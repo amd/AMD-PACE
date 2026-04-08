@@ -1,5 +1,5 @@
 # *******************************************************************************
-# Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
 # Portions of this file consist of AI-generated content
 # *******************************************************************************
@@ -122,11 +122,11 @@ def _compute_linear_cos_sin_cache(
     max_position_embeddings: int,
     scaling_factor: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    inv_freq = _compute_inv_freq(base, rotary_dim)
+    inv_freq = _compute_inv_freq(base, rotary_dim) / scaling_factor
     return _compute_cos_sin_cache_from_inv_freq(
         inv_freq=inv_freq,
         max_position_embeddings=max_position_embeddings,
-        scaling_factor=scaling_factor,
+        scaling_factor=1.0,  # No additional scaling needed
     )
 
 
@@ -196,6 +196,85 @@ def _compute_longrope_cos_sin_cache(
     inv_freq = _compute_inv_freq(base, rotary_dim, rescale_factors=rescale_factor)
     return _compute_cos_sin_cache_from_inv_freq(
         inv_freq, max_position_embeddings, scaling_factor
+    )
+
+
+def _compute_yarn_cos_sin_cache(
+    base: Union[int, float],
+    rotary_dim: int,
+    max_position_embeddings: int,
+    rope_scaling: Dict[str, Any],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    factor = rope_scaling["factor"]
+    original_max_position_embeddings = rope_scaling.get(
+        "original_max_position_embeddings", max_position_embeddings
+    )
+    if "original_max_position_embeddings" in rope_scaling:
+        factor = max_position_embeddings / original_max_position_embeddings
+
+    attention_factor = rope_scaling.get("attention_factor")
+    mscale = rope_scaling.get("mscale")
+    mscale_all_dim = rope_scaling.get("mscale_all_dim")
+
+    def get_mscale(scale, value=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * value * math.log(scale) + 1.0
+
+    if attention_factor is None:
+        if mscale and mscale_all_dim:
+            attention_factor = float(
+                get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
+            )
+        else:
+            attention_factor = get_mscale(factor)
+
+    beta_fast = rope_scaling.get("beta_fast") or 32
+    beta_slow = rope_scaling.get("beta_slow") or 1
+
+    def find_correction_dim(num_rot, dim, base_val, max_pos):
+        return (dim * math.log(max_pos / (num_rot * 2 * math.pi))) / (
+            2 * math.log(base_val)
+        )
+
+    def find_correction_range(low_rot, high_rot, dim, base_val, max_pos, truncate):
+        low = find_correction_dim(low_rot, dim, base_val, max_pos)
+        high = find_correction_dim(high_rot, dim, base_val, max_pos)
+        if truncate:
+            low = math.floor(low)
+            high = math.ceil(high)
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(min_val, max_val, dim):
+        if min_val == max_val:
+            max_val += 0.001
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (
+            max_val - min_val
+        )
+        return torch.clamp(linear_func, 0, 1)
+
+    pos_freqs = base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+
+    truncate = rope_scaling.get("truncate", True)
+    low, high = find_correction_range(
+        beta_fast,
+        beta_slow,
+        rotary_dim,
+        base,
+        original_max_position_embeddings,
+        truncate,
+    )
+    inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, rotary_dim // 2)
+    inv_freq = (
+        inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+        + inv_freq_extrapolation * inv_freq_extrapolation_factor
+    )
+    return _compute_cos_sin_cache_from_inv_freq(
+        inv_freq=inv_freq,
+        max_position_embeddings=max_position_embeddings,
+        scaling_factor=attention_factor,
     )
 
 
@@ -292,7 +371,10 @@ class RotaryEmbedding(OperatorBase):
                 max_position_embeddings=max_position_embeddings,
             )
         elif self.rope_type == "linear":
-            scaling_factor = rope_scaling["scaling_factor"]
+            # Support both "factor" (HuggingFace convention) and "scaling_factor"
+            scaling_factor = rope_scaling.get(
+                "scaling_factor", rope_scaling.get("factor", 1.0)
+            )
             cache = _compute_linear_cos_sin_cache(
                 base=self.rope_theta,
                 rotary_dim=rotary_dim,
@@ -300,7 +382,10 @@ class RotaryEmbedding(OperatorBase):
                 scaling_factor=scaling_factor,
             )
         elif self.rope_type == "dynamic":
-            scaling_factor = rope_scaling["scaling_factor"]
+            # Support both "factor" and "scaling_factor"
+            scaling_factor = rope_scaling.get(
+                "scaling_factor", rope_scaling.get("factor", 1.0)
+            )
             cache = _compute_dynamic_ntk_cos_sin_cache(
                 base=self.rope_theta,
                 rotary_dim=rotary_dim,
@@ -361,6 +446,13 @@ class RotaryEmbedding(OperatorBase):
                 torch.cat([short_cache[0], long_cache[0]], dim=0),
                 torch.cat([short_cache[1], long_cache[1]], dim=0),
             )
+        elif self.rope_type == "yarn":
+            cache = _compute_yarn_cos_sin_cache(
+                base=self.rope_theta,
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position_embeddings,
+                rope_scaling=rope_scaling,
+            )
         else:
             PACE_ASSERT(False, f"Unsupported RoPE type: {self.rope_type}")
 
@@ -380,14 +472,10 @@ class RotaryEmbedding(OperatorBase):
         # and returns the result, instead of just returning the cos and sin tensors
         if self.rope_type == "longrope":
             k = self.original_max_position_embeddings
-            long_prompt_offset = (
-                torch.any(position_ids > k).float() * torch.full_like(position_ids, k)
-            ).long()
-            idx = (
-                torch.add(position_ids, long_prompt_offset)
-                if long_prompt_offset is not None
-                else position_ids
-            )
+            # Per-sequence check: only offset rows where any position exceeds k
+            is_long = torch.any(position_ids > k, dim=-1, keepdim=True).float()
+            long_prompt_offset = (is_long * k).long().expand_as(position_ids)
+            idx = torch.add(position_ids, long_prompt_offset)
             idx = torch.add(idx, offsets) if offsets is not None else idx
             idx = idx.flatten()
         else:
@@ -469,6 +557,26 @@ class RotaryEmbedding(OperatorBase):
             Tuple[torch.Tensor, torch.Tensor]: The query and key tensors with
                 rotary embeddings applied.
         """
+        query = query.contiguous()
+        key = key.contiguous()
+        if (
+            is_neox_style
+            and self.rope_type != "longrope"
+            and query.dtype == torch.bfloat16
+            and key.dtype == torch.bfloat16
+            and cos.dtype == torch.bfloat16
+            and sin.dtype == torch.bfloat16
+            and query.dim() == 4
+            and key.dim() == 4
+            and unsqueeze_dim in (1, 2)
+        ):
+            try:
+                return torch.ops.pace.fused_rope_apply(
+                    query, key, cos, sin, unsqueeze_dim
+                )
+            except Exception:
+                pass
+
         query = self._apply_rotary_emb(query, cos, sin, unsqueeze_dim, is_neox_style)
         key = self._apply_rotary_emb(key, cos, sin, unsqueeze_dim, is_neox_style)
         return query, key

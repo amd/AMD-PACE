@@ -1,5 +1,5 @@
 # ******************************************************************************
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
@@ -21,12 +21,12 @@ import torch
 class OperatorType(StrEnum):
     LINEAR = auto()
     REPEATEDKVLINEAR = auto()
-    MHA = auto()
     SOFTMAX = auto()
     RELU = auto()
     GELU = auto()
     SILU = auto()
     TANH = auto()
+    SIGMOID = auto()
     LAYERNORM = auto()
     RMSNORM = auto()
     ROTARYEMBEDDING = auto()
@@ -38,6 +38,8 @@ class FusedOperatorType(StrEnum):
     FUSEDLINEARGELU = auto()
     FUSEDLINEARSILU = auto()
     FUSEDLINEARMUL = auto()
+    FUSED_RMSNORM_RESIDUAL = auto()
+    FUSED_LAYERNORM_RESIDUAL = auto()
 
 
 class BackendType(StrEnum):
@@ -45,6 +47,7 @@ class BackendType(StrEnum):
     JIT = auto()
     TPP = auto()
     IMBPS = auto()
+    AOCLDLP = auto()
 
 
 class DataType(StrEnum):
@@ -77,4 +80,5 @@ FALLBACK_BACKEND: List[BackendType] = [
     BackendType.JIT,
     BackendType.TPP,
     BackendType.IMBPS,
+    BackendType.AOCLDLP,
 ]

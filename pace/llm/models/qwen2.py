@@ -1,5 +1,5 @@
 # *******************************************************************************
-# Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
 # Portions of this file consist of AI-generated content
 # *******************************************************************************
@@ -24,25 +24,25 @@
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.48.2/src/transformers/models/qwen2/modeling_qwen2.py
 
-from typing import Optional, Tuple, Iterable, Callable
+from typing import Tuple, Iterable, Callable, Union, List
 
 import torch
 from torch import nn
 from transformers import Qwen2Config
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 from pace.llm.outputs import ModelOutput
 from pace.llm.configs import OperatorConfig
 from pace.llm.models.base_model import BaseModelForCausalLM
-from pace.llm.cache import KVCacheBase, KVCacheManager
+from pace.llm.attention import KVCacheBase, KVCacheManager
 from pace.llm.ops import (
     Linear,
-    # RepeatedKVLinear,
-    MultiHeadAttention,
+    FusedQKVLinear,
     RMSNorm,
+    FusedRMSNormResidual,
     RotaryEmbedding,
     MergedMLP,
 )
+from pace.llm.attention import Attention
 
 
 def rotate_half(x):
@@ -79,20 +79,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
 class Qwen2Attention(nn.Module):
 
     def __init__(self, config: Qwen2Config, opconfig: OperatorConfig):
@@ -105,25 +91,25 @@ class Qwen2Attention(nn.Module):
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.q_proj = Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+
+        self.qkv_proj = FusedQKVLinear(
+            in_features=config.hidden_size,
+            out_features=(config.num_attention_heads + 2 * config.num_key_value_heads)
+            * self.head_dim,
             bias=True,
+            num_key_value_heads=config.num_key_value_heads,
             backend_impl=opconfig.qkv_projection,
         )
-        self.k_proj = Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=True,
-            backend_impl=opconfig.qkv_projection,
+
+        self.attn = Attention(
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=self.head_dim,
+            opconfig=opconfig,
         )
-        self.v_proj = Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=True,
-            backend_impl=opconfig.qkv_projection,
-        )
-        self.attention = MultiHeadAttention(backend_impl=opconfig.attention)
+
         self.o_proj = Linear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
@@ -131,44 +117,32 @@ class Qwen2Attention(nn.Module):
             backend_impl=opconfig.out_projection,
         )
 
+        self.q_size = self.num_attention_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Callable,
-        kv_cache: KVCacheBase,
-        attention_mask: torch.Tensor,
+        kv_cache,
+        positions: torch.LongTensor,
+        **kwargs,
     ) -> torch.Tensor:
-        ...
-
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        batch_size, seq_len = input_shape
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        Q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        K = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        V = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
 
-        query_states, key_states = position_embeddings(query_states, key_states)
+        Q, K = position_embeddings(Q, K, unsqueeze_dim=2)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_output = self.attn(Q, K, V, kv_cache, positions, **kwargs)
+        attn_output = attn_output.reshape(*input_shape, -1)
 
-        # KV Cache
-        key_states, value_states = kv_cache.update_cache(
-            key_states, value_states, concat_dim=2
-        )
-
-        attn_output = self.attention(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=attention_mask,
-        )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output
+        return self.o_proj(attn_output)
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -185,36 +159,33 @@ class Qwen2DecoderLayer(nn.Module):
             gate=True,
             backend_impl=opconfig.mlp,
         )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = FusedRMSNormResidual(
             config.hidden_size, eps=config.rms_norm_eps, backend_impl=opconfig.norm
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = FusedRMSNormResidual(
             config.hidden_size, eps=config.rms_norm_eps, backend_impl=opconfig.norm
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         position_embeddings: Callable,
-        kv_cache: KVCacheBase,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        kv_cache: Union[KVCacheBase, List[KVCacheBase]],
+        positions: torch.LongTensor,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.self_attn(
-            hidden_states, position_embeddings, kv_cache, attention_mask
+            hidden_states, position_embeddings, kv_cache, positions, **kwargs
         )
-        hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class Qwen2Model(nn.Module):
@@ -224,10 +195,6 @@ class Qwen2Model(nn.Module):
 
         self.config = config
         self.padding_idx = config.pad_token_id
-
-        self.attn_mask_converter = AttentionMaskConverter(
-            is_causal=True, sliding_window=None
-        )
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
@@ -252,51 +219,52 @@ class Qwen2Model(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        kv_cache: KVCacheManager,
-        attention_mask: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        positions: torch.LongTensor,
+        kv_cache: Union[KVCacheManager, List[KVCacheManager]],
+        **kwargs,
     ) -> torch.Tensor:
-
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
-
-        past_key_values_length = len(kv_cache)
-
-        org_input_size = input_ids.size(1)
-        input_ids = input_ids[:, past_key_values_length:]
 
         input_shape = input_ids.shape
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids)
 
-        # 4d mask is passed through the layers
-        key_value_length = input_shape[-1] + past_key_values_length
-        hf_attention_mask = self.attn_mask_converter.to_4d(
-            attention_mask,
-            input_shape[-1],
-            key_value_length=key_value_length,
-            dtype=inputs_embeds.dtype,
-        )
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        if kv_cache:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
+        is_kv_cache_list = isinstance(kv_cache, list)
 
-        hidden_states = inputs_embeds
-        position_embeddings: Callable = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings: Callable = self.rotary_emb(hidden_states, positions)
 
-        hf_attention_mask = kv_cache.update_mask(hf_attention_mask, org_input_size)
+        if is_kv_cache_list:
+            if len(kv_cache) != input_shape[0]:
+                raise ValueError(
+                    f"Number of KVCache objects ({len(kv_cache)}) must match "
+                    f"batch size ({input_shape[0]})"
+                )
+
+        residual = torch.zeros_like(hidden_states)
 
         for idx, decoder_layer in enumerate(self.layers):
-            hidden_states = decoder_layer(
-                hidden_states, position_embeddings, kv_cache[idx], hf_attention_mask
-            )
+            if is_kv_cache_list:
+                layer_kv_caches = [
+                    kv_cache_mgr.cache_objects[idx] for kv_cache_mgr in kv_cache
+                ]
+                hidden_states, residual = decoder_layer(
+                    hidden_states,
+                    residual,
+                    position_embeddings,
+                    layer_kv_caches,
+                    positions,
+                    **kwargs,
+                )
+            else:
+                hidden_states, residual = decoder_layer(
+                    hidden_states,
+                    residual,
+                    position_embeddings,
+                    kv_cache.cache_objects[idx],
+                    positions,
+                    **kwargs,
+                )
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states + residual)
         return hidden_states
 
 
@@ -320,37 +288,75 @@ class Qwen2ForCausalLM(BaseModelForCausalLM):
 
     def load_weights(self, weight_iterator: Iterable[Tuple[str, torch.Tensor]]):
 
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        params = dict(self.named_parameters(remove_duplicate=False))
+
+        qkv_cache = {}
 
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-        for name, weight in weight_iterator:
+
+        for name, tensor in weight_iterator:
             name = self.rename_fused_params(name)
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
-            if name.endswith(".bias") and name not in params_dict:
+            if name.endswith(".bias") and name not in params:
+                if not any(proj in name for proj in ["q_proj", "k_proj", "v_proj"]):
+                    continue
+
+            # Already fused qkv -> load directly
+            if "qkv_proj" in name and name in params:
+                params[name].data.copy_(tensor)
                 continue
 
-            assert params_dict[name].size() == weight.size()
-            params_dict[name].data.copy_(weight)
+            # Collect q_proj / k_proj / v_proj for fusion
+            if any(proj in name for proj in ["q_proj", "k_proj", "v_proj"]):
+                parts = name.split(".")
+                proj_token = parts[-2]
+                proj_type = proj_token.split("_")[0]
+                attn_prefix = ".".join(parts[:-2])
+
+                if attn_prefix not in qkv_cache:
+                    qkv_cache[attn_prefix] = {"weight": {}, "bias": {}}
+
+                if name.endswith(".weight"):
+                    qkv_cache[attn_prefix]["weight"][proj_type] = tensor
+                else:
+                    qkv_cache[attn_prefix]["bias"][proj_type] = tensor
+                continue
+
+            if name in params:
+                if hasattr(params[name], "load_weights"):
+                    params[name].load_weights(params[name], tensor)
+                else:
+                    params[name].data.copy_(tensor)
+
+        # Fuse collected q/k/v into each layer's qkv_proj
+        modules = dict(self.named_modules())
+        for attn_prefix, tensors in qkv_cache.items():
+            if not all(x in tensors["weight"] for x in ("q", "k", "v")):
+                continue
+
+            fused_layer = modules.get(f"{attn_prefix}.qkv_proj")
+            if fused_layer is None:
+                continue
+
+            fused_layer.load_from_unfused(tensors)
+
+        qkv_cache.clear()
 
     def forward(
         self,
         input_ids: torch.LongTensor,
-        kv_cache: KVCacheManager,
-        attention_mask: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        positions: torch.LongTensor,
+        kv_cache: Union[KVCacheManager, List[KVCacheManager]],
+        **kwargs,
     ) -> ModelOutput:
-        model_output = self.model(
-            input_ids, kv_cache, attention_mask, inputs_embeds=inputs_embeds
-        )
+        model_output = self.model(input_ids, positions, kv_cache, **kwargs)
         logits = self.lm_head(model_output)
 
         return ModelOutput(logits=logits)

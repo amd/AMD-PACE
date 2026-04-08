@@ -108,3 +108,51 @@ class RepeatedKVLinear(Linear):
 
         assert param.size() == loaded_bias.size()
         param.data.copy_(loaded_bias)
+
+
+class FusedQKVLinear(Linear):
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        dtype: Optional[DataType] = None,
+        num_key_value_heads: int = 8,
+        backend_impl: BackendType = BackendType.NATIVE,
+    ):
+        super().__init__(in_features, out_features, bias, dtype, backend_impl)
+        self.num_key_value_heads = num_key_value_heads
+
+    @torch.no_grad()
+    def load_from_unfused(self, qkv_tensors: dict[str, dict[str, torch.Tensor]]):
+
+        w = qkv_tensors["weight"]
+        b = qkv_tensors.get("bias", {})
+
+        q_w, k_w, v_w = w["q"], w["k"], w["v"]
+
+        q_b = b.get("q")
+        k_b = b.get("k")
+        v_b = b.get("v")
+
+        fused_w = torch.cat([q_w, k_w, v_w], dim=0)
+        assert (
+            fused_w.shape == self.weight.shape
+        ), f"Fused weight mismatch: {fused_w.shape} != {self.weight.shape}"
+        self.weight.copy_(fused_w)
+
+        if self.bias is not None:
+            dtype = q_w.dtype
+            if q_b is None:
+                q_b = torch.zeros(q_w.size(0), dtype=dtype, device=self.weight.device)
+            if k_b is None:
+                k_b = torch.zeros(k_w.size(0), dtype=dtype, device=self.weight.device)
+            if v_b is None:
+                v_b = torch.zeros(v_w.size(0), dtype=dtype, device=self.weight.device)
+
+            fused_b = torch.cat([q_b, k_b, v_b], dim=0)
+            assert (
+                fused_b.shape == self.bias.shape
+            ), f"Bias mismatch: {fused_b.shape} != {self.bias.shape}"
+            self.bias.copy_(fused_b)

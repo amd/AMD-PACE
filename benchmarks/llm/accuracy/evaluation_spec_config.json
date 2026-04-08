@@ -18,7 +18,6 @@
     },
     "generation_args": {
         "batch_size": 1,
-        "num_beams": 1,
         "kv_cache_type": "BMC"
     },
     "tasks": [

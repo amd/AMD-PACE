@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Optional
 from contextlib import contextmanager
 
+import torch
 import pace
 
 
@@ -45,7 +46,14 @@ class PACELogger:
             caller_stack = traceback.extract_stack(limit=3 + caller_stack_depth)[0]
             return os.path.basename(caller_stack.filename), caller_stack.lineno
 
-        if cls.supressor:
+        # The idea is that if it's an error, it usually is associated with
+        # an exit, or another error handler, so does not matter if we are
+        # compiling or not. If an error is encountered during compilation,
+        # we will accept a graph break and/or recompilation. Others such
+        # as debugs, info and warnings are not critical and can be skipped.
+        if (
+            torch.compiler.is_compiling() or cls.supressor
+        ) and loglevel.value < logLevel.ERROR.value:
             return
 
         assert isinstance(  # noqa: F631
@@ -70,6 +78,8 @@ def PACE_DEBUG(
 
     Args:
         message: The message to be displayed.
+        extra_info: Optional prefix appended to "pace" in the log output (e.g. "-llm "). Default is None.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller. Default is 1. Useful for nested functions.
     """
     message = f"pace{extra_info if extra_info else ''}: {message}"
     pacelogger(logLevel.DEBUG, message, caller_stack_depth)
@@ -85,6 +95,8 @@ def PACE_INFO(
 
     Args:
         message: The message to be displayed.
+        extra_info: Optional prefix appended to "pace" in the log output (e.g. "-llm "). Default is None.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller. Default is 1. Useful for nested functions.
     """
 
     message = f"pace{extra_info if extra_info else ''}: {message}"
@@ -101,10 +113,30 @@ def PACE_WARNING(
 
     Args:
         message: The message to be displayed.
+        extra_info: Optional prefix appended to "pace" in the log output (e.g. "-llm "). Default is None.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller. Default is 1. Useful for nested functions.
     """
 
     message = f"pace{extra_info if extra_info else ''}: {message}"
     pacelogger(logLevel.WARNING, message, caller_stack_depth)
+
+
+def PACE_ERROR(
+    message: str,
+    extra_info: Optional[str] = None,
+    caller_stack_depth: Optional[int] = 1,
+):
+    """
+    Logs an error message.
+
+    Args:
+        message: The message to be displayed.
+        extra_info: Optional prefix appended to "pace" in the log output (e.g. "-llm "). Default is None.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller.
+                            Default is 1. Useful for nested functions.
+    """
+    message = f"pace{extra_info if extra_info else ''}: {message}"
+    pacelogger(logLevel.ERROR, message, caller_stack_depth)
 
 
 def PACE_ASSERT(
@@ -119,6 +151,9 @@ def PACE_ASSERT(
     Args:
         condition: The condition to be checked.
         message: The message to be displayed if the condition is not met.
+        extra_info: Optional prefix appended to "pace" in the log output (e.g. "-llm "). Default is None.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller.
+                            Default is 1. Useful for nested functions.
 
     Raises:
         AssertionError: If the condition is not met.
@@ -131,20 +166,68 @@ def PACE_ASSERT(
 
 
 def PACE_LLM_DEBUG(message: str, caller_stack_depth: Optional[int] = 2):
+    """
+    Logs a debug message with the "pace-llm" prefix.
+
+    Args:
+        message: The message to be displayed.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller.
+                            Default is 2. Useful for nested functions.
+    """
     PACE_DEBUG(message, extra_info="-llm ", caller_stack_depth=caller_stack_depth)
 
 
 def PACE_LLM_INFO(message: str, caller_stack_depth: Optional[int] = 2):
+    """
+    Logs an informational message with the "pace-llm" prefix.
+
+    Args:
+        message: The message to be displayed.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller.
+                            Default is 2. Useful for nested functions.
+    """
     PACE_INFO(message, extra_info="-llm ", caller_stack_depth=caller_stack_depth)
 
 
 def PACE_LLM_WARNING(message: str, caller_stack_depth: Optional[int] = 2):
+    """
+    Logs a warning message with the "pace-llm" prefix.
+
+    Args:
+        message: The message to be displayed.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller.
+                            Default is 2. Useful for nested functions.
+    """
     PACE_WARNING(message, extra_info="-llm ", caller_stack_depth=caller_stack_depth)
+
+
+def PACE_LLM_ERROR(message: str, caller_stack_depth: Optional[int] = 2):
+    """
+    Logs an error message with the "pace-llm" prefix.
+
+    Args:
+        message: The message to be displayed.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller.
+                            Default is 2. Useful for nested functions.
+    """
+    PACE_ERROR(message, extra_info="-llm ", caller_stack_depth=caller_stack_depth)
 
 
 def PACE_LLM_ASSERT(
     condition: bool, message: str, caller_stack_depth: Optional[int] = 2
 ):
+    """
+    Asserts a condition and raises an exception if it is not met, with the "pace-llm" prefix.
+
+    Args:
+        condition: The condition to be checked.
+        message: The message to be displayed if the condition is not met.
+        caller_stack_depth: The number of extra stack frames to traverse to identify the caller.
+                            Default is 2. Useful for nested functions.
+
+    Raises:
+        AssertionError: If the condition is not met.
+    """
     PACE_ASSERT(
         condition, message, extra_info="-llm ", caller_stack_depth=caller_stack_depth
     )

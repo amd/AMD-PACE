@@ -189,5 +189,5 @@ cython_debug/
 # We will be downloading the format file from pytorch if required
 .clang-format
 
-# Do not include pace/version.py since it is generated
-pace/version.py
+# Do not include pace/_version.py since it is generated
+pace/_version.py

@@ -1,5 +1,5 @@
 # ******************************************************************************
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
@@ -23,13 +23,17 @@ from pace.ops import (  # noqa: F401
     DataType,
     Linear,
     RepeatedKVLinear,
-    MultiHeadAttention,
     LayerNorm,
     RMSNorm,
+    FusedRMSNormResidual,
+    FusedGemma3RMSNormResidual,
+    FusedLayerNormResidual,
     RotaryEmbedding,
     SoftMax,
+    Sigmoid,
     Activation,
     MergedMLP,
+    FusedQKVLinear,
 )
 
 

@@ -17,10 +17,10 @@ set(ALL_CPP_FILES ${CSRC_ROOT_FOLDER}/torch_extension_bindings.cpp
     ${KERNELS_CPP_FILES} ${KERNELS_AVX512_CPP_FILES} ${PACETENSOR_CPP_FILES} ${LIBXSMM_CPP_FILES})
 
 # Set the headers to be included
-set(PACE_HEADER_FILES ${OPS_HEADERS})
+set(PACE_HEADER_FILES ${OPS_HEADERS} ${CORE_HEADERS} ${UTILS_HEADERS})
 
 add_library(${LIBRARY_NAME} SHARED ${ALL_CPP_FILES})
-add_dependencies(${LIBRARY_NAME} jit_backend fbgemm libxsmm)
+add_dependencies(${LIBRARY_NAME} jit_backend fbgemm libxsmm libaocl-dlp)
 target_compile_features(${LIBRARY_NAME} PRIVATE cxx_std_17)
 
 # Automatic clang-format with the flag ENABLE_CLANG_FORMAT
@@ -46,8 +46,13 @@ add_definitions(-DUSE_ONEDNN)
 # endif()
 
 # AVX512 flags for kernels
-set(AVX512_CXX_FLAGS "-mavx512f -mavx512bw -mavx512dq -mavx512vl")
+set(AVX512_CXX_FLAGS "-mavx2 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512bf16")
 set_source_files_properties(${KERNELS_AVX512_CPP_FILES} PROPERTIES COMPILE_FLAGS "${AVX512_CXX_FLAGS}")
+
+# vLLM-derived paged attention files need AVX512 + warning suppression for upstream code
+file(GLOB_RECURSE PAGED_ATTN_CPP_FILES ${CSRC_ROOT_FOLDER}/ops/attention/paged/*.cpp)
+set(PAGED_ATTN_CXX_FLAGS "${AVX512_CXX_FLAGS} -Wno-unused-variable -Wno-error")
+set_source_files_properties(${PAGED_ATTN_CPP_FILES} PROPERTIES COMPILE_FLAGS "${PAGED_ATTN_CXX_FLAGS}")
 
 # Common flags, OMP and TORCH
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -O3 -Werror -Wunused-variable")
@@ -59,6 +64,7 @@ target_include_directories(${LIBRARY_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${LIBRARY_NAME} PUBLIC ${JIT_BACKEND_INCLUDE_DIR})
 target_include_directories(${LIBRARY_NAME} PUBLIC ${FBGEMM_INCLUDE_DIR})
 target_include_directories(${LIBRARY_NAME} PUBLIC ${LIBXSMM_INCLUDE_DIR})
+target_include_directories(${LIBRARY_NAME} PUBLIC ${AOCLDLP_INCLUDE_DIR})
 target_include_directories(${LIBRARY_NAME} PUBLIC ${TORCH_INCLUDE_DIRS})
 target_include_directories(${LIBRARY_NAME} PUBLIC ${PYTHON_INCLUDE_DIR})
 
@@ -67,15 +73,27 @@ target_compile_options(${LIBRARY_NAME} BEFORE PUBLIC ${TORCH_CXX_FLAGS} ${OpenMP
 target_link_libraries(${LIBRARY_NAME} PRIVATE ${JIT_BACKEND_STATIC_LIB})
 target_link_libraries(${LIBRARY_NAME} PRIVATE ${FBGEMM_STATIC_LIB})
 target_link_libraries(${LIBRARY_NAME} PRIVATE ${LIBXSMM_STATIC_LIB})
+target_link_libraries(${LIBRARY_NAME} PRIVATE ${AOCLDLP_STATIC_LIB})
 target_link_libraries(${LIBRARY_NAME} PUBLIC OpenMP::OpenMP_CXX)
 target_link_libraries(${LIBRARY_NAME} PUBLIC torch_cpu c10)
 
-# set_target_properties(${LIBRARY_NAME} PROPERTIES PUBLIC_HEADER "${PACE_HEADER_FILES}")
+set_target_properties(${LIBRARY_NAME} PROPERTIES PUBLIC_HEADER "${PACE_HEADER_FILES}")
 
 install(TARGETS ${LIBRARY_NAME}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   # PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+# Temporary workaround to install all the header files
+# since ATGenie requires them to be in the include folder.
+# In the future we will switch to using the PUBLIC_HEADER property above.
+set(HEADER_INSTALL_DIR ${CMAKE_INSTALL_PREFIX}/include)
+set(PACE_INCLUDE_DIRS ${CSRC_ROOT_FOLDER}/core
+                        ${CSRC_ROOT_FOLDER}/graph
+                        ${CSRC_ROOT_FOLDER}/ops
+                        ${CSRC_ROOT_FOLDER}/pace_tensor
+                        ${CSRC_ROOT_FOLDER}/utils)
+install(DIRECTORY ${PACE_INCLUDE_DIRS} DESTINATION ${HEADER_INSTALL_DIR} FILES_MATCHING PATTERN "*.h")
 
 get_target_property(TARGET_LINK_LIBRARIES ${LIBRARY_NAME} LINK_LIBRARIES)
 message(STATUS "Summary for PACE:")

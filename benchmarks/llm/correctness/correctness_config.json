@@ -1,0 +1,21 @@
+{
+    "model_args": {
+        "model_name": "all",
+        "dtype": "bf16",
+        "llm_operators": {
+            "Norm": "NATIVE",
+            "QKVProjection": "NATIVE",
+            "Attention": "NATIVE",
+            "OutProjection": "NATIVE",
+            "MLP": "NATIVE",
+            "LMHead": "NATIVE"
+        },
+        "spec_config": null
+    },
+    "generation_args": {
+        "kv_cache_type": "BMC",
+        "max_tokens": 32,
+        "batch_size": [1, 8],
+        "num_logprobs": 5
+    }
+}

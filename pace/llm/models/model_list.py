@@ -1,5 +1,5 @@
 # *******************************************************************************
-# Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
 # Portions of this file consist of AI-generated content
 # *******************************************************************************
@@ -20,6 +20,9 @@ _MODELS = {
     "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
     "GPTJForCausalLM": ("gptj", "GPTJForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    "Gemma3ForCausalLM": ("gemma3", "Gemma3ForCausalLM"),
+    "Gemma3ForConditionalGeneration": ("gemma3", "Gemma3ForConditionalGeneration"),
+    "GptOssForCausalLM": ("gpt_oss", "GptOssForCausalLM"),
 }
 
 

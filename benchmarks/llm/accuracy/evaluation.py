@@ -68,7 +68,7 @@ def main():
 
     config = get_args()
 
-    PACE_LLM_INFO(f"Running evaluation for model {config["model_args"].model_name}")
+    PACE_LLM_INFO(f"Running evaluation for model {config['model_args'].model_name}")
 
     task_manager = TaskManager()
 

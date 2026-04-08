@@ -11,10 +11,16 @@ import torch
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import TestCase
 
+import pace  # noqa: F401 -- ensures C++ ops and backend registrations are loaded
 
-from pace.ops.enum import OperatorType
+from pace.ops.enum import OperatorType, FusedOperatorType
 from pace.ops.registry import backend_registry
-from pace.ops.normalization import LayerNorm, RMSNorm
+from pace.ops.normalization import (
+    LayerNorm,
+    RMSNorm,
+    FusedRMSNormResidual,
+    FusedLayerNormResidual,
+)
 
 
 class TestNormalization(TestCase):
@@ -60,3 +66,65 @@ class TestNormalization(TestCase):
         y = rmsnorm(x)
         y_torch = F.rms_norm(x, normalized_shape=(normalized_shape,), weight=weight)
         self.assertEqual(y, y_torch)
+
+    @given(
+        st.sampled_from(
+            backend_registry.get_available_backends(
+                FusedOperatorType.FUSED_RMSNORM_RESIDUAL
+            )
+        )
+    )
+    def test_fused_rmsnorm_residual(self, backend):
+        """Fused Add+RMSNorm across all registered backends and shapes."""
+        for rows, dim in [(1, 64), (2, 64), (4, 128), (8, 64), (32, 256)]:
+            with self.subTest(rows=rows, dim=dim, backend=backend):
+                fused = FusedRMSNormResidual(
+                    dim, backend_impl=backend[0], dtype=backend[1]
+                )
+                weight = torch.randn(dim, dtype=backend[1].to_torch_dtype())
+                fused.weight.copy_(weight)
+
+                x = torch.randn(rows, dim, dtype=backend[1].to_torch_dtype())
+                residual = torch.randn(rows, dim, dtype=backend[1].to_torch_dtype())
+
+                normed, residual_out = fused(x, residual)
+
+                residual_ref = x + residual
+                normed_ref = F.rms_norm(
+                    residual_ref, normalized_shape=(dim,), weight=weight
+                )
+
+                self.assertEqual(residual_out, residual_ref, atol=2e-2, rtol=2e-2)
+                self.assertEqual(normed, normed_ref, atol=2e-2, rtol=2e-2)
+
+    @given(
+        st.sampled_from(
+            backend_registry.get_available_backends(
+                FusedOperatorType.FUSED_LAYERNORM_RESIDUAL
+            )
+        )
+    )
+    def test_fused_layernorm_residual(self, backend):
+        """Fused Add+LayerNorm across all registered backends and shapes."""
+        for rows, dim in [(1, 64), (2, 64), (4, 128), (8, 64), (32, 256)]:
+            with self.subTest(rows=rows, dim=dim, backend=backend):
+                fused = FusedLayerNormResidual(
+                    dim, backend_impl=backend[0], dtype=backend[1]
+                )
+                weight = torch.randn((dim,), dtype=backend[1].to_torch_dtype())
+                bias = torch.randn((dim,), dtype=backend[1].to_torch_dtype())
+                fused.weight.copy_(weight)
+                fused.bias.copy_(bias)
+
+                x = torch.randn(rows, dim, dtype=backend[1].to_torch_dtype())
+                residual = torch.randn(rows, dim, dtype=backend[1].to_torch_dtype())
+
+                normed, residual_out = fused(x, residual)
+
+                residual_ref = x + residual
+                normed_ref = F.layer_norm(
+                    residual_ref, normalized_shape=(dim,), weight=weight, bias=bias
+                )
+
+                self.assertEqual(residual_out, residual_ref, atol=2e-2, rtol=2e-2)
+                self.assertEqual(normed, normed_ref, atol=2e-2, rtol=2e-2)

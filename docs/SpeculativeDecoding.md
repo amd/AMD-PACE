@@ -73,7 +73,11 @@ pard_config = PardSpecDecodeConfig(
 ## Usage Example
 
 ```python
-from pace.llm import LLMModel, PardSpecDecodeConfig
+import torch
+from transformers import AutoTokenizer
+from pace.llm import LLMModel, PardSpecDecodeConfig, SamplingConfig
+
+model_name = "Qwen/Qwen2.5-7B-Instruct"
 
 # Configure PARD
 pard_config = PardSpecDecodeConfig(
@@ -81,12 +85,16 @@ pard_config = PardSpecDecodeConfig(
     num_speculative_tokens=12
 )
 
-# # Initialize model with PARD
+# Initialize model with PARD
 model = LLMModel(
-    model_name_or_path="Qwen/Qwen2.5-7B-Instruct",
-    dtype="bfloat16",
-    pard_config=pard_config
+    model_name_or_path=model_name,
+    dtype=torch.bfloat16,
+    spec_config=pard_config
 )
+
+# Tokenize input
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+inputs = tokenizer("Hello, how are you?", return_tensors="pt")
 
 # Configure sampling
 sampling_config = SamplingConfig(
@@ -96,10 +104,7 @@ sampling_config = SamplingConfig(
 )
 
 # Generate with speculative decoding
-response = model.generate(
-    "Hello, how are you?",
-    sampling_config=sampling_config
-)
+response = model.generate(inputs, sampling_config=sampling_config)
 ```
 For a more detailed example, refer to the [PARD example](../examples/pace_llm_pard.py).
 

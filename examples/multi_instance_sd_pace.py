@@ -18,6 +18,7 @@ from pace.llm import (
     OperatorConfig,
     PardSpecDecodeConfig,
 )
+from pace.llm.attention import AttentionBackendType
 import time
 from pace.utils.worker import Worker, MultipleProcesses
 from pace.utils.inference_dataset import LLMInferenceDataset
@@ -78,7 +79,7 @@ class LLMWorker(Worker):
             **{
                 LLMOperatorType.Norm: LLMBackendType.NATIVE,
                 LLMOperatorType.QKVProjection: LLMBackendType.TPP,
-                LLMOperatorType.Attention: LLMBackendType.JIT,
+                LLMOperatorType.Attention: AttentionBackendType.JIT,
                 LLMOperatorType.OutProjection: LLMBackendType.TPP,
                 LLMOperatorType.MLP: LLMBackendType.TPP,
                 LLMOperatorType.LMHead: LLMBackendType.NATIVE,
@@ -98,7 +99,7 @@ class LLMWorker(Worker):
         self.model = LLMModel(
             model_name,
             dtype=torch.bfloat16,
-            pard_config=PardSpecDecodeConfig(
+            spec_config=PardSpecDecodeConfig(
                 model_name_or_path=pard_model_name,
                 num_speculative_tokens=12,
             ),

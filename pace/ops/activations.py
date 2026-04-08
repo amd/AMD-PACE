@@ -1,5 +1,5 @@
 # ******************************************************************************
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
@@ -134,6 +134,27 @@ class Tanh(OperatorBase):
         return f"dtype={self.dtype}, backend={self.backend}"
 
 
+class Sigmoid(OperatorBase):
+    @property
+    def operator_type(self):
+        return OperatorType.SIGMOID
+
+    def __init__(
+        self,
+        dtype=None,
+        backend_impl=BackendType.NATIVE,
+    ):
+
+        self.dtype = dtype
+        super().__init__(backend_impl=backend_impl, dtype=dtype)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return self.backend.execute(input)
+
+    def extra_repr(self):
+        return f"dtype={self.dtype}, backend={self.backend}"
+
+
 # Wrapper for all activation classes since HF
 # uses a name based approach to get the activation function
 class Activation(nn.Module):
@@ -146,12 +167,15 @@ class Activation(nn.Module):
             self.act = ReLU(**kwargs)
         elif act_type == "gelu":
             self.act = GeLU(**kwargs)
-        elif act_type == "gelu_new":
+        elif act_type in ("gelu_new", "gelu_pytorch_tanh"):
+            # gelu_pytorch_tanh is the same as gelu_new (GELU with tanh approximation)
             self.act = GeLU(approximate="tanh", **kwargs)
         elif act_type == "silu":
             self.act = SiLU(**kwargs)
         elif act_type == "tanh":
             self.act = Tanh(**kwargs)
+        elif act_type == "sigmoid":
+            self.act = Sigmoid(**kwargs)
         else:
             raise ValueError(f"Unsupported activation type: {act_type}")
 

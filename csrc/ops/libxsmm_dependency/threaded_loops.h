@@ -21,6 +21,7 @@
 #define _THREADED_LOOPS_H_
 
 #include <stdio.h>
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <fstream>
@@ -37,6 +38,7 @@ typedef std::function<void(int*)> loop_func;
 
 class LoopSpecs {
  public:
+  LoopSpecs() : start(0), end(0), step(1), isParallel(true) {}
   LoopSpecs(long end) : LoopSpecs(0L, end, 1L) {}
   LoopSpecs(long end, bool isParallel) : LoopSpecs(0L, end, 1L, isParallel) {}
   LoopSpecs(long start, long end) : LoopSpecs(start, end, 1L) {}
@@ -102,11 +104,13 @@ inline LoopingScheme* getLoopingScheme(std::string scheme) {
 template <int N>
 class ThreadedLoop {
  public:
-  ThreadedLoop(const LoopSpecs (&bounds)[N], std::string scheme = "")
-      : bounds(bounds), scheme(scheme) {
-    if (scheme == "")
-      scheme = getDefaultScheme();
-    loopScheme = getLoopingScheme(scheme);
+  ThreadedLoop(const LoopSpecs (&bounds)[N], std::string loop_scheme = "")
+      : scheme(loop_scheme) {
+    std::copy(bounds, bounds + N, this->bounds);
+    if (loop_scheme == "")
+      loop_scheme = getDefaultScheme();
+    this->scheme = loop_scheme;
+    loopScheme = getLoopingScheme(this->scheme);
   }
 
   template <class T>

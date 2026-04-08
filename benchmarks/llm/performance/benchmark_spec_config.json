@@ -7,7 +7,7 @@
         "model_name": "Qwen/Qwen2.5-7B-Instruct",
         "dtype": "bf16",
         "llm_operators": {
-            "Norm": "NATIVE",
+            "Norm": "JIT",
             "QKVProjection": "TPP",
             "Attention" : "JIT",
             "OutProjection": "TPP",
@@ -24,14 +24,12 @@
         "input_tokens": 128,
         "output_tokens": 128,
         "batch_size": 1,
-        "num_beams": 1,
         "kv_cache_type": "BMC",
         "do_sample": false,
         "manual_seed": 0
     },
     "warmup_runs": 1,
     "num_runs": 2,
-    "visualize": false,
     "verbose": true,
     "output_dir": "./benchmark_results",
     "token_metrics": {

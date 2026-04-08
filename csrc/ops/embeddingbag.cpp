@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Modifications Copyright (c) 2024 Advanced Micro Devices, Inc. All rights
+ * Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
  * reserved. Notified per clause 4(b) of the license.
  * Portions of this file consist of AI-generated content
  *******************************************************************************/
@@ -80,12 +80,14 @@ at::Tensor qmerged_embedding_bag_nbit_cat(
 
 namespace {
 
-// clang-format off
 TORCH_LIBRARY_FRAGMENT(pace, m) {
-
-  // PACE Kernel
-  m.def("pace::qmerged_embedding_bag_nbit_cat", pace::qmerged_embedding_bag_nbit_cat);
+  m.def(
+      "qmerged_embedding_bag_nbit_cat(__torch__.torch.classes.quantized.EmbeddingPackedParamsBase[] weights, Tensor[] indices, Tensor[] offsets, Tensor dense, int bit_width) -> Tensor");
 }
-// clang-format on
+
+TORCH_LIBRARY_IMPL(pace, CPU, m) {
+  m.impl(
+      "qmerged_embedding_bag_nbit_cat", pace::qmerged_embedding_bag_nbit_cat);
+}
 
 } // namespace

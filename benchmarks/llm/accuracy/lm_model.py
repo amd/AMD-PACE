@@ -45,8 +45,13 @@ class PaceLLM(LM):
     ):
         super().__init__()
 
-        if generation_args.kv_cache_type.upper() == "BMC":
+        kv_upper = generation_args.kv_cache_type.upper()
+        if kv_upper == "BMC":
             kv_cache_type = KVCacheType.BMC
+        elif kv_upper == "PAGED":
+            kv_cache_type = KVCacheType.PAGED
+        elif kv_upper == "SLAB_POOL":
+            kv_cache_type = KVCacheType.SLAB_POOL
         else:
             kv_cache_type = KVCacheType.DYNAMIC
 
@@ -58,10 +63,10 @@ class PaceLLM(LM):
             )
             batch_size = 1
 
-        pard_config = None
+        spec_config = None
         if model_args.spec_config is not None:
             # If spec_config is provided, use it to create a PardSpecDecodeConfig
-            pard_config = PardSpecDecodeConfig(
+            spec_config = PardSpecDecodeConfig(
                 model_name_or_path=model_args.spec_config["model_name"],
                 num_speculative_tokens=model_args.spec_config["num_speculated_tokens"],
             )
@@ -73,7 +78,7 @@ class PaceLLM(LM):
             dtype=model_args.dtype,
             kv_cache_type=kv_cache_type,
             opconfig=OperatorConfig(**model_args.llm_operators),
-            pard_config=pard_config,
+            spec_config=spec_config,
         )
         self.model_config = self.model.get_config()
         self.tokenizer = self.model.get_tokenizer()

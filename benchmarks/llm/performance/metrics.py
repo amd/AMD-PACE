@@ -10,10 +10,10 @@ from typing import Dict, List, Optional
 
 import psutil
 import torch
-from pace.utils.logging import PACE_LLM_ASSERT, PACE_LLM_INFO, PACE_LLM_WARNING
 from transformers.generation.streamers import BaseStreamer
 
 from datastructs import GeneratorOutputAggregator, Metrics, SystemMetrics
+from utils import PACE_LLM_ASSERT, PACE_LLM_INFO, PACE_LLM_WARNING
 
 
 class FirstTokenTimerStreamer(BaseStreamer):

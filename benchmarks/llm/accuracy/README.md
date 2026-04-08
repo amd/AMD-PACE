@@ -29,7 +29,6 @@ benchmarks/llm/accuracy/
         *   `spec_config`: Configuration for speculative decoding.
     *   `generation_args`: An object for generation-specific arguments.
         *   `batch_size`: The number of samples to process in a single batch.
-        *   `num_beams`: The number of beams for beam search decoding.
         *   `kv_cache_type`: The type of key-value cache to use (e.g., "BMC").
     *   `tasks`: An array defining the benchmark tasks to run. Each task object specifies:
         *   `task_name`: The name of the evaluation task (e.g., "mmlu").

@@ -10,6 +10,7 @@ import json
 
 import torch
 from pace.llm import LLMBackendType, LLMOperatorType
+from pace.llm.attention import AttentionBackendType
 from pace.utils.logging import PACE_LLM_ASSERT
 
 from datastructs import ModelArgs, GenerationArgs
@@ -32,11 +33,19 @@ def verify_and_convert_operators(operators: dict) -> dict:
             key in [op.value for op in LLMOperatorType],
             f"Unsupported operator type: {key}, only {list([value.value for value in LLMOperatorType])} are supported.",
         )
-        PACE_LLM_ASSERT(
-            value in [backend.value for backend in LLMBackendType],
-            f"Unsupported backend type: {value}, only {list([value.value for value in LLMBackendType])} are supported.",
-        )
-        verified_operators[LLMOperatorType(key)] = LLMBackendType(value)
+        op_key = LLMOperatorType(key)
+        if op_key == LLMOperatorType.Attention:
+            PACE_LLM_ASSERT(
+                value in [b.value for b in AttentionBackendType],
+                f"Unsupported attention backend: {value}, only {list([b.value for b in AttentionBackendType])} are supported.",
+            )
+            verified_operators[op_key] = AttentionBackendType(value)
+        else:
+            PACE_LLM_ASSERT(
+                value in [backend.value for backend in LLMBackendType],
+                f"Unsupported backend type: {value}, only {list([value.value for value in LLMBackendType])} are supported.",
+            )
+            verified_operators[op_key] = LLMBackendType(value)
     return verified_operators
 
 
@@ -53,19 +62,14 @@ def verify_args(args):
         for key, value in config_args.items():
             config[key] = value
 
-    # PACE_LLM_ASSERT(args.batch_size >= 1, "batch_size must be a positive integer.")
-    # PACE_LLM_ASSERT(args.num_beams >= 1, "num_beams must be a positive integer.")
     PACE_LLM_ASSERT(
         config["generation_args"]["batch_size"] >= 1,
         "batch_size must be a positive integer.",
     )
     PACE_LLM_ASSERT(
-        config["generation_args"]["num_beams"] >= 1,
-        "num_beams must be a positive integer.",
-    )
-    PACE_LLM_ASSERT(
-        config["generation_args"]["kv_cache_type"] in ["BMC", "DYNAMIC"],
-        "kv_cache_type must be either 'BMC' or 'DYNAMIC'.",
+        config["generation_args"]["kv_cache_type"]
+        in ["BMC", "DYNAMIC", "PAGED", "SLAB_POOL"],
+        "kv_cache_type must be 'BMC', 'DYNAMIC', 'PAGED', or 'SLAB_POOL'.",
     )
 
     if "llm_operators" in config["model_args"]:
@@ -126,7 +130,7 @@ def get_args() -> argparse.Namespace:
     description = """
         This script evaluate the accuracy of a language model on a set of tasks.
         The tasks are defined in the config file, which specifies the model, tokenizer,
-        batch size, number of beams, and the tasks to evaluate on.
+        batch size, and the tasks to evaluate on.
     """
 
     epilog = """
@@ -161,7 +165,6 @@ def get_args() -> argparse.Namespace:
     #     },
     #     "generation_args": {
     #         "batch_size": 1,
-    #         "num_beams": 1,
     #         "kv_cache_type": "BMC",
     #     },
     #     "tasks": [
@@ -212,7 +215,6 @@ def get_args() -> argparse.Namespace:
 
     generation_args = GenerationArgs(
         batch_size=config["generation_args"]["batch_size"],
-        num_beams=config["generation_args"]["num_beams"],
         kv_cache_type=config["generation_args"]["kv_cache_type"],
     )
 

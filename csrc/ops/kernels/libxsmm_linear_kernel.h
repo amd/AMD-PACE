@@ -13,7 +13,6 @@
 namespace pace {
 namespace kernels {
 
-// Dummy class for NoActivation template
 class NoOpActivation {
  public:
   NoOpActivation(long BSb, long Hk, long K, long K2) {}
@@ -22,7 +21,6 @@ class NoOpActivation {
   void operator()(T* in, T* out) const {}
 };
 
-// Aliasing template names
 using ReLUActivation = ReLUFwdTPP<at::BFloat16>;
 using GeluActivation = GeluFwdTPP<at::BFloat16>;
 using SiLUActivation = SiLUFwdTPP<at::BFloat16>;
@@ -48,6 +46,31 @@ void libxsmmlinear_kernel(
     at::Tensor& t_wt,
     at::Tensor& t_bias,
     at::Tensor& t_out);
+
+/**
+ * @brief Fused MLP: gate+activation+up+mul+down in a single OMP region.
+ *
+ * Dispatches to the templated kernel implementation based on the activation
+ * string. Supports "silu", "gelu", and "relu".
+ *
+ * @param t_in         Input tensor [B, S, C] (bfloat16)
+ * @param t_wt_gate    Gate weight (packed 5D), or empty for non-gated MLP
+ * @param t_wt_up      Up-projection weight (packed 5D)
+ * @param t_wt_down    Down-projection weight (packed 5D)
+ * @param t_gate_bias  Optional gate bias
+ * @param t_up_bias    Optional up-projection bias
+ * @param t_down_bias  Optional down-projection bias
+ * @param activation   One of "silu", "gelu", "relu"
+ */
+at::Tensor fused_mlp_dispatch(
+    const at::Tensor& t_in,
+    const c10::optional<at::Tensor>& t_wt_gate,
+    const at::Tensor& t_wt_up,
+    const at::Tensor& t_wt_down,
+    const c10::optional<at::Tensor>& t_gate_bias,
+    const c10::optional<at::Tensor>& t_up_bias,
+    const c10::optional<at::Tensor>& t_down_bias,
+    const std::string& activation);
 
 } // namespace kernels
 } // namespace pace

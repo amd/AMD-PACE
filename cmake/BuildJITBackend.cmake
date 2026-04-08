@@ -15,7 +15,7 @@ if("$ENV{JIT_BACKEND}" STREQUAL "zendnn")
 else()
 
   set(JIT_BACKEND_LIB "onednn")
-  set(ONEDNN_VERSION v3.8)
+  set(ONEDNN_VERSION v3.11)
 
   set(ONEDNN_PROJ_DIR
       ${CMAKE_CURRENT_BINARY_DIR}/${JIT_BACKEND_LIB}/src/${JIT_BACKEND_LIB})
@@ -25,7 +25,7 @@ else()
   # Download, build and install oneDNN library
   ExternalProject_Add(
     ${JIT_BACKEND_PROJECT}
-    GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
+    GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN.git
     GIT_TAG ${ONEDNN_VERSION}
     PREFIX ${JIT_BACKEND_LIB}
     SOURCE_DIR ${ONEDNN_PROJ_DIR}
@@ -38,6 +38,7 @@ else()
       -DONEDNN_BUILD_GRAPH=OFF
       -DONEDNN_VERBOSE=ON
       -DONEDNN_ENABLE_WORKLOAD=INFERENCE
+      -DONEDNN_EXPERIMENTAL_UKERNEL=ON
       -DCMAKE_INSTALL_PREFIX=${ONEDNN_PROJ_BUILD_DIR}
     BUILD_COMMAND make -j
     INSTALL_COMMAND make install

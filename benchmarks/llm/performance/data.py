@@ -10,8 +10,9 @@ from typing import Optional
 
 import tqdm
 import torch
-from pace.utils.logging import PACE_LLM_ASSERT, PACE_LLM_INFO
 from transformers import PreTrainedTokenizer, BatchEncoding
+
+from utils import PACE_LLM_ASSERT, PACE_LLM_INFO
 
 
 class BenchMarkDataGenerator(Generator):
@@ -95,6 +96,8 @@ class BenchMarkDataGenerator(Generator):
         # @Question: Should we allow the user to specify the dataset name and version?
         dataset_name = "openai/gsm8k"
         dataset_version = "main"
+
+        tokenizer.padding_side = "left"
 
         PACE_LLM_INFO(
             f"Generating real data input of {input_tokens} tokens for {batch_size} batch size using {dataset_name}: v{dataset_version}."

@@ -7,7 +7,7 @@
         "model_name": "facebook/opt-125m",
         "dtype": "bf16",
         "llm_operators": {
-            "Norm": "NATIVE",
+            "Norm": "JIT",
             "QKVProjection": "TPP",
             "Attention" : "JIT",
             "OutProjection": "TPP",
@@ -21,14 +21,12 @@
         "input_tokens": 128,
         "output_tokens": 128,
         "batch_size": 1,
-        "num_beams": 1,
         "kv_cache_type": "BMC",
         "do_sample": false,
         "manual_seed": 0
     },
-    "warmup_runs": 2,
-    "num_runs": 5,
-    "visualize": false,
+    "warmup_runs": 1,
+    "num_runs": 3,
     "verbose": true,
     "output_dir": "./benchmark_results",
     "token_metrics": {

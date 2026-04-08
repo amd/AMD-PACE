@@ -1,36 +1,60 @@
 # ******************************************************************************
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
+# Portion of this file may consist of AI-generated code.
 # ******************************************************************************
 
+import argparse
 import asyncio
 import time
-import json
-from typing import Dict, Any
 import httpx
+import os
+from typing import Dict, Any
 
-from pace.utils.logging import PACE_DEBUG, PACE_INFO
+
+os.environ["PACE_LOG_LEVEL"] = "none"
+
+PROMPT_COLOR = "\033[94m"
+RESPONSE_COLOR = "\033[92m"
+ERROR_COLOR = "\033[91m"
+RESET_COLOR = "\033[0m"
 
 
 async def call_api_router(
-    model_name: str, router_url: str, prompt: str, gen_kwargs: Dict[str, Any]
+    model_name: str,
+    router_url: str,
+    prompt: str,
+    gen_kwargs: Dict[str, Any],
+    request_num: int,
+    total_requests: int,
 ) -> str:
     """
     Call the router asynchronously with a single prompt and generation parameters.
+    Prints the prompt when sent and output when received.
     """
+
     payload = {
         "model": model_name,
         "prompt": prompt,
-        "max_tokens": gen_kwargs.get("max_new_tokens", 50),
-        "temperature": gen_kwargs.get("temperature", 0.7),
-        "top_p": gen_kwargs.get("top_p", 1.0),
-        "top_k": gen_kwargs.get("top_k", 50),  # Added top_k parameter
-        "seed": gen_kwargs.get("random_seed", None),
+        "stream": False,
+        "gen_config": {
+            "max_new_tokens": gen_kwargs.get("max_new_tokens", 50),
+            "temperature": gen_kwargs.get("temperature", 0.7),
+            "top_p": gen_kwargs.get("top_p", 1.0),
+            "top_k": gen_kwargs.get("top_k", 50),
+            "seed": gen_kwargs.get("seed", None),
+            "do_sample": gen_kwargs.get("do_sample", True),
+            "repetition_penalty": gen_kwargs.get("repetition_penalty", 1.0),
+            "frequency_penalty": gen_kwargs.get("frequency_penalty", 0.0),
+            "stop": gen_kwargs.get("stop_strings", "\n\n"),
+        },
     }
-    if "stop_strings" in gen_kwargs and gen_kwargs["stop_strings"]:
-        payload["stop"] = gen_kwargs["stop_strings"]
 
-    headers = {"Content-Type": "application/json", "Authorization": "API KEY"}
+    headers = {"Content-Type": "application/json"}
+
+    print(
+        f"\n{PROMPT_COLOR}[{request_num}/{total_requests}] Sending: {prompt}{RESET_COLOR}"
+    )
 
     async with httpx.AsyncClient() as client:
         try:
@@ -38,19 +62,25 @@ async def call_api_router(
                 f"{router_url}/v1/completions",
                 headers=headers,
                 json=payload,
-                timeout=60,
+                timeout=500,
             )
             response.raise_for_status()
             result = response.json()
             if "choices" in result and len(result["choices"]) > 0:
-                return result["choices"][0]["text"]
+                output = result["choices"][0]["message"]["content"]
+                print(
+                    f"{RESPONSE_COLOR}[{request_num}/{total_requests}] Received: {output}{RESET_COLOR}"
+                )
+                return output
             else:
-                PACE_INFO(f"Warning: Unexpected response format: {result}")
+                print(
+                    f"{ERROR_COLOR}[{request_num}/{total_requests}] Warning: Unexpected response format{RESET_COLOR}"
+                )
                 return ""
         except Exception as e:
-            PACE_INFO(f"Error calling API: {type(e).__name__}: {e}")
-            PACE_INFO(f"Failed to get response from {router_url}/v1/completions")
-            PACE_INFO(f"Payload: {json.dumps(payload, indent=2)}")
+            print(
+                f"{ERROR_COLOR}[{request_num}/{total_requests}] Error: {type(e).__name__}: {e}{RESET_COLOR}"
+            )
             return ""
 
 
@@ -59,40 +89,34 @@ async def generate_and_time(
 ):
     start = time.time()
 
-    async def single_prompt(prompt):
-        PROMPT_COLOR = "\033[94m"  # Blue for prompt issued
-        RESPONSE_COLOR = "\033[92m"  # Green for response
-        PROMPT_IN_RESPONSE_COLOR = (
-            "\033[96m"  # Cyan (light blue) for prompt in response
-        )
-        RESET_COLOR = "\033[0m"
-
-        PACE_INFO(f"\n{PROMPT_COLOR}Prompt issued: {prompt}{RESET_COLOR}")
-        output = await call_api_router(model_name, router_url, prompt, gen_kwargs)
-        PACE_INFO(
-            f"\n{RESPONSE_COLOR}Model output for prompt [{PROMPT_IN_RESPONSE_COLOR}{prompt}{RESPONSE_COLOR}]: {output}{RESET_COLOR}"
-        )
-        return output
-
     tasks = []
-    for prompt in input_prompts:
-        task = asyncio.create_task(single_prompt(prompt))
+    for i, prompt in enumerate(input_prompts, 1):
+        task = asyncio.create_task(
+            call_api_router(
+                model_name, router_url, prompt, gen_kwargs, i, len(input_prompts)
+            )
+        )
         tasks.append(task)
         await asyncio.sleep(interval)
 
     results = await asyncio.gather(*tasks)
+
     elapsed = time.time() - start
-    PACE_DEBUG("Time taken: ", elapsed)
+    print(f"\n{'=' * 80}")
+    print(f"Total time taken: {elapsed:.2f} seconds")
+    print(f"Average time per request: {elapsed / len(input_prompts):.2f} seconds")
+    print(f"Successful requests: {sum(1 for r in results if r)} / {len(results)}")
+    print(f"{'=' * 80}\n")
     return results
 
 
-async def run_pace_llm():
+async def run_pace_llm(args):
     """
     Run the PACE model via async API calls to the router.
     """
-    router_url = "http://localhost:8001"
+    router_url = f"http://{args.router_host}:{args.router_port}"
 
-    model_name = "facebook/opt-6.7b"
+    model_name = args.model
     inputs_str = [
         "A lone astronaut discovers a hidden message on Mars,",
         "The world's last bookstore receives a mysterious",
@@ -126,34 +150,109 @@ async def run_pace_llm():
         "do_sample": True,
         "temperature": 0.7,
         "top_k": 50,
-        "random_seed": 123,
+        "top_p": 1.0,
+        "seed": 123,
+        "repetition_penalty": 1.0,
+        "frequency_penalty": 0.0,
         "stop_strings": ["\n\n"],
     }
 
-    PACE_INFO("\nRunning PACE model via async API")
-    PACE_INFO("Model Name: ", model_name)
-    PACE_INFO("Input: ", inputs_str)
-    PACE_INFO("Router URL: ", router_url)
+    launch_cmd = (
+        f"pace-server --server_model {model_name} --dtype bfloat16 \\\n"
+        f"      --serve_type {args.scheduler_type} \\\n"
+        f"      --scheduler_metrics_enabled True --enable_prometheus"
+    )
 
-    # Check if the router is available
+    print(f"\n{'=' * 80}")
+    print("PACE Model Inference Test")
+    print(f"{'=' * 80}")
+    print(f"Model: {model_name}")
+    print(f"Router URL: {router_url}")
+    print(f"Scheduler Type: {args.scheduler_type}")
+    print(f"Total Prompts: {len(inputs_str)}")
+    print(f"{'=' * 80}\n")
+
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"{router_url}/v1/models")
-            if response.status_code == 200:
-                available_models = response.json()
-                PACE_INFO("Available models: ", json.dumps(available_models, indent=2))
-            else:
-                PACE_INFO(
-                    f"Warning: Router returned status code {response.status_code}"
+            response = await client.get(f"{router_url}/v1/health")
+            if response.status_code != 200:
+                print(
+                    f"{ERROR_COLOR}Warning: Router returned status code {response.status_code}{RESET_COLOR}"
                 )
+
+            probe = await client.post(
+                f"{router_url}/v1/completions",
+                json={
+                    "model": model_name,
+                    "prompt": "probe",
+                    "stream": False,
+                    "gen_config": {"max_new_tokens": 1},
+                },
+                timeout=60,
+            )
+            if probe.status_code == 404:
+                body = probe.json()
+                if body.get("error", {}).get("code") == "model_not_found":
+                    print(
+                        f"{ERROR_COLOR}Model '{model_name}' is not loaded on the server.{RESET_COLOR}"
+                    )
+                    print(f"\nStart the server with:\n\n    {launch_cmd}\n")
+                    return
+            print(
+                f"{RESPONSE_COLOR}Router available -- model '{model_name}' confirmed{RESET_COLOR}"
+            )
     except Exception as e:
-        PACE_INFO(f"Error connecting to router: {e}")
-        PACE_INFO("\nMake sure to start the router with $ python router.py\n")
+        print(f"{ERROR_COLOR}Cannot reach server: {e}{RESET_COLOR}")
+        print(f"\nStart the server with:\n\n    {launch_cmd}\n")
         return
 
-    # Generate outputs via router API
     await generate_and_time(model_name, router_url, inputs_str, gen_kwargs, interval=3)
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="PACE Server Basic Example - Send requests to PACE router"
+    )
+    parser.add_argument(
+        "--router_host",
+        type=str,
+        default="localhost",
+        help="Router host address (default: localhost)",
+    )
+    parser.add_argument(
+        "--router_port",
+        type=int,
+        default=8080,
+        help="Router port (default: 8080)",
+    )
+    parser.add_argument(
+        "--server_host",
+        type=str,
+        default="localhost",
+        help="Engine server host address (default: localhost)",
+    )
+    parser.add_argument(
+        "--server_port",
+        type=int,
+        default=8000,
+        help="Engine server port (default: 8000)",
+    )
+    parser.add_argument(
+        "--scheduler_type",
+        type=str,
+        default="iterative",
+        choices=["iterative", "continuous_prefill_first"],
+        help="Type of scheduler to use (default: iterative)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="facebook/opt-6.7b",
+        help="Model name to use (default: facebook/opt-6.7b)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(run_pace_llm())
+    args = parse_arguments()
+    asyncio.run(run_pace_llm(args))

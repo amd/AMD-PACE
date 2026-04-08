@@ -1,0 +1,22 @@
+# MLPerf Server scenario — install in a dedicated conda env named "mlperf".
+# Do NOT use the main project env for this benchmark.
+#
+#   conda create -n mlperf python=3.12 -y
+#   conda activate mlperf
+#   pip install -r requirements.txt
+#
+# Start vLLM or PACE server separately; benchmark only sends requests to it.
+#
+# Dependencies (used by main.py, SUT_PACE_async.py, dataset.py, evaluation.py, download_model.py):
+mlcommons-loadgen==5.1.0
+transformers==4.55.2
+numpy>=1.24
+pandas
+aiohttp
+uvloop==0.22.1
+nltk
+evaluate
+rouge_score
+absl-py
+huggingface-hub
+sentencepiece

@@ -61,3 +61,58 @@ class TestStoppingCriteria(TestCase):
         for eos_token_id in eos_token_ids:
             logits[0, -1] = eos_token_id
             self.assertTrue(stopping_criteria.stop_now(logits).max())
+
+    def test_ignore_eos(self):
+        """EOS tokens should not trigger stopping when ignore_eos=True."""
+        eos_id = 2
+        sampling_config = SamplingConfig(
+            max_new_tokens=10, eos_token_id=[eos_id], ignore_eos=True
+        )
+        input_prompts = torch.rand((1, 5))
+        sc = StoppingCriteria(sampling_config, input_prompts)
+
+        logits = torch.zeros((1, 6), dtype=torch.long)
+        logits[0, -1] = eos_id
+        self.assertFalse(sc.stop_now(logits).item())
+
+    def test_ignore_eos_default_false(self):
+        """With default ignore_eos=False, EOS should still trigger stopping."""
+        eos_id = 2
+        sampling_config = SamplingConfig(eos_token_id=[eos_id])
+        input_prompts = torch.rand((1, 5))
+        sc = StoppingCriteria(sampling_config, input_prompts)
+
+        logits = torch.zeros((1, 6), dtype=torch.long)
+        logits[0, -1] = eos_id
+        self.assertTrue(sc.stop_now(logits).item())
+
+    def test_min_new_tokens_suppresses_eos(self):
+        """EOS should not stop generation until min_new_tokens is reached."""
+        eos_id = 2
+        sampling_config = SamplingConfig(
+            max_new_tokens=10, min_new_tokens=5, eos_token_id=[eos_id]
+        )
+        input_prompts = torch.rand((1, 5))
+        sc = StoppingCriteria(sampling_config, input_prompts)
+
+        # 2 new tokens generated (seq len 7), below min_new_tokens=5
+        logits = torch.zeros((1, 7), dtype=torch.long)
+        logits[0, -1] = eos_id
+        self.assertFalse(sc.stop_now(logits).item())
+
+        # 5 new tokens generated (seq len 10), at min_new_tokens=5
+        logits = torch.zeros((1, 10), dtype=torch.long)
+        logits[0, -1] = eos_id
+        self.assertTrue(sc.stop_now(logits).item())
+
+    def test_min_new_tokens_greater_than_max_still_stops(self):
+        """max_new_tokens must always be respected even if min_new_tokens > max_new_tokens."""
+        sampling_config = SamplingConfig(
+            max_new_tokens=3, min_new_tokens=10, eos_token_id=[2]
+        )
+        input_prompts = torch.rand((1, 5))
+        sc = StoppingCriteria(sampling_config, input_prompts)
+
+        # At max_length (5 + 3 = 8), should stop even though below min_length (5 + 10 = 15)
+        logits = torch.zeros((1, 8), dtype=torch.long)
+        self.assertTrue(sc.stop_now(logits).item())

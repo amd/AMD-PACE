@@ -31,17 +31,17 @@ class TestSampler(TestCase):
             top_k=0,
             top_p=1.0,
             min_p=0,
-            num_beams=1,
             eos_token_id=[0],
         )
         config.verify_max_new_tokens()
         config.finalize()
         sampler = Sampler(config, input_tensor)
         logits = torch.randn(2, 5)
-        output = sampler.sample(logits, input_tensor)
+        output = sampler.sample(input_tensor, logits)
         self.assertEqual(output.next_tokens.shape, (2, 1))
-        self.assertIsNotNone(output.probs)
-        self.assertIsNotNone(output.logprobs)
+        # Greedy fast path returns None for probs/logprobs (no softmax needed).
+        self.assertIsNone(output.probs)
+        self.assertIsNone(output.logprobs)
 
     def test_random_sampling(self):
         config = SamplingConfig(
@@ -50,7 +50,6 @@ class TestSampler(TestCase):
             top_k=0,
             top_p=1.0,
             min_p=0,
-            num_beams=1,
             eos_token_id=[0],
         )
         config.verify_max_new_tokens()
@@ -61,26 +60,6 @@ class TestSampler(TestCase):
         self.assertEqual(output.next_tokens.shape, (2, 1))
         self.assertIsNotNone(output.probs)
         self.assertIsNotNone(output.logprobs)
-
-    def test_beam_search(self):
-        num_beams = 2
-        config = SamplingConfig(
-            do_sample=False,
-            temperature=1.0,
-            top_k=0,
-            top_p=1.0,
-            min_p=0,
-            num_beams=num_beams,
-            eos_token_id=[0],
-        )
-        config.verify_max_new_tokens()
-        config.finalize()
-        sampler = Sampler(config, input_tensor)
-        logits = torch.repeat_interleave(torch.randn(2, 5), num_beams, dim=0)
-        beam_scores = torch.zeros(2 * num_beams)
-        output = sampler.sample(input_tensor, logits, beam_scores)
-        self.assertEqual(output.next_tokens.shape, (2, sampler.n_tokens_to_keep))
-        self.assertIsNotNone(output.probs)
 
     @given(
         temperature=st.floats(min_value=0.01, max_value=5.0),
@@ -98,7 +77,6 @@ class TestSampler(TestCase):
             top_k=top_k,
             top_p=top_p,
             min_p=min_p,
-            num_beams=1,
             eos_token_id=[0],
         )
         config.verify_max_new_tokens()
@@ -107,8 +85,9 @@ class TestSampler(TestCase):
         logits = torch.randn(batch_size, vocab_size)
         output = sampler.sample(input_tensor, logits)
         self.assertEqual(output.next_tokens.shape, (batch_size, 1))
-        self.assertIsNotNone(output.probs)
-        self.assertIsNotNone(output.logprobs)
+        if not sampler._greedy_fast_path:
+            self.assertIsNotNone(output.probs)
+            self.assertIsNotNone(output.logprobs)
 
     def test_seed_reproducibility(self):
         config = SamplingConfig(
@@ -116,7 +95,6 @@ class TestSampler(TestCase):
             top_k=0,
             top_p=1.0,
             min_p=0,
-            num_beams=1,
             eos_token_id=[0],
             sampling_seed=42,
         )
@@ -138,7 +116,6 @@ class TestSampler(TestCase):
             top_k=1_000_000,  # Larger than vocab
             top_p=1.0,
             min_p=0,
-            num_beams=1,
             eos_token_id=[0],
         )
         config.verify_max_new_tokens()
@@ -147,7 +124,6 @@ class TestSampler(TestCase):
         logits = torch.randn(3, 4)
         output = sampler.sample(input_tensor, logits)
         self.assertEqual(output.next_tokens.shape, (3, 1))
-        self.assertIsNotNone(output.probs)
 
     def test_zero_temperature(self):
         config = SamplingConfig(
@@ -155,7 +131,6 @@ class TestSampler(TestCase):
             top_k=0,
             top_p=1.0,
             min_p=0,
-            num_beams=1,
             eos_token_id=[0],
         )
         config.verify_max_new_tokens()
@@ -164,8 +139,6 @@ class TestSampler(TestCase):
         logits = torch.randn(3, 5)
         output = sampler.sample(input_tensor, logits)
         self.assertEqual(output.next_tokens.shape, (3, 1))
-        self.assertIsNotNone(output.probs)
-        self.assertIsNotNone(output.logprobs)
 
     def test_infinite_logits(self):
         config = SamplingConfig(
@@ -173,7 +146,6 @@ class TestSampler(TestCase):
             top_k=2,
             top_p=1.0,
             min_p=0,
-            num_beams=1,
             eos_token_id=[0],
         )
         config.verify_max_new_tokens()
@@ -193,6 +165,7 @@ class TestSampler(TestCase):
             random_seed=123,
             eos_token_id=1,
             min_new_tokens=4,
+            return_logprobs=True,  # Force slow path to verify EOS suppression
         )
         config.verify_max_new_tokens()
         config.finalize()
@@ -204,14 +177,13 @@ class TestSampler(TestCase):
         self.assertEqual(output.logprobs[0][1], -math.inf)
         self.assertEqual(output.logprobs[1][1], -math.inf)
 
-    def test_frequency_penalty_application(self):
+    def test_repetition_penalty_application(self):
         config = SamplingConfig(
             max_new_tokens=50,
             do_sample=True,
             temperature=0,
-            random_seed=123,
             eos_token_id=3,
-            frequency_penalty=1.87,
+            repetition_penalty=1.87,
         )
         config.verify_max_new_tokens()
         config.finalize()
@@ -222,69 +194,104 @@ class TestSampler(TestCase):
         output = sampler.sample(input_tensor, logits)
         logit = torch.gather(logits, 1, input_tensor)
         logit = torch.where(
-            logit < 0,
-            logit * config.frequency_penalty,
-            logit / config.frequency_penalty,
+            logit > 0,
+            logit / config.repetition_penalty,
+            logit * config.repetition_penalty,
         )
         processed_logits = logits.scatter(1, input_tensor, logit)
         processed_logits = torch.softmax(processed_logits, dim=-1, dtype=torch.float)
         self.assertEqual(processed_logits, output.probs)
 
-    def test_min_new_tokens_with_beam_search(self):
+    def test_greedy_fast_path_flag(self):
+        """Greedy fast path flag is set correctly at init."""
+        # Default greedy: fast path eligible
+        greedy_config = SamplingConfig(do_sample=False, eos_token_id=[0])
+        greedy_config.verify_max_new_tokens()
+        greedy_config.finalize()
+        s1 = Sampler(greedy_config, input_tensor)
+        self.assertTrue(s1._greedy_fast_path)
+
+        # Greedy with penalty: NOT eligible
+        penalty_config = SamplingConfig(
+            do_sample=False, frequency_penalty=0.5, eos_token_id=[0]
+        )
+        penalty_config.verify_max_new_tokens()
+        penalty_config.finalize()
+        s2 = Sampler(penalty_config, input_tensor)
+        self.assertFalse(s2._greedy_fast_path)
+
+        # Sampling: NOT eligible
+        sample_config = SamplingConfig(
+            do_sample=True, temperature=0.7, eos_token_id=[0]
+        )
+        sample_config.verify_max_new_tokens()
+        sample_config.finalize()
+        s3 = Sampler(sample_config, input_tensor)
+        self.assertFalse(s3._greedy_fast_path)
+
+        # Greedy with min_new_tokens: NOT eligible (needs EOS masking)
+        min_tokens_config = SamplingConfig(
+            do_sample=False, min_new_tokens=4, eos_token_id=[0]
+        )
+        min_tokens_config.verify_max_new_tokens()
+        min_tokens_config.finalize()
+        s4 = Sampler(min_tokens_config, input_tensor)
+        self.assertFalse(s4._greedy_fast_path)
+
+    def test_greedy_fast_path_matches_slow_path(self):
+        """Greedy fast path produces same tokens as full pipeline."""
+        test_input = torch.tensor([[0, 1, 2, 3, 4]])
+        logits = torch.randn(1, 10)
+
+        # Fast path (default greedy)
+        fast_config = SamplingConfig(do_sample=False, eos_token_id=[0])
+        fast_config.verify_max_new_tokens()
+        fast_config.finalize()
+        fast_sampler = Sampler(fast_config, test_input)
+        fast_out = fast_sampler.sample(test_input, logits.clone())
+
+        # Slow path (greedy + return_logprobs forces slow path)
+        slow_config = SamplingConfig(
+            do_sample=False, return_logprobs=True, eos_token_id=[0]
+        )
+        slow_config.verify_max_new_tokens()
+        slow_config.finalize()
+        slow_sampler = Sampler(slow_config, test_input)
+        slow_out = slow_sampler.sample(test_input, logits.clone())
+
+        self.assertEqual(fast_out.next_tokens, slow_out.next_tokens)
+        self.assertIsNone(fast_out.probs)
+        self.assertIsNotNone(slow_out.probs)
+
+    def test_frequency_penalty_application(self):
+        prompt_tokens = torch.tensor([[0, 1, 2, 3, 4]])
+        prompt_and_output = torch.tensor([[0, 1, 2, 3, 4, 2, 2, 3]])
+
         config = SamplingConfig(
             max_new_tokens=50,
-            do_sample=False,
-            num_beams=2,
+            do_sample=True,
             temperature=0,
-            eos_token_id=0,
-            min_new_tokens=4,
+            eos_token_id=3,
+            frequency_penalty=0.5,
         )
         config.verify_max_new_tokens()
         config.finalize()
-        sampler = Sampler(config, input_tensor)
-        logits = torch.repeat_interleave(torch.randn(2, 5), 2, dim=0)
-        beam_scores = torch.zeros(2 * 2)
-        output = sampler.sample(input_tensor, logits, beam_scores)
-        check_eos_existence = torch.eq(output.next_tokens, 0).any().item()
-        self.assertFalse(check_eos_existence)
+        sampler = Sampler(config, prompt_tokens)
 
-    def test_frequency_penalty_application_with_beam_search(self):
-        config = SamplingConfig(
-            max_new_tokens=50,
-            do_sample=False,
-            temperature=1.0,
-            num_beams=2,
-            top_k=0,
-            top_p=1.0,
-            min_p=0,
-            eos_token_id=[1],
-            frequency_penalty=1.7,
+        logits = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+
+        output = sampler.sample(prompt_and_output, logits)
+
+        # Output tokens are indices [5:] = [2, 2, 3]
+        # Token 2 appears 2 times, token 3 appears 1 time
+        expected_logits = logits.clone()
+        bin_counts = torch.zeros_like(expected_logits)
+        output_tokens = prompt_and_output[:, prompt_tokens.shape[-1] :]
+        bin_counts.scatter_add_(
+            1,
+            output_tokens,
+            torch.ones_like(output_tokens, dtype=expected_logits.dtype),
         )
-        config.finalize()
-        sampler = Sampler(config, input_tensor)
-        logits = torch.repeat_interleave(torch.randn(2, 5), 2, dim=0)
-        beam_scores = torch.zeros(2 * 2)
-        output = sampler.sample(input_tensor, logits, beam_scores)
-        logit = torch.gather(logits, 1, input_tensor)
-        logit = torch.where(
-            logit < 0,
-            logit * config.frequency_penalty,
-            logit / config.frequency_penalty,
-        )
-        processed_logits = logits.scatter(1, input_tensor, logit)
-        processed_logits = torch.log_softmax(
-            processed_logits, dim=-1, dtype=torch.float
-        )
-        processed_logits = processed_logits + beam_scores[:, None].expand_as(
-            processed_logits
-        )
-        vocab_size = processed_logits.shape[-1]
-        processed_logits = processed_logits.view(-1, 2 * vocab_size)
-        n_eos_tokens = (
-            config.eos_token_id.shape[0] if config.eos_token_id is not None else 0
-        )
-        n_tokens_to_keep = max(2, 1 + n_eos_tokens) * config.num_beams
-        processed_logits, next_tokens = torch.topk(
-            processed_logits, n_tokens_to_keep, dim=1, largest=True, sorted=True
-        )
-        self.assertEqual(processed_logits, output.probs)
+        expected_logits = expected_logits - 0.5 * bin_counts
+        expected_probs = torch.softmax(expected_logits, dim=-1, dtype=torch.float)
+        self.assertEqual(expected_probs, output.probs)

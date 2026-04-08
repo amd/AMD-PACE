@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
+ * Copyright (c) 2026 Advanced Micro Devices, Inc.
  * All rights reserved.
  * Portions of this file consist of AI-generated content
  ******************************************************************************/
@@ -473,32 +473,35 @@ namespace {
 
 TORCH_LIBRARY_FRAGMENT(pace, m) {
   // For the fp32/bf16 dtypes without scales
-  m.def(
-      "linear(Tensor input, Tensor weight, Tensor ? bias) -> Tensor",
-      pace::linear);
-  m.def(
-      "linear_relu(Tensor input, Tensor weight, Tensor ? bias) -> Tensor",
-      pace::linear_relu);
+  m.def("linear(Tensor input, Tensor weight, Tensor ? bias) -> Tensor");
+  m.def("linear_relu(Tensor input, Tensor weight, Tensor ? bias) -> Tensor");
 
   // For the int8 -> int8 and int8 -> fp32 dtypes with scales and zero points
   m.def(
-      "qlinear(Tensor input, Tensor weight, Tensor ? bias, Scalar o_scale, Scalar o_zero_point, ScalarType o_dtype) -> Tensor",
-      pace::qlinear);
+      "qlinear(Tensor input, Tensor weight, Tensor ? bias, Scalar o_scale, Scalar o_zero_point, ScalarType o_dtype) -> Tensor");
   m.def(
-      "qlinear_relu(Tensor input, Tensor weight, Tensor ? bias, Scalar o_scale, Scalar o_zero_point, ScalarType o_dtype) -> Tensor",
-      pace::qlinear_relu);
+      "qlinear_relu(Tensor input, Tensor weight, Tensor ? bias, Scalar o_scale, Scalar o_zero_point, ScalarType o_dtype) -> Tensor");
   // For the INT8 -> FP32 dtypes
   m.def(
-      "qlinear_mul_add(Tensor input, Tensor weight, Tensor ? bias, Tensor multiplier, Tensor addend, Scalar alpha) -> Tensor",
-      pace::qlinear_mul_add);
+      "qlinear_mul_add(Tensor input, Tensor weight, Tensor ? bias, Tensor multiplier, Tensor addend, Scalar alpha) -> Tensor");
   m.def(
-      "qlinear_sigmoid(Tensor input, Tensor weight, Tensor ? bias) -> Tensor",
-      pace::qlinear_sigmoid);
+      "qlinear_sigmoid(Tensor input, Tensor weight, Tensor ? bias) -> Tensor");
 
   // torch.compile experiment
-  m.def(
-      "pace_addmm(Tensor bias, Tensor input, Tensor weight) -> Tensor",
-      pace::pace_addmm);
+  m.def("pace_addmm(Tensor bias, Tensor input, Tensor weight) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(pace, CPU, m) {
+  m.impl("linear", pace::linear);
+  m.impl("linear_relu", pace::linear_relu);
+  m.impl("pace_addmm", pace::pace_addmm);
+}
+
+TORCH_LIBRARY_IMPL(pace, QuantizedCPU, m) {
+  m.impl("qlinear", pace::qlinear);
+  m.impl("qlinear_relu", pace::qlinear_relu);
+  m.impl("qlinear_mul_add", pace::qlinear_mul_add);
+  m.impl("qlinear_sigmoid", pace::qlinear_sigmoid);
 }
 
 } // namespace

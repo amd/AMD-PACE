@@ -11,7 +11,12 @@ import torch
 import pace  # noqa: F401
 from pace.ops.base import BackendBase
 from pace.ops.registry import backend_registry
-from pace.ops.enum import OperatorType, BackendType, DataType
+from pace.ops.enum import (
+    OperatorType,
+    FusedOperatorType,
+    BackendType,
+    DataType,
+)
 
 
 @backend_registry.register(
@@ -29,19 +34,74 @@ class JITLinear(BackendBase):
 
 
 @backend_registry.register(
-    OperatorType.MHA, BackendType.JIT, [DataType.FLOAT32, DataType.BFLOAT16]
+    OperatorType.RMSNORM,
+    BackendType.JIT,
+    [DataType.BFLOAT16],
 )
-class JITAttention(BackendBase):
+class JITRMSNorm(BackendBase):
 
     def execute(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        input: torch.Tensor,
+        _normalized_shape,
+        weight: torch.Tensor,
+        eps: float = 1e-5,
     ) -> torch.Tensor:
-        # Ensure tensors are contiguous for JIT compatibility
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        return torch.ops.pace.attention(query, key, value, attention_mask, False)
+        return torch.ops.pace.rmsnorm(input, weight, eps)
+
+
+@backend_registry.register(
+    OperatorType.LAYERNORM,
+    BackendType.JIT,
+    [DataType.BFLOAT16],
+)
+class JITLayerNorm(BackendBase):
+
+    def execute(
+        self,
+        input: torch.Tensor,
+        _normalized_shape,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        eps: float = 1e-5,
+    ) -> torch.Tensor:
+        if bias is None:
+            bias = torch.zeros_like(weight)
+        return torch.ops.pace.layernorm(input, weight, bias, eps)
+
+
+@backend_registry.register(
+    FusedOperatorType.FUSED_LAYERNORM_RESIDUAL,
+    BackendType.JIT,
+    [DataType.BFLOAT16],
+)
+class JITFusedLayerNormResidual(BackendBase):
+
+    def execute(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if bias is None:
+            bias = torch.zeros_like(weight)
+        return torch.ops.pace.fused_add_layernorm(x, residual, weight, bias, eps)
+
+
+@backend_registry.register(
+    FusedOperatorType.FUSED_RMSNORM_RESIDUAL,
+    BackendType.JIT,
+    [DataType.BFLOAT16],
+)
+class JITFusedRMSNormResidual(BackendBase):
+
+    def execute(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.pace.fused_add_rmsnorm(x, residual, weight, eps)

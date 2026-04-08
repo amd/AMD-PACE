@@ -105,6 +105,32 @@ at::Tensor libxsmmlinear_mul(
     at::Tensor& weight,
     c10::optional<at::Tensor> bias_opt);
 
+/**
+ * @brief Fused MLP: gate+activation+up+mul+down in a single OMP region.
+ *
+ * Performs all three MLP projections (gate, up, down) fused into one call,
+ * reducing OMP region overhead and enabling L1 tile reuse.
+ *
+ * @param input      Input tensor [B, S, C] or [S, C] (bfloat16)
+ * @param wt_gate    Optional gate weight (packed 5D)
+ * @param wt_up      Up-projection weight (packed 5D)
+ * @param wt_down    Down-projection weight (packed 5D)
+ * @param gate_bias  Optional gate bias
+ * @param up_bias    Optional up-projection bias
+ * @param down_bias  Optional down-projection bias
+ * @param activation One of "silu", "gelu", "relu"
+ * @return Output tensor with same batch dims as input
+ */
+at::Tensor libxsmm_fused_mlp(
+    const at::Tensor& input,
+    c10::optional<at::Tensor> wt_gate,
+    const at::Tensor& wt_up,
+    const at::Tensor& wt_down,
+    c10::optional<at::Tensor> gate_bias,
+    c10::optional<at::Tensor> up_bias,
+    c10::optional<at::Tensor> down_bias,
+    const std::string& activation);
+
 } // namespace pace
 
 #endif // LIBXSMM_MLP_H

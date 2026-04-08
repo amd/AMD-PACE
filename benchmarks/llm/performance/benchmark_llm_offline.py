@@ -9,19 +9,12 @@ import os
 import gc
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime
 from statistics import fmean
 from typing import Optional
 
 import torch
 from tqdm import tqdm
-from pace.llm import (
-    LLMModel,
-    SamplingConfig,
-    KVCacheType,
-    OperatorConfig,
-    PardSpecDecodeConfig,
-)
-from pace.utils.logging import PACE_LLM_INFO, PACE_LLM_WARNING, suppress_logging_fn
 from transformers import AutoTokenizer, BatchEncoding
 
 from arguments import get_args
@@ -32,13 +25,13 @@ from datastructs import (
     BenchmarkArgs,
     BenchmarkResults,
     BenchmarkResultsList,
-    GeneraterOutput,
+    GeneratorOutput,
     GeneratorOutputAggregator,
     Metrics,
 )
 from metrics import SystemMonitor, TokenLatencyStreamer, calculate_metrics
 from data import BenchMarkDataGenerator
-from visualization import create_comparison_bar_graph, create_comparison_line_graph
+from utils import PACE_LLM_INFO, PACE_LLM_ASSERT, suppress_logging_fn
 
 # @TODO:
 # 1. Add support for multiple instances
@@ -51,7 +44,7 @@ class BenchmarkOfflineFramework(ABC):
         pass
 
     @abstractmethod
-    def generate(self, inputs: BatchEncoding) -> GeneraterOutput:
+    def generate(self, inputs: BatchEncoding) -> GeneratorOutput:
         pass
 
 
@@ -85,10 +78,9 @@ class HuggingFaceOfflineFramework(BenchmarkOfflineFramework):
             "min_new_tokens": generation_args.output_tokens,
             "streamer": self.streamer,
             "do_sample": generation_args.do_sample,
-            "num_beams": generation_args.num_beams,
         }
 
-    def generate(self, inputs: torch.Tensor) -> GeneraterOutput:
+    def generate(self, inputs: torch.Tensor) -> GeneratorOutput:
         """
         Generates text using a Hugging Face Transformer model.
 
@@ -114,7 +106,7 @@ class HuggingFaceOfflineFramework(BenchmarkOfflineFramework):
         time_per_tokens = (
             self.streamer.time_per_tokens if self.token_args.time_per_tokens else None
         )
-        return GeneraterOutput(
+        return GeneratorOutput(
             total_time=(end_time - start_time),
             time_per_tokens=time_per_tokens,
             ttft=ttft,
@@ -131,15 +123,28 @@ class PACEOfflineFramework(BenchmarkOfflineFramework):
         generation_args: GenerationArgs,
         token_args: TokenArgs,
     ):
-        if generation_args.kv_cache_type.upper() == "BMC":
+        from pace.llm import (
+            LLMModel,
+            SamplingConfig,
+            KVCacheType,
+            OperatorConfig,
+            PardSpecDecodeConfig,
+        )
+
+        cache_type_str = generation_args.kv_cache_type.upper()
+        if cache_type_str == "BMC":
             kv_cache_type = KVCacheType.BMC
+        elif cache_type_str == "SLAB_POOL":
+            kv_cache_type = KVCacheType.SLAB_POOL
+        elif cache_type_str == "PAGED":
+            kv_cache_type = KVCacheType.PAGED
         else:
             kv_cache_type = KVCacheType.DYNAMIC
 
-        pard_config = None
+        spec_config = None
         if model_args.spec_config is not None:
             # If spec_config is provided, use it to create a PardSpecDecodeConfig
-            pard_config = PardSpecDecodeConfig(
+            spec_config = PardSpecDecodeConfig(
                 model_name_or_path=model_args.spec_config["model_name"],
                 num_speculative_tokens=model_args.spec_config["num_speculated_tokens"],
             )
@@ -149,7 +154,7 @@ class PACEOfflineFramework(BenchmarkOfflineFramework):
             dtype=model_args.dtype,
             kv_cache_type=kv_cache_type,
             opconfig=OperatorConfig(**model_args.llm_operators),
-            pard_config=pard_config,
+            spec_config=spec_config,
         )
 
         self.token_args = token_args
@@ -164,14 +169,13 @@ class PACEOfflineFramework(BenchmarkOfflineFramework):
             "streamer": self.streamer,
             "do_sample": generation_args.do_sample,
             "temperature": (torch.rand(1).item() if generation_args.do_sample else 0),
-            "num_beams": generation_args.num_beams,
             "seed": generation_args.manual_seed,
         }
 
         self.sampling_config = SamplingConfig(**gen_kwargs)
 
     @suppress_logging_fn
-    def generate(self, inputs: BatchEncoding) -> GeneraterOutput:
+    def generate(self, inputs: BatchEncoding) -> GeneratorOutput:
         """
         Generates text using a PACE LLM model.
 
@@ -196,7 +200,7 @@ class PACEOfflineFramework(BenchmarkOfflineFramework):
         time_per_tokens = (
             self.streamer.time_per_tokens if self.token_args.time_per_tokens else None
         )
-        return GeneraterOutput(
+        return GeneratorOutput(
             total_time=(end_time - start_time),
             ttft=ttft,
             time_per_tokens=time_per_tokens,
@@ -222,20 +226,25 @@ class VLLMOfflineFramework(BenchmarkOfflineFramework):
         from vllm import LLM, SamplingParams
 
         # Init model
-        self.model = LLM(model_args.model_name, dtype=model_args.dtype)
+        self.model = LLM(
+            model_args.model_name,
+            dtype=model_args.dtype,
+            seed=(
+                generation_args.manual_seed if generation_args.manual_seed else 1
+            ),  # New vLLM (V1) sets default seed to 1 but cannot pass None
+            enable_prefix_caching=False,
+        )
 
         gen_kwargs = {
             "max_tokens": generation_args.output_tokens,
             "min_tokens": generation_args.output_tokens,
-            "n": generation_args.num_beams,  # VLLM does not support beam search, but this simulates n number of generations
             "temperature": torch.rand(1).item() if generation_args.do_sample else 1.0,
-            "seed": generation_args.manual_seed,
         }
 
         self.sampling_params = SamplingParams(**gen_kwargs)
         self.token_args = token_args
 
-    def generate(self, inputs: BatchEncoding) -> GeneraterOutput:
+    def generate(self, inputs: BatchEncoding) -> GeneratorOutput:
         """
         Generates text using a VLLM model.
 
@@ -267,13 +276,26 @@ class VLLMOfflineFramework(BenchmarkOfflineFramework):
         output_tokens = torch.tensor(
             [response.outputs[0].token_ids for response in out]
         ).shape[-1]
-        return GeneraterOutput(
+        return GeneratorOutput(
             total_time=(end_time - start_time),
             ttft=ttft,
             time_per_tokens=[],  # Not available
             input_tokens=inputs.shape[1],
             total_tokens=inputs.shape[1] + output_tokens,
         )
+
+
+class VLLMZenTorchOfflineFramework(VLLMOfflineFramework):
+
+    def __init__(
+        self,
+        model_args: ModelArgs,
+        generation_args: GenerationArgs,
+        token_args: TokenArgs,
+    ):
+        import zentorch  # noqa: F401 — must be imported before vLLM init so the platform plugin registers
+
+        super().__init__(model_args, generation_args, token_args)
 
 
 class ZenTorchOfflineFramework(BenchmarkOfflineFramework):
@@ -307,12 +329,11 @@ class ZenTorchOfflineFramework(BenchmarkOfflineFramework):
             "min_new_tokens": generation_args.output_tokens,
             "streamer": self.streamer,
             "do_sample": generation_args.do_sample,
-            "num_beams": generation_args.num_beams,
         }
         self.model = zentorch.llm.optimize(self.model, self.model.dtype)
         self.model.forward = torch.compile(self.model.forward, backend="zentorch")
 
-    def generate(self, inputs: torch.Tensor) -> GeneraterOutput:
+    def generate(self, inputs: torch.Tensor) -> GeneratorOutput:
         """
         Generates text using a Hugging Face Transformer model.
 
@@ -339,7 +360,7 @@ class ZenTorchOfflineFramework(BenchmarkOfflineFramework):
         time_per_tokens = (
             self.streamer.time_per_tokens if self.token_args.time_per_tokens else None
         )
-        return GeneraterOutput(
+        return GeneratorOutput(
             total_time=(end_time - start_time),
             time_per_tokens=time_per_tokens,
             ttft=ttft,
@@ -401,12 +422,21 @@ def benchmark(
             generation_args,
             token_args,
         )
+    elif framework == "vllm_zentorch":
+        model = VLLMZenTorchOfflineFramework(
+            model_args,
+            generation_args,
+            token_args,
+        )
     elif framework == "zentorch":
         model = ZenTorchOfflineFramework(
             model_args,
             generation_args,
             token_args,
         )
+    else:
+        PACE_LLM_ASSERT(False, f"Unsupported framework: {framework}")
+
     # Warm-up runs
     PACE_LLM_INFO("Performing warm-up runs...")
     for _ in tqdm(range(warmup_runs), desc="Warming up"):
@@ -417,7 +447,7 @@ def benchmark(
     PACE_LLM_INFO("Starting timed runs...")
     for i in tqdm(range(num_runs), desc="Benchmarking"):
         inputs = next(data_gen)
-        generation_output: GeneraterOutput = model.generate(inputs)
+        generation_output: GeneratorOutput = model.generate(inputs)
         generator_outputs.append(generation_output)
     PACE_LLM_INFO("Timed runs complete.")
 
@@ -473,22 +503,18 @@ def main():
         benchmark_results_list.append(benchmark_results)
 
     if args.output_dir:
+        frameworks_tag = "-".join(args.frameworks)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file_prefix = os.path.join(
             args.output_dir,
-            f"{args.model_args.model_name.replace('/', '--')}_{args.model_args.dtype}_bs{args.generation_args.batch_size}_it{args.generation_args.input_tokens}_nt{args.generation_args.output_tokens}",
+            f"{frameworks_tag}_{args.model_args.model_name.replace('/', '--')}"
+            f"_{args.model_args.dtype}_bs{args.generation_args.batch_size}"
+            f"_it{args.generation_args.input_tokens}_nt{args.generation_args.output_tokens}"
+            f"_{timestamp}",
         )
         output_file = f"{output_file_prefix}_results.json"
         benchmark_results_list.dump(output_file)
         PACE_LLM_INFO(f"Results saved to: {output_file}")
-
-        if args.visualize:
-            if len(args.frameworks) == 1:
-                PACE_LLM_WARNING(
-                    "Comparitive visualization does not make sense for single framework, skipping..."
-                )
-            else:
-                create_comparison_bar_graph(benchmark_results_list, output_file_prefix)
-            create_comparison_line_graph(benchmark_results_list, output_file_prefix)
 
 
 if __name__ == "__main__":

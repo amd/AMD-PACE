@@ -8,7 +8,10 @@ This document provides guidelines and instructions for contributing to the AMD P
 3. [Creating a Python Operator](#creating-a-python-operator)
 4. [Creating a core function](#creating-a-core-function)
 5. [Logging in AMD PACE](#logging-in-amd-pace)
-6. [Basic Developer Checks](#basic-developer-checks)
+6. [Code Style](#code-style)
+7. [Testing](#testing)
+8. [Basic Developer Checks](#basic-developer-checks)
+9. [Submitting a PR](#submitting-a-pr)
 
 ## Adding an external library
 The implementation for building and linking with external libraries are under `cmake/Build{Library}.cmake`. All the libraries are downloaded and build using the `ExternalProject_Add` command in CMake. For more information on `ExternalProject_Add`, please refer to the [CMake documentation](https://cmake.org/cmake/help/latest/module/ExternalProject.html). The external libraries are built as static objects and linked with the AMD PACE library.
@@ -94,17 +97,25 @@ The directory structure should look like:
 
     The timer works on the logic of scoping. When `PROFILE_PACE_FUNCTION("opname")` is called, the timer starts and when the scope ends, the timer stops and logs the time taken for the operation. The timer is thread safe and can be used in multi-threaded environments.
 
-3. Once the op is defined and implementation is complete, within the `opname.cpp` file, you can register the op with the torch library as follows:
+4. Once the op is defined and implementation is complete, within the `opname.cpp` file, you can register the op with the torch library as follows:
     ```cpp
-    TORCH_LIBRARY_FRAGEMENT(pace, m) {
-        m.def(
-            "operator_name(operator_schema)",
-            &pace::opname
-        );
+    TORCH_LIBRARY_FRAGMENT(pace, m) {
+        m.def("operator_name(operator_schema)");
+    }
+
+    TORCH_LIBRARY_IMPL(pace, CPU, m) {
+        m.impl("operator_name", pace::opname);
     }
     ```
 
-4. The function can be imported and used in the python code as follows:
+    **Important Notes:**
+    - `TORCH_LIBRARY_FRAGMENT` defines the operator schema (signature)
+    - `TORCH_LIBRARY_IMPL` provides the implementation for a specific dispatch key (CPU, QuantizedCPU, etc.)
+    - For quantized operations, use `TORCH_LIBRARY_IMPL(pace, QuantizedCPU, m)` instead
+    - Multiple operators can be defined in the same fragment
+    - Multiple implementations can be registered for different dispatch keys
+
+5. The function can be imported and used in the python code as follows:
     ```python
     # Make sure to import torch before importing pace
     import torch
@@ -113,14 +124,49 @@ The directory structure should look like:
     ret = torch.ops.pace.opname(...)
     ```
 
-5. Once the method is implemented, it needs to be documented in the `docs/Ops.md` file. The documentation should include the method signature, the input and output types, and a brief description of the operator.
+6. **Register fake ops for torch.compile support**: To enable your operator to work with `torch.compile`, you need to register a fake implementation in `pace/_register_fake.py`. Fake ops are used by the compiler to infer output shapes and types without executing the actual operation.
 
-> For a complete example of an operator, refer to the binary operator in `csrc/ops/binary.h` and `csrc/ops/binary.cpp` for operator implementation and `csrc/ops/kernels/binary_kernel.h`, `csrc/ops/kernels/binary_kernel.cpp`, and `csrc/ops/kernels/binary_kernel_avx512.cpp` for kernel implementation.
+    Add a corresponding fake implementation in `pace/_register_fake.py`:
+    ```python
+    from torch.library import register_fake
+    
+    @register_fake("pace::operator_name")
+    def _fake_operator_name(operator_schema):
+        # Compute output shape
+        out_shape = ...
+        out_dtype = ...
+        out_device = ...
+        return torch.empty(out_shape, dtype=out_dtype, device=out_device)
+    ```
+    
+    **Key points for fake ops:**
+    - The fake function should match the operator signature exactly
+    - It only needs to return a tensor with the correct shape, dtype, and device
+    - Do not perform actual computation - just shape/type inference
+    - Quantized operations typically cannot be registered as fake ops due to qtensor limitations
+    - Multiple operators with the same signature can share a fake implementation by stacking `@register_fake` decorators
+    - See `pace/_register_fake.py` for examples
+
+7. Once the method is implemented, it needs to be documented in the `docs/Ops.md` file. The documentation should include the method signature, the input and output types, and a brief description of the operator.
+
+> For a complete example of an operator, refer to the binary operator in `csrc/ops/binary.h` and `csrc/ops/binary.cpp` for operator implementation, `csrc/ops/kernels/binary_kernel.h`, `csrc/ops/kernels/binary_kernel.cpp`, and `csrc/ops/kernels/binary_kernel_avx512.cpp` for kernel implementation, and `pace/_register_fake.py` for fake op registration for torch.compile support.
 
 ### Note:
 1. Make sure that the op is registered outside of the `pace` namespace so that the op can be loaded dynamically by the torch library.
-2. The AVX512 kernel should go in the file `opname_kernel_avx512.cpp` only as only those files are compiled with the AVX512 flags. Failing to do so might result in errors during compilation.
-3. All AVX512 kernels should have a reference implementation in the `opname_kernel.cpp` file. This is required for the fallback mechanism in case the AVX512 kernel is not supported on the target machine and for testing purposes.
+
+> **Attention backends**: Attention kernel implementations are organized under `csrc/ops/attention/` with per-backend subdirectories (e.g., `csrc/ops/attention/contiguous/` for standard MHA/GQA kernels). New attention backends should create their own subdirectory under `csrc/ops/attention/`. The Python-side attention integration lives in `pace/llm/attention/` with a matching per-backend folder structure.
+2. Use `TORCH_LIBRARY_FRAGMENT` to define the operator schema and `TORCH_LIBRARY_IMPL` to provide the implementation for specific dispatch keys (CPU, QuantizedCPU, etc.). Do not mix definition and implementation in a single macro.
+3. The AVX512 kernel should go in the file `opname_kernel_avx512.cpp` only as only those files are compiled with the AVX512 flags. Failing to do so might result in errors during compilation.
+4. All AVX512 kernels should have a reference implementation in the `opname_kernel.cpp` file. This is required for the fallback mechanism in case the AVX512 kernel is not supported on the target machine and for testing purposes.
+5. For torch.compile support, always register a fake op in `pace/_register_fake.py` that matches your operator's signature and returns tensors with correct shapes/types.
+
+### Adding a Fused Op / Optimization
+
+Fused ops combine multiple operations into a single kernel for better performance. They use `FusedOperatorType` (from `pace/ops/enum.py`) instead of `OperatorType` and follow the same registry pattern.
+
+For a concrete example, see `pace/ops/mlp.py` — `MergedMLP` is a fused op that combines gate/up projections with activation and a down projection into a single module. It uses `FusedOperatorType.FUSEDMLPLINEAR` and the backend registry resolves the implementation at runtime. If no fused backend is registered, the op falls back to its default `forward` method (composed of individual ops).
+
+See [PythonOps.md](PythonOps.md) for details on the operator/backend registry pattern.
 
 ## Creating a Python Operator
 Please refer to [PythonOps.md](PythonOps.md#adding-new-operators-and-backends) for more details on how to create a Python operator.
@@ -178,7 +224,7 @@ The directory structure should look like:
 
 
 ## Logging in AMD PACE
-There is a logging module that is available in AMD PACE to be used with both C++ and Python. The logging module is available in the `csrc/core/logging.h` file. There are 5 levels of logging available in AMD PACE -> `DEBUG`, `PROFILE`,  `INFO`, `WARNING`, `ERROR`.
+There is a logging module that is available in AMD PACE to be used with both C++ and Python. The logging module is available in the `csrc/core/logging.h` file. There are 6 levels of logging available in AMD PACE -> `DEBUG`, `PROFILE`,  `INFO`, `WARNING`, `ERROR`, `NONE`.
 
 The logging can be controlled by setting the environment variable `PACE_LOG_LEVEL`. Refer to [README](../README.md#verbose) for more details.
 
@@ -186,11 +232,11 @@ To make use of Logger in C++, include the `logging.h` file in the file where you
 
 ```cpp
 #include "core/logging.h"
-PACE_LOG_DEBUG(...)`: // Used to log debug information.
-PACE_LOG_PROFILE(...)`: // Used to log profiling information.
-PACE_LOG_INFO(...)`: // Used to log information.
-PACE_LOG_WARNING(...)`: // Used to log warnings.
-PACE_LOG_ERROR(...)`: // Used to log errors.
+PACE_LOG_DEBUG(...)    // Used to log debug information.
+PACE_LOG_PROFILE(...)  // Used to log profiling information.
+PACE_LOG_INFO(...)     // Used to log information.
+PACE_LOG_WARNING(...)  // Used to log warnings.
+PACE_LOG_ERROR(...)    // Used to log errors.
 ```
 
 The logging module in Python is a wrapper around the C++ logging module. The logging module in Python is available in the `pace.utils.logging` module. The logging module in Python has the same levels as the C++ logging module. The logging module in Python can be used as follows. To make use of the different logging levels, the logger should be initialized as follows:
@@ -204,26 +250,69 @@ pacelogger(logLevel.WARNING, "...") # WARNING level
 pacelogger(logLevel.ERROR, "...") # ERROR level
 ```
 
+There are also convenience functions available for general use that automatically prefix messages with `pace:`:
+```python
+from pace.utils.logging import PACE_DEBUG, PACE_INFO, PACE_WARNING, PACE_ERROR, PACE_ASSERT
+
+PACE_DEBUG("...")
+PACE_INFO("...")
+PACE_WARNING("...")
+PACE_ERROR("...")
+PACE_ASSERT(CONDITION, "...")
+```
+`PACE_ASSERT` is a special case, where it will raise an exception if the condition is not met. If condition is not met, it will raise an assertion error with the message logged.
+
 For LLM modules, this is abstracted one more level. This is to capture some extra information(please make sure to use these methods inside any python LLM related implementations) , and can be accessed like such:
 ```python
-from pace.utils.logging import PACE_LLM_DEBUG, PACE_LLM_INFO, PACE_LLM_WARNING, PACE_LLM_ASSERT
+from pace.utils.logging import PACE_LLM_DEBUG, PACE_LLM_INFO, PACE_LLM_WARNING, PACE_LLM_ERROR, PACE_LLM_ASSERT
 
 PACE_LLM_DEBUG("...")
 PACE_LLM_INFO("...")
 PACE_LLM_WARNING("...")
+PACE_LLM_ERROR("...")
 PACE_LLM_ASSERT(CONDITION, "...")
 ```
 `PACE_LLM_ASSERT` is a special case, where it will raise an exception if the condition is not met. If condition is not met, it will raise an assertion error with the message logged.
+
+## Code Style
+
+### Python
+All Python files follow the standard `black` formatting. Linting is enforced via `flake8` (see `.flake8` for the full config).
+
+### C++
+C++ formatting follows the PyTorch clang-format style and is applied automatically during the build when `ENABLE_CLANG_FORMAT=ON` is set. No manual formatting step is needed.
+
+### Error Handling
+- **Python:** Use `PACE_ASSERT(condition, "message")` for invariant checks (raises `AssertionError`). Inside LLM code (`pace/llm/`), use `PACE_LLM_ASSERT` instead. Use `ValueError` for invalid configuration and `RuntimeError` for state errors.
+- **C++:** Use `TORCH_CHECK(condition, "message")` for precondition checks on dtypes, shapes, and tensor properties.
+
+## Testing
+
+AMD PACE uses `unittest` for all tests. Tests live under the `tests/` directory:
+
+```
+tests/
+├── ops/          # Tests for C++ ops (torch.ops.pace.*)
+├── python_ops/   # Tests for Python ops (pace.ops.*)
+├── llm_infra/    # Tests for LLM infrastructure
+├── server/       # Tests for inference server
+└── test_utils.py # Shared test utilities
+```
+
+**Required coverage for new/modified ops:**
+1. Functional correctness — compare output against a PyTorch reference implementation
+2. Negative inputs — verify proper error handling for invalid inputs
+3. Edge cases — boundary conditions, empty tensors, single-element tensors
 
 ## Basic Developer Checks
 Before raising patches for review make sure of the following:
 
 > Currently basic linting/formatting is only available. Later more linting will be enforced.
 
-1. Code styling for C++: All the C++ files within AMD PACE follows the PyTorch format of formatting. The formatting module is integrated into AMD PACE itself. To make use of it, while building the extension, use the flag `ENABLE_CLANG_FORMAT`.
+1. Code styling for C++: All the C++ files within AMD PACE follows the PyTorch format of formatting. The formatting module is integrated into AMD PACE itself. To make use of it while building the extension, use the environment variable `ENABLE_CLANG_FORMAT`.
 
     ```shell
-    ENABLE_CLANG_FORMAT=ON python setup.py [install|bdist_wheel]
+    ENABLE_CLANG_FORMAT=ON pip install [-v] .
     ```
 
 2. Code styling for Python: All the Python files within AMD PACE follows the standard `black` formatting and can be invoked as follows:
@@ -232,10 +321,21 @@ Before raising patches for review make sure of the following:
     ```
     This will format all the python files within the directory.
 
-    Once you invoke `black`, run `flake8`
+    Once you invoke `black`, run `flake8` to check for any linting errors.
     ```
     flake8 .
     ```
     It will check for any linting errors in the code. Make sure to fix all the errors before raising a PR.
-    > NOTE: Once you run `flake8`, make sure to run `black` again as `flake8` might change the formatting of the code.
+    > NOTE: Once you fix the linting errors using `flake8`, make sure to run `black` again to rectify the formatting errors.
 3. Make sure that the library builds and runs with some basic examples. Unit tests also need to be added for methods exposed.
+
+## Submitting a PR
+
+### Commit Messages
+Follow the existing commit style — short, imperative, descriptive. Always sign off your commits with `-s`. 
+
+### PR Guidelines
+- Keep PRs small and focused on a single change. Large PRs are harder to review and more likely to introduce regressions.
+- Include tests for any new or modified operators (see [Testing](#testing)).
+- Update documentation in `docs/` if you add new ops, change APIs, or modify behavior.
+- Make sure all [Basic Developer Checks](#basic-developer-checks) pass before submitting.

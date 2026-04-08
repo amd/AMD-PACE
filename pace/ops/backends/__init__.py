@@ -9,4 +9,4 @@
 # when the package is imported. The backend modules are responsible for
 # registering the appropriate backend implementations for the operations
 # defined in the pace.ops module.
-from . import imbps, jit, native, tpp  # noqa: F401
+from . import imbps, jit, native, tpp, aocldlp  # noqa: F401

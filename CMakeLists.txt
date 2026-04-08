@@ -20,6 +20,7 @@ include(cmake/BuildLIBXSMM.cmake)
 include(cmake/BuildJITBackend.cmake)
 include(cmake/BuildFBGEMM.cmake)
 include(cmake/ClangFormat.cmake)
+include(cmake/BuildAOCLDLP.cmake)
 
 set(CMAKE_INSTALL_RPATH $ORIGIN)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/csrc)

@@ -65,29 +65,12 @@ class TestGeneratorMethods(TestCase):
         sampling_config = self.generator._prepare_sampling_config(user_sampling_config)
         self.assertIsInstance(sampling_config, SamplingConfig)
 
-    def test_create_attention_mask(self):
-        prompts_tensor = torch.tensor([[1, 2, 3], [4, 5, 6]])
-        sampling_config = SamplingConfig(pad_token_id=torch.tensor([0]))
-        attention_mask = self.generator._create_attention_mask(
-            prompts_tensor, sampling_config
-        )
-        self.assertTrue(torch.equal(attention_mask, torch.ones_like(prompts_tensor)))
-
     def test_prepare_streamer(self):
         text_streamer = None
         input_prompts = torch.tensor([[1, 2, 3]])
         self.assertIsNone(
             self.generator._prepare_streamer(text_streamer, input_prompts)
         )
-
-    def test_adjust_mask_for_generation(self):
-        attention_mask = torch.tensor([[1, 1, 1], [1, 1, 1]])
-        unfinished_sequences = torch.tensor([1, 0])
-        adjusted_mask = self.generator._adjust_mask_for_generation(
-            attention_mask, unfinished_sequences
-        )
-        expected_mask = torch.tensor([[1, 1, 1, 1], [0, 0, 0, 0]])
-        self.assertTrue(torch.equal(adjusted_mask, expected_mask))
 
     def test_update_probs_logprobs(self):
 
@@ -128,6 +111,49 @@ class TestGeneratorMethods(TestCase):
             prompts, SamplingConfig(eos_token_id=[2])
         )
         self.assertTrue(torch.equal(input_prompts, prompts))
+
+    def test_compute_positions_basic(self):
+        self.generator.num_computed_tokens = torch.zeros(2, dtype=torch.long)
+        positions = self.generator._compute_positions(3)
+        expected = torch.tensor([[0, 1, 2], [0, 1, 2]])
+        self.assertTrue(torch.equal(positions, expected))
+
+    def test_compute_positions_with_offset(self):
+        self.generator.num_computed_tokens = torch.tensor([5, 10])
+        positions = self.generator._compute_positions(1)
+        expected = torch.tensor([[5], [10]])
+        self.assertTrue(torch.equal(positions, expected))
+
+    def test_compute_positions_speculative(self):
+        self.generator.num_computed_tokens = torch.tensor([5, 5])
+        positions = self.generator._compute_positions(3)
+        expected = torch.tensor([[5, 6, 7], [5, 6, 7]])
+        self.assertTrue(torch.equal(positions, expected))
+
+    def test_compute_positions_explicit_num_computed(self):
+        self.generator.num_computed_tokens = torch.zeros(2, dtype=torch.long)
+        override = torch.tensor([3, 7])
+        positions = self.generator._compute_positions(2, num_computed=override)
+        expected = torch.tensor([[3, 4], [7, 8]])
+        self.assertTrue(torch.equal(positions, expected))
+
+    def test_initial_positions_no_padding(self):
+        prompts = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        self.generator.prepare_for_generate(prompts, SamplingConfig(eos_token_id=[2]))
+        expected = torch.tensor([[0, 1, 2], [0, 1, 2]])
+        self.assertTrue(torch.equal(self.generator.initial_positions, expected))
+        self.assertTrue(
+            torch.equal(
+                self.generator.num_computed_tokens, torch.zeros(2, dtype=torch.long)
+            )
+        )
+
+    def test_initial_positions_left_padded(self):
+        prompts = torch.tensor([[0, 0, 1, 2, 3], [0, 4, 5, 6, 7]])
+        config = SamplingConfig(eos_token_id=[2], pad_token_id=torch.tensor([0]))
+        self.generator.prepare_for_generate(prompts, config)
+        expected = torch.tensor([[0, 0, 0, 1, 2], [0, 0, 1, 2, 3]])
+        self.assertTrue(torch.equal(self.generator.initial_positions, expected))
 
 
 @suppress_logging_cls()

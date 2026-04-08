@@ -21,6 +21,13 @@ list(FILTER KERNELS_CPP_FILES EXCLUDE REGEX ".*avx512.cpp$")
 # KERNELS_AVX512_CPP_FILES will contain all the files which end with avx512.cpp
 file(GLOB KERNELS_AVX512_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/*avx512.cpp)
 
+# Attention backend kernels (organized under attention/ subdirectories)
+file(GLOB_RECURSE ATTN_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/attention/*.cpp)
+list(FILTER ATTN_CPP_FILES EXCLUDE REGEX ".*avx512.cpp$")
+file(GLOB_RECURSE ATTN_AVX512_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/attention/*avx512.cpp)
+list(APPEND KERNELS_CPP_FILES ${ATTN_CPP_FILES})
+list(APPEND KERNELS_AVX512_CPP_FILES ${ATTN_AVX512_CPP_FILES})
+
 # Set the variables to the parent scope
 set(OPS_HEADERS ${OPS_HEADERS} PARENT_SCOPE)
 set(OPS_CPP_FILES ${OPS_CPP_FILES} PARENT_SCOPE)

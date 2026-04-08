@@ -43,7 +43,7 @@ The framework is built around several key components:
 4.  **`BackendRegistry` ([`pace.ops.registry.BackendRegistry`](../pace/ops/registry.py))**:
     *   A global singleton (`backend_registry`) responsible for storing and providing backend implementations.
     *   Backends are registered using the `@backend_registry.register(operator_type, backend_type, dtype)` decorator on the backend class. This maps a unique tuple of (`OperatorType`, `BackendType`, `DataType`) to a specific backend implementation class.
-    *   The `OperatorBase` uses the registry's `get_backend` method to find and instantiate the appropriate backend during its initialization.
+    *   The `OperatorBase` uses the registry's `get` method to find and instantiate the appropriate backend during its initialization.
 
 ## Workflow: Operator Instantiation and Execution
 
@@ -51,7 +51,7 @@ The framework is built around several key components:
     *   A user or higher-level module instantiates an operator, e.g., `my_linear = pace.ops.Linear(in_features, out_features, backend_impl=BackendType.NATIVE, dtype=DataType.FLOAT32)`.
     *   The `OperatorBase.__init__` method is called.
     *   It retrieves its `operator_type` (e.g., `OperatorType.LINEAR`).
-    *   It calls `backend_registry.get_backend(OperatorType.LINEAR, BackendType.NATIVE, DataType.FLOAT32)`.
+    *   It calls `backend_registry.get(OperatorType.LINEAR, BackendType.NATIVE, DataType.FLOAT32)`.
     *   The registry looks up this combination. If found, it instantiates the corresponding backend class (e.g., `NativeLinear`).
     *   If not found, it iterates through `FALLBACK_BACKEND` (e.g., trying `BackendType.JIT` next if `NATIVE` was the primary and failed).
     *   Logging messages ([`PACE_LLM_DEBUG`](../pace/utils/logging.py)) indicate the backend selection process. If no backend is found after trying fallbacks, an assertion ([`PACE_LLM_ASSERT`](../pace/utils/logging.py)) is raised.
@@ -61,6 +61,24 @@ The framework is built around several key components:
     *   When `my_linear.forward(input_tensor)` is called:
     *   The `Linear.forward` method (or `OperatorBase.forward` if not overridden specifically) typically calls `self.backend.execute(input_tensor, self.weight, self.bias, **self.extra_params)`.
     *   The `execute` method of the chosen backend (e.g., `NativeLinear.execute`) performs the actual computation and returns the result.
+
+## Fused Operators
+
+Fused operators combine multiple primitive operations into a single optimized unit. They inherit from `OperatorBase` just like regular ops, but use `FusedOperatorType` (from [`pace/ops/enum.py`](../pace/ops/enum.py)) instead of `OperatorType`.
+
+The key difference in registry behavior is that **fused ops degrade gracefully**: if no fused backend is registered for the requested type/dtype, the registry returns `None` (rather than raising an error). The fused operator then falls back to composing individual ops in its default `forward` method.
+
+For example, `MergedMLP` (`pace/ops/mlp.py`) is a fused op that wraps gate/up projections, activation, and a down projection. When a TPP backend is available, the entire MLP runs as a single fused kernel. When it isn't, the individual `Linear` and activation ops execute independently — correctness is preserved, only performance differs.
+
+When the fused backend is resolved, sub-operators are created with `backend_impl=None` — the fused op manages execution for its children. If no fused backend is found (`self.backend is None`), the sub-operators receive the original `backend_impl` and execute independently as fallback.
+
+See [`pace/ops/enum.py`](../pace/ops/enum.py) for the full list of `FusedOperatorType` values.
+
+## Backend Fallback
+
+When the requested `BackendType` is not registered for a given `(OperatorType, DataType)`, the `BackendRegistry` walks the `FALLBACK_BACKEND` list (defined in [`pace/ops/enum.py`](../pace/ops/enum.py)) in order — `NATIVE` first, then `JIT`, `TPP`, `IMBPS`, `AOCLDLP` — until it finds a registered implementation. If none is found, an assertion is raised.
+
+This fallback only applies to standard `OperatorType` ops. `FusedOperatorType` ops do not fall back through this list — they simply get `None` and use their composed implementation.
 
 ## Adding New Operators and Backends
 
@@ -77,12 +95,3 @@ The framework is built around several key components:
     3.  Implement the `execute` method and any other required backend logic.
     4.  Decorate the class with `@backend_registry.register(operator_type, backend_type, dtype)` for all supported data types.
     5.  Ensure the backend module is imported in [`pace/ops/backends/__init__.py`](../pace/ops/backends/__init__.py).
-
-> NOTE:
-> For fused ops, any operator that is defined inside n fused op should not have a backend_impl argument, as it will be handled by the fused op itself. If the fused operator cannot find a suitable backend, then the backend_impl should be used to create the operator, as a fallback.
->
-> This is to ensure that the fused operator can be executed on the backend
-> that is specified in the fused operator, and not the individual operators
-> inside the fused operator.
->
-> Refer to pace/ops/mlp.py for an example of how to implement this.

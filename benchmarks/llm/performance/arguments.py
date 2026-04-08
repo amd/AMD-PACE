@@ -11,9 +11,8 @@ from importlib.util import find_spec
 from typing import List
 
 import torch
-from pace.utils.logging import PACE_LLM_ASSERT
-from pace.llm.ops import LLMOperatorType, LLMBackendType
 
+from utils import PACE_LLM_ASSERT
 from datastructs import ModelArgs, GenerationArgs, TokenArgs, BenchmarkArgs
 
 
@@ -44,6 +43,9 @@ def verify_and_convert_operators(operators: dict) -> dict:
     Returns:
         dict: Verified and converted operators.
     """
+    from pace.llm.ops import LLMOperatorType, LLMBackendType
+    from pace.llm.attention import AttentionBackendType
+
     verified_operators = {}
     for key, value in operators.items():
         key, value = key.lower(), value.lower()
@@ -51,11 +53,19 @@ def verify_and_convert_operators(operators: dict) -> dict:
             key in [op.value for op in LLMOperatorType],
             f"Unsupported operator type: {key}, only {list([value.value for value in LLMOperatorType])} are supported.",
         )
-        PACE_LLM_ASSERT(
-            value in [backend.value for backend in LLMBackendType],
-            f"Unsupported backend type: {value}, only {list([value.value for value in LLMBackendType])} are supported.",
-        )
-        verified_operators[LLMOperatorType(key)] = LLMBackendType(value)
+        op_key = LLMOperatorType(key)
+        if op_key == LLMOperatorType.Attention:
+            PACE_LLM_ASSERT(
+                value in [b.value for b in AttentionBackendType],
+                f"Unsupported attention backend: {value}, only {list([b.value for b in AttentionBackendType])} are supported.",
+            )
+            verified_operators[op_key] = AttentionBackendType(value)
+        else:
+            PACE_LLM_ASSERT(
+                value in [backend.value for backend in LLMBackendType],
+                f"Unsupported backend type: {value}, only {list([value.value for value in LLMBackendType])} are supported.",
+            )
+            verified_operators[op_key] = LLMBackendType(value)
     return verified_operators
 
 
@@ -83,12 +93,14 @@ def verify_args(args) -> dict:
             check_if_lib_available(["vllm"])
         elif framework == "pace":
             check_if_lib_available(["pace"])
+        elif framework == "vllm_zentorch":
+            check_if_lib_available(["vllm", "zentorch"])
         elif framework == "zentorch":
             check_if_lib_available(["zentorch"])
         else:
             PACE_LLM_ASSERT(
                 False,
-                f"Unsupported framework: {framework}, only 'hf', 'vllm', zentorch and 'pace' are supported.",
+                f"Unsupported framework: {framework}, only 'hf', 'vllm', 'vllm_zentorch', 'zentorch' and 'pace' are supported.",
             )
 
     if config["model_args"]["dtype"] == "bf16":
@@ -96,7 +108,8 @@ def verify_args(args) -> dict:
     else:
         config["model_args"]["dtype"] = torch.float32
 
-    if "llm_operators" in config["model_args"]:
+    # Only check if pace is one of the frameworks
+    if "llm_operators" in config["model_args"] and "pace" in config["frameworks"]:
         PACE_LLM_ASSERT(
             isinstance(config["model_args"]["llm_operators"], dict),
             "llm_operators must be a dictionary.",
@@ -128,29 +141,21 @@ def verify_args(args) -> dict:
         "batch_size must be a positive integer.",
     )
     PACE_LLM_ASSERT(
-        config["generation_args"]["num_beams"] >= 1,
-        "num_beams must be a positive integer.",
-    )
-    PACE_LLM_ASSERT(
         isinstance(config["generation_args"]["manual_seed"], int)
         and config["generation_args"]["manual_seed"] >= 0,
         "manual_seed must be a non-negative integer if provided.",
     )
 
     PACE_LLM_ASSERT(
-        config["generation_args"]["kv_cache_type"] in ["BMC", "DYNAMIC"],
-        "kv_cache_type must be either 'BMC' or 'DYNAMIC'.",
+        config["generation_args"]["kv_cache_type"]
+        in ["BMC", "DYNAMIC", "SLAB_POOL", "PAGED"],
+        "kv_cache_type must be 'BMC', 'DYNAMIC', 'SLAB_POOL', or 'PAGED'.",
     )
 
     PACE_LLM_ASSERT(config["num_runs"] >= 1, "num_runs must be a positive integer.")
     PACE_LLM_ASSERT(
         config["warmup_runs"] >= 0, "warm_up_runs must be a non-negative integer."
     )
-    if config["visualize"]:
-        PACE_LLM_ASSERT(
-            config["output_dir"] is not None,
-            "Output file must be provided for visualization.",
-        )
     # Check if the path to the file is valid
     if config["output_dir"]:
         PACE_LLM_ASSERT(
@@ -213,14 +218,12 @@ def get_args() -> BenchmarkArgs:
     #         "input_tokens": 128,                  // Number of input tokens
     #         "output_tokens": 128,                 // Number of output tokens
     #         "batch_size": 1,                      // Batch size for benchmarking
-    #         "num_beams": 1,                       // Number of beams for beam search
     #         "kv_cache_type": "BMC",               // Type of KV cache to use (BMC or DYNAMIC)
     #         "do_sample": false,                   // Whether to use sampling for generation
     #         "manual_seed": 0                      // Seed for random number generation
     #     },
     #     "warmup_runs": 2,                         // Number of warmup runs before actual benchmarking
     #     "num_runs": 5,                            // Number of runs to perform for benchmarking
-    #     "visualize": false,                       // Whether to visualize the results (graphs)
     #     "verbose": true,                          // Whether to print detailed logs of output
     #     "output_dir": "./benchmark_results",      // Directory to save the benchmarking results
     #     "token_metrics": {
@@ -252,7 +255,6 @@ def get_args() -> BenchmarkArgs:
         input_tokens=config["generation_args"]["input_tokens"],
         output_tokens=config["generation_args"]["output_tokens"],
         batch_size=config["generation_args"]["batch_size"],
-        num_beams=config["generation_args"]["num_beams"],
         kv_cache_type=config["generation_args"]["kv_cache_type"],
         do_sample=config["generation_args"]["do_sample"],
         manual_seed=config["generation_args"]["manual_seed"],
@@ -270,7 +272,6 @@ def get_args() -> BenchmarkArgs:
         generation_args=generation_args,
         num_runs=config["num_runs"],
         warmup_runs=config["warmup_runs"],
-        visualize=config["visualize"],
         verbose=config["verbose"],
         output_dir=config["output_dir"],
         token_args=token_args,

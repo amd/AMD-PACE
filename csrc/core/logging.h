@@ -64,6 +64,7 @@ enum PACELogLevel {
   PACELogLevelInfo,
   PACELogLevelWarning,
   PACELogLevelError,
+  PACENoLog,
 };
 
 class StatelessLogger {
@@ -125,6 +126,8 @@ class StatelessLogger {
         return PACELogLevelWarning;
       } else if (std::string(env_value) == "error") {
         return PACELogLevelError;
+      } else if (std::string(env_value) == "none") {
+        return PACENoLog;
       }
     }
     return PACELogLevelInfo;

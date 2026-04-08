@@ -108,7 +108,7 @@ class TestBackendRegistry(TestCase):
         self.assertIs(retrieved_impl_rocm, TPPLinear)
 
     def test_get_fallback_backend_order_preference(self):
-        op = OperatorType.MHA
+        op = OperatorType.LINEAR
         dtype = DataType.BFLOAT16
 
         self.registry.register(op, BackendType.NATIVE, [dtype])(NativeLinear)
@@ -196,9 +196,9 @@ class TestBackendRegistry(TestCase):
         self.assertIn("DataType.BFLOAT16", representation)
         self.assertIn(NativeLinear.__name__, representation)
 
-    @patch("pace.ops.registry.PACE_DEBUG")  # To check debug messages
+    @patch("pace.ops.registry.PACE_DEBUG")
     def test_get_operator_not_in_registry_debug_message(self, mock_pace_debug):
-        op = OperatorType.MHA
+        op = OperatorType.SOFTMAX
         backend = BackendType.JIT
         dtype = DataType.BFLOAT16
 

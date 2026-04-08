@@ -19,6 +19,7 @@ ExternalProject_Add(
   ${FBGEMM_PROJECT}
   GIT_REPOSITORY https://github.com/pytorch/FBGEMM.git
   GIT_TAG ${FBGEMM_VERSION}
+  GIT_SUBMODULES "external/asmjit external/cpuinfo"
   PREFIX ${FBGEMM_PROJECT}
   BINARY_DIR ${FBGEMM_PROJ_DIR}
   CONFIGURE_COMMAND

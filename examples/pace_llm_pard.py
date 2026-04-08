@@ -85,7 +85,7 @@ def run_pace_llm():
     pace_model = LLMModel(
         model_name,
         dtype=torch_dtype,
-        pard_config=PardSpecDecodeConfig(
+        spec_config=PardSpecDecodeConfig(
             model_name_or_path="amd/PARD-Qwen2.5-0.5B", num_speculative_tokens=12
         ),
         kv_cache_type=kv_cache_type,

@@ -1,5 +1,5 @@
 # ******************************************************************************
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
@@ -8,11 +8,15 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from pace.ops.base import BackendBase
 from pace.ops.registry import backend_registry
-from pace.ops.enum import OperatorType, BackendType, DataType
+from pace.ops.enum import (
+    OperatorType,
+    FusedOperatorType,
+    BackendType,
+    DataType,
+)
 
 
 @backend_registry.register(
@@ -27,24 +31,6 @@ class NativeLinear(BackendBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return F.linear(input, weight, bias)
-
-
-@backend_registry.register(
-    OperatorType.MHA, BackendType.NATIVE, [DataType.FLOAT32, DataType.BFLOAT16]
-)
-class NativeAttention(BackendBase):
-
-    def execute(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
-            return F.scaled_dot_product_attention(
-                query, key, value, attn_mask=attention_mask
-            )
 
 
 @backend_registry.register(
@@ -79,6 +65,56 @@ class NativeRMSNorm(BackendBase):
         return F.rms_norm(
             input, normalized_shape=normalized_shape, weight=weight, eps=eps
         )
+
+
+@backend_registry.register(
+    FusedOperatorType.FUSED_LAYERNORM_RESIDUAL,
+    BackendType.NATIVE,
+    [DataType.FLOAT32, DataType.BFLOAT16],
+)
+class NativeFusedLayerNormResidual(BackendBase):
+
+    def execute(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual_out = x + residual
+        normed = F.layer_norm(
+            residual_out,
+            normalized_shape=weight.shape,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+        )
+        return normed, residual_out
+
+
+@backend_registry.register(
+    FusedOperatorType.FUSED_RMSNORM_RESIDUAL,
+    BackendType.NATIVE,
+    [DataType.FLOAT32, DataType.BFLOAT16],
+)
+class NativeFusedRMSNormResidual(BackendBase):
+
+    def execute(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual_out = x + residual
+        normed = F.rms_norm(
+            residual_out,
+            normalized_shape=weight.shape,
+            weight=weight,
+            eps=eps,
+        )
+        return normed, residual_out
 
 
 @backend_registry.register(
@@ -144,3 +180,15 @@ class NativeTanh(BackendBase):
         input: torch.Tensor,
     ) -> torch.Tensor:
         return torch.tanh(input)
+
+
+@backend_registry.register(
+    OperatorType.SIGMOID, BackendType.NATIVE, [DataType.FLOAT32, DataType.BFLOAT16]
+)
+class NativeSigmoid(BackendBase):
+
+    def execute(
+        self,
+        input: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.sigmoid(input)

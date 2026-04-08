@@ -1,5 +1,5 @@
 # *******************************************************************************
-# Modifications Copyright (c) 2024 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
 # Portions of this file consist of AI-generated content
 # *******************************************************************************
@@ -19,24 +19,24 @@
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.48.2/src/transformers/models/gptj/modeling_gptj.py
 
-from typing import Optional, Tuple, Iterable
+from typing import Tuple, Iterable, Union, List
 
 import torch
 from torch import nn
 from transformers import GPTJConfig
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 from pace.llm.outputs import ModelOutput
 from pace.llm.configs import OperatorConfig
-from pace.llm.cache import KVCacheBase, KVCacheManager
+from pace.llm.attention import KVCacheBase, KVCacheManager
 from pace.llm.models.base_model import BaseModelForCausalLM
 from pace.llm.ops import (
     Linear,
-    MultiHeadAttention,
     LayerNorm,
+    FusedLayerNormResidual,
     RotaryEmbedding,
     MergedMLP,
 )
+from pace.llm.attention import Attention
 
 
 class GPTJAttention(nn.Module):
@@ -80,7 +80,12 @@ class GPTJAttention(nn.Module):
             rope_theta=getattr(config, "rope_theta", 10000),
             backend_impl=opconfig.rope,
         )
-        self.attention = MultiHeadAttention(backend_impl=opconfig.attention)
+        self.attn = Attention(
+            num_heads=self.num_attention_heads,
+            num_kv_heads=self.num_attention_heads,
+            head_dim=self.head_dim,
+            opconfig=opconfig,
+        )
         self.out_proj = Linear(
             self.embed_dim,
             self.embed_dim,
@@ -91,59 +96,38 @@ class GPTJAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: Tuple[torch.Tensor, torch.Tensor],
-        kv_cache: KVCacheBase,
-        attention_mask: torch.Tensor,
+        positions: torch.LongTensor,
+        kv_cache,
+        **kwargs,
     ) -> torch.Tensor:
-
         bsz, q_len, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(
+        Q = self.q_proj(hidden_states).view(
             bsz, q_len, self.num_attention_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = key_states.view(
+        )
+        K = self.k_proj(hidden_states).view(
             bsz, q_len, self.num_attention_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = value_states.view(
+        )
+        V = self.v_proj(hidden_states).view(
             bsz, q_len, self.num_attention_heads, self.head_dim
-        ).transpose(1, 2)
-
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        if self.rotary_dim is not None:
-            key_rot = key_states[..., : self.rotary_dim]
-            key_pass = key_states[..., self.rotary_dim :]
-
-            query_rot = query_states[..., : self.rotary_dim]
-            query_pass = query_states[..., self.rotary_dim :]
-
-            query_rot, key_rot = position_embeddings(
-                query_rot, key_rot, is_neox_style=False
-            )
-            key_states = torch.cat([key_rot, key_pass], dim=-1)
-            query_states = torch.cat([query_rot, query_pass], dim=-1)
-        else:
-            query_states, key_states = position_embeddings(
-                query_states, key_states, is_neox_style=False
-            )
-
-        # KV Cache
-        if kv_cache is not None:
-            key_states, value_states = kv_cache.update_cache(
-                key_states, value_states, concat_dim=2
-            )
-
-        attn_output = self.attention(
-            query_states, key_states, value_states, attention_mask=attention_mask
         )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-        attn_output = self.out_proj(attn_output)
+        position_embeddings = self.rotary_emb(hidden_states, positions)
+        if self.rotary_dim is not None:
+            q_rot, q_pass = Q[..., : self.rotary_dim], Q[..., self.rotary_dim :]
+            k_rot, k_pass = K[..., : self.rotary_dim], K[..., self.rotary_dim :]
+            q_rot, k_rot = position_embeddings(
+                q_rot, k_rot, unsqueeze_dim=2, is_neox_style=False
+            )
+            Q = torch.cat([q_rot, q_pass], dim=-1)
+            K = torch.cat([k_rot, k_pass], dim=-1)
+        else:
+            Q, K = position_embeddings(Q, K, unsqueeze_dim=2, is_neox_style=False)
 
-        return attn_output
+        attn_output = self.attn(Q, K, V, kv_cache, positions, **kwargs)
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+
+        return self.out_proj(attn_output)
 
 
 class GPTJBlock(nn.Module):
@@ -155,7 +139,7 @@ class GPTJBlock(nn.Module):
     ):
         super().__init__()
         inner_dim = config.n_inner if config.n_inner is not None else 4 * config.n_embd
-        self.ln_1 = LayerNorm(
+        self.ln_1 = FusedLayerNormResidual(
             config.n_embd, eps=config.layer_norm_epsilon, backend_impl=opconfig.norm
         )
         self.attn = GPTJAttention(config, opconfig)
@@ -170,19 +154,18 @@ class GPTJBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: Tuple[torch.Tensor, torch.Tensor],
-        kv_cache: KVCacheBase,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: torch.Tensor,
+        positions: torch.LongTensor,
+        kv_cache: Union[KVCacheBase, List[KVCacheBase]],
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        residual = hidden_states
-        hidden_states = self.ln_1(hidden_states)
-        attn_output = self.attn(hidden_states, position_ids, kv_cache, attention_mask)
-
+        hidden_states, residual = self.ln_1(hidden_states, residual)
+        attn_output = self.attn(hidden_states, positions, kv_cache, **kwargs)
         feed_forward_hidden_states = self.mlp(hidden_states)
-        hidden_states = attn_output + feed_forward_hidden_states + residual
+        hidden_states = attn_output + feed_forward_hidden_states
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class GPTJModel(nn.Module):
@@ -201,53 +184,42 @@ class GPTJModel(nn.Module):
             self.embed_dim, eps=config.layer_norm_epsilon, backend_impl=opconfig.norm
         )
 
-        self.attn_mask_converter = AttentionMaskConverter(
-            is_causal=True, sliding_window=None
-        )
-
     def forward(
         self,
         input_ids: torch.LongTensor,
-        kv_cache: KVCacheManager,
-        attention_mask: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        positions: torch.LongTensor,
+        kv_cache: Union[KVCacheManager, List[KVCacheManager]],
+        **kwargs,
     ) -> torch.Tensor:
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
+        hidden_states = self.wte(input_ids)
 
-        past_key_values_length = len(kv_cache)
-        org_input_size = input_ids.size(1)
-        input_ids = input_ids[:, past_key_values_length:]
+        is_kv_cache_list = isinstance(kv_cache, list)
 
-        input_shape = input_ids.shape
-        if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids)
+        residual = torch.zeros_like(hidden_states)
 
-        # 4d mask is passed through the layers
-        key_value_length = input_shape[-1] + past_key_values_length
-        hf_attention_mask = self.attn_mask_converter.to_4d(
-            attention_mask,
-            input_shape[-1],
-            key_value_length=key_value_length,
-            dtype=inputs_embeds.dtype,
-        )
-
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        if kv_cache:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
-        hidden_states = inputs_embeds
-
-        hf_attention_mask = kv_cache.update_mask(hf_attention_mask, org_input_size)
         for idx, decoder_layer in enumerate(self.h):
-            hidden_states = decoder_layer(
-                hidden_states, position_ids, kv_cache[idx], hf_attention_mask
-            )
+            if is_kv_cache_list:
+                layer_kv_caches = [
+                    kv_cache_mgr.cache_objects[idx] for kv_cache_mgr in kv_cache
+                ]
+                hidden_states, residual = decoder_layer(
+                    hidden_states,
+                    residual,
+                    positions,
+                    layer_kv_caches,
+                    **kwargs,
+                )
+            else:
+                hidden_states, residual = decoder_layer(
+                    hidden_states,
+                    residual,
+                    positions,
+                    kv_cache.cache_objects[idx],
+                    **kwargs,
+                )
 
-        hidden_states = self.ln_f(hidden_states)
+        hidden_states = self.ln_f(hidden_states + residual)
         return hidden_states
 
 
@@ -285,13 +257,11 @@ class GPTJForCausalLM(BaseModelForCausalLM):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        kv_cache: KVCacheManager,
-        attention_mask: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        positions: torch.LongTensor,
+        kv_cache: Union[KVCacheManager, List[KVCacheManager]],
+        **kwargs,
     ) -> ModelOutput:
-        model_output = self.transformer(
-            input_ids, kv_cache, attention_mask, inputs_embeds=inputs_embeds
-        )
+        model_output = self.transformer(input_ids, positions, kv_cache, **kwargs)
         logits = self.lm_head(model_output)
 
         return ModelOutput(logits=logits)

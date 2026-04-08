@@ -20,5 +20,4 @@ class ModelArgs:
 @dataclass
 class GenerationArgs:
     batch_size: int
-    num_beams: int
     kv_cache_type: str

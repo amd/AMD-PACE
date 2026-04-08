@@ -21,10 +21,7 @@ using namespace zendnn;
 #define JIT_MEMORY_NONE ZENDNN_MEMORY_NONE
 #define JIT_MEMORY_ALLOCATE ZENDNN_MEMORY_ALLOCATE
 
-#define JIT_MEMORY_ALLOCATE ZENDNN_MEMORY_ALLOCATE
-
 #define GET_DIMS(mem_desc, dim) mem_desc.dims()[dim]
-
 #define GET_DATA_TYPE(memory) memory.get_desc().data_type()
 
 #else
@@ -41,10 +38,7 @@ using namespace dnnl;
 #define JIT_MEMORY_NONE DNNL_MEMORY_NONE
 #define JIT_MEMORY_ALLOCATE DNNL_MEMORY_ALLOCATE
 
-#define JIT_MEMORY_ALLOCATE DNNL_MEMORY_ALLOCATE
-
 #define GET_DIMS(mem_desc, dim) mem_desc.get_dims()[dim]
-
 #define GET_DATA_TYPE(memory) memory.get_desc().get_data_type()
 
 #endif

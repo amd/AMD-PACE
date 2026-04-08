@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright (c) 2025 Advanced Micro Devices, Inc.
+ * Copyright (c) 2026 Advanced Micro Devices, Inc.
  * All rights reserved.
  * Portions of this file consist of AI-generated content
  ******************************************************************************/
@@ -91,7 +91,7 @@ void _validate_inputs(
   }
 }
 
-// Helper function for linear kernal (with and without activation)
+// Helper function for linear kernel (with and without activation)
 at::Tensor _libxsmmlinear(
     at::Tensor& input,
     at::Tensor& weight,
@@ -173,8 +173,6 @@ at::Tensor _libxsmmlinear(
 
   return output;
 }
-//----------------------------------------------------------PUBLIC API
-
 at::Tensor libxsmmlinear_silu(
     at::Tensor& input,
     at::Tensor& weight,
@@ -219,23 +217,169 @@ at::Tensor libxsmmlinear_mul(
   auto bias = get_bias_from_opt(bias_opt, input.options());
   return _libxsmmlinear(input, weight, bias, "libxsmmlinear_mul", multiplier);
 }
+at::Tensor libxsmm_fused_mlp(
+    const at::Tensor& input,
+    c10::optional<at::Tensor> wt_gate,
+    const at::Tensor& wt_up,
+    const at::Tensor& wt_down,
+    c10::optional<at::Tensor> gate_bias,
+    c10::optional<at::Tensor> up_bias,
+    c10::optional<at::Tensor> down_bias,
+    const std::string& activation) {
+  PROFILE_PACE_FUNCTION("libxsmm_fused_mlp");
+  static const std::string op = "pace::libxsmm_fused_mlp";
+  TORCH_CHECK(
+      dtype_supported(input.scalar_type(), {at::kBFloat16}),
+      op,
+      " only supports bfloat16, got ",
+      input.scalar_type(),
+      ".");
+  TORCH_CHECK(
+      input.dim() >= 2 && input.dim() <= 3,
+      op,
+      " expected input to be 2D or 3D, got ",
+      input.dim(),
+      "D.");
+  TORCH_CHECK(
+      wt_up.dim() == 5,
+      op,
+      " expected wt_up to be 5D (packed), got ",
+      wt_up.dim(),
+      "D.");
+  TORCH_CHECK(
+      wt_down.dim() == 5,
+      op,
+      " expected wt_down to be 5D (packed), got ",
+      wt_down.dim(),
+      "D.");
+  TORCH_CHECK(
+      activation == "silu" || activation == "gelu" || activation == "relu",
+      op,
+      " unsupported activation: ",
+      activation);
+  if (wt_gate.has_value() && wt_gate.value().numel() > 0) {
+    TORCH_CHECK(
+        wt_gate.value().dim() == 5,
+        op,
+        " expected wt_gate to be 5D (packed), got ",
+        wt_gate.value().dim(),
+        "D.");
+    TORCH_CHECK(
+        wt_gate.value().sizes() == wt_up.sizes(),
+        op,
+        " wt_gate and wt_up shape mismatch: ",
+        wt_gate.value().sizes(),
+        " vs ",
+        wt_up.sizes());
+  }
+
+  auto C = input.size(-1);
+  auto N_out = wt_up.size(0) * wt_up.size(3);
+  auto K_out = wt_down.size(0) * wt_down.size(3);
+  auto up_C = wt_up.size(1) * wt_up.size(2) * wt_up.size(4);
+  auto down_C = wt_down.size(1) * wt_down.size(2) * wt_down.size(4);
+
+  TORCH_CHECK(
+      up_C == C,
+      op,
+      " input features (",
+      C,
+      ") != wt_up packed input dim (",
+      up_C,
+      ").");
+  TORCH_CHECK(
+      down_C == N_out,
+      op,
+      " wt_up output dim (",
+      N_out,
+      ") != wt_down packed input dim (",
+      down_C,
+      ").");
+
+  auto validate_bias = [&](const c10::optional<at::Tensor>& b,
+                           const char* name,
+                           int64_t expected_size) {
+    if (b.has_value() && b.value().numel() > 0 && b.value().dim() > 0) {
+      TORCH_CHECK(
+          b.value().scalar_type() == at::kBFloat16,
+          op,
+          " expected ",
+          name,
+          " to be bfloat16, got ",
+          b.value().scalar_type(),
+          ".");
+      TORCH_CHECK(
+          b.value().dim() == 1,
+          op,
+          " expected ",
+          name,
+          " to be 1D, got ",
+          b.value().dim(),
+          "D.");
+      TORCH_CHECK(
+          b.value().size(0) == expected_size,
+          op,
+          " expected ",
+          name,
+          " size ",
+          expected_size,
+          ", got ",
+          b.value().size(0),
+          ".");
+    }
+  };
+  validate_bias(gate_bias, "gate_bias", N_out);
+  validate_bias(up_bias, "up_bias", N_out);
+  validate_bias(down_bias, "down_bias", K_out);
+
+  auto orig_dim = input.dim();
+  at::Tensor in_3d = input;
+  if (orig_dim < 3) {
+    for (int d = orig_dim; d < 3; ++d)
+      in_3d = in_3d.unsqueeze(0);
+  }
+  auto result = pace::kernels::fused_mlp_dispatch(
+      in_3d,
+      wt_gate,
+      wt_up,
+      wt_down,
+      gate_bias,
+      up_bias,
+      down_bias,
+      activation);
+  if (orig_dim == 2)
+    result = result.squeeze(0);
+  return result;
+}
+
 } // namespace pace
 
-// Register function with PyTorch
+namespace {
+
 TORCH_LIBRARY_FRAGMENT(pace, m) {
   m.def(
-      "libxsmmlinear_plain(Tensor input, Tensor weight, Tensor? bias) -> Tensor",
-      pace::libxsmmlinear_plain);
+      "libxsmmlinear_plain(Tensor input, Tensor weight, Tensor? bias) -> Tensor");
   m.def(
-      "libxsmmlinear_gelu(Tensor input, Tensor weight, Tensor? bias) -> Tensor",
-      pace::libxsmmlinear_gelu);
+      "libxsmmlinear_gelu(Tensor input, Tensor weight, Tensor? bias) -> Tensor");
   m.def(
-      "libxsmmlinear_relu(Tensor input, Tensor weight, Tensor? bias) -> Tensor",
-      pace::libxsmmlinear_relu);
+      "libxsmmlinear_relu(Tensor input, Tensor weight, Tensor? bias) -> Tensor");
   m.def(
-      "libxsmmlinear_silu(Tensor input, Tensor weight, Tensor? bias) -> Tensor",
-      pace::libxsmmlinear_silu);
+      "libxsmmlinear_silu(Tensor input, Tensor weight, Tensor? bias) -> Tensor");
   m.def(
-      "libxsmmlinear_mul(Tensor input1, Tensor input2, Tensor weight, Tensor? bias) -> Tensor",
-      pace::libxsmmlinear_mul);
+      "libxsmmlinear_mul(Tensor input1, Tensor input2, Tensor weight, Tensor? bias) -> Tensor");
+  m.def(
+      "libxsmm_fused_mlp(Tensor src, Tensor? wt_gate, Tensor wt_up, "
+      "Tensor wt_down, Tensor? gate_bias, Tensor? up_bias, "
+      "Tensor? down_bias, str activation) -> Tensor");
 }
+
+TORCH_LIBRARY_IMPL(pace, CPU, m) {
+  m.impl("libxsmmlinear_plain", pace::libxsmmlinear_plain);
+  m.impl("libxsmmlinear_gelu", pace::libxsmmlinear_gelu);
+  m.impl("libxsmmlinear_relu", pace::libxsmmlinear_relu);
+  m.impl("libxsmmlinear_silu", pace::libxsmmlinear_silu);
+  m.impl("libxsmmlinear_mul", pace::libxsmmlinear_mul);
+  m.impl("libxsmm_fused_mlp", pace::libxsmm_fused_mlp);
+}
+
+} // namespace

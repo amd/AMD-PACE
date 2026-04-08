@@ -5,9 +5,8 @@
     1. [Offline](#offline)
 2. [Benchmarking Infrastructure](#benchmarking-infrastructure)
     1. [Data Generator](#data-generator)
-    2. [Visualizations](#visualizations)
-    3. [System Metrics](#system-metrics)
-    4. [Token Metrics](#token-metrics)
+    2. [System Metrics](#system-metrics)
+    3. [Token Metrics](#token-metrics)
 
 ## Scenarios
 
@@ -46,14 +45,12 @@ The benchmarking process is configured using a JSON file. Below is an example co
         "input_tokens": 128,
         "output_tokens": 128,
         "batch_size": 1,
-        "num_beams": 1,
         "kv_cache_type": "BMC",
         "do_sample": false,
         "manual_seed": 0
     },
     "warmup_runs": 2,
     "num_runs": 5,
-    "visualize": false,
     "verbose": true,
     "output_dir": "./benchmark_results",
     "token_metrics": {
@@ -66,7 +63,7 @@ The benchmarking process is configured using a JSON file. Below is an example co
 
 #### Configuration Parameters
 
-- `frameworks`: List of frameworks to benchmark (e.g., `"pace"`, `"hf"`).
+- `frameworks`: List of frameworks to benchmark (e.g., `"pace"`, `"hf"`, `"vllm"`, `"vllm_zentorch"`, `"zentorch"`).
 - `model_args`: Dictionary of model arguments, including:
     - `model_name`: Name of the model to benchmark (e.g., `"facebook/opt-125m"`).
     - `dtype`: Data type to use (e.g., `"bf16"`).
@@ -76,23 +73,28 @@ The benchmarking process is configured using a JSON file. Below is an example co
     - `input_tokens`: Number of input tokens.
     - `output_tokens`: Number of output tokens.
     - `batch_size`: Batch size for benchmarking.
-    - `num_beams`: Number of beams for beam search.
     - `kv_cache_type`: Type of key-value cache (e.g., `"BMC"`).
     - `do_sample`: Boolean indicating whether to use sampling.
     - `manual_seed`: Random seed for reproducibility.
 - `warmup_runs`: Number of warm-up runs before benchmarking.
 - `num_runs`: Number of benchmark runs.
-- `visualize`: Boolean indicating whether to generate visualizations.
 - `verbose`: Boolean indicating whether to print detailed logs.
-- `output_dir`: Directory to save benchmark results.
+- `output_dir`: Directory to save benchmark results. Output files are named using the pattern `{frameworks}_{model}_{dtype}_bs{batch}_it{input}_nt{output}_{timestamp}_results.json`, where `{frameworks}` is the list of frameworks joined by `-` and `{timestamp}` is `YYYYMMDD_HHMMSS` to ensure uniqueness across runs.
 - `token_metrics`: Dictionary specifying token-level metrics to collect (e.g., `time_to_first_token`, `time_per_tokens`).
 - `system_metrics`: Boolean indicating whether to collect system-level metrics.
 
 NOTE:
 1. Either `verbose` or `output_dir` should be set, otherwise the script will not run.
-2. If `visualize` is set to `true`, the script will generate visualizations for the benchmark results, but it will depend on metrics collected, comparison charts will only be generated if multiple frameworks are benchmarked.
 
 #### Usage
+Install required dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+> Note: While benchmarking for ZenTorch, vLLM, or vLLM+ZenTorch, it's the user's responsibility to ensure that the respective frameworks are installed and properly configured with all their dependencies. For `vllm_zentorch`, both `vllm` and `zentorch` must be installed; vLLM will automatically detect and use the zentorch platform plugin.
+
 To run the benchmarking script, use the following command:
 
 ```bash
@@ -133,32 +135,6 @@ for _ in range(N):
     data = next(data_gen)
     ...
 ```
-
-### Visualizations
-
-#### Bar Graphs
-
-The `visualization.py` file provides functions to generate visualizations for the benchmark results. These visualizations help in comparing the performance of different frameworks.
-
-The `create_comparison_bar_graph` function generates bar charts to compare frameworks based on various metrics. The bar graphs are generated for each metric and saved as separate images, comparing the performance of different frameworks. It can be usesful to compare the performance of different frameworks.
-
-The bar graphs compare the following metrics (can be extented):
-- `average_gen_time`: Average generation time (seconds)
-- `average_latency_per_token`: Average latency (seconds)
-- `total_tps`: Total tokens per second
-- `output_tps`: Output tokens per second
-- `average_ttft`: Average time to first token (seconds)
-
-#### Line Graphs
-
-The `create_comparison_line_graph` function generates line charts to compare frameworks based on token-level and system-level metrics. The line graphs are generated for each metric and saved as separate images, comparing the performance of different frameworks. It can be usesful to compare the performance of different frameworks as well as for one framework over time.
-
-The line graphs compare the following metrics (can be extented):
-- `time_per_tokens`: Per-token time (seconds)
-- `cpu_usage`: CPU usage (%)
-- `ram_usage`: RAM usage (MB)
-
-They can be extended by extending the dictionary in the `create_comparison_line_graph` and `create_comparison_bar_graph` functions.
 
 ### System Metrics
 

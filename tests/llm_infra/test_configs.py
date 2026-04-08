@@ -13,7 +13,7 @@ from hypothesis import strategies as st
 from torch.testing._internal.common_utils import TestCase
 
 from pace.llm import SamplingConfig
-from pace.llm.configs import SamplingMode
+from pace.llm.configs import SamplingMode, PardSpecDecodeConfig
 from pace.utils.logging import suppress_logging_cls
 
 
@@ -92,16 +92,6 @@ class TestSamplingConfig(TestCase):
 
     def test_set_sampling_method(self):
         config = SamplingConfig(
-            temperature=0.7,
-            top_k=50,
-            top_p=0.9,
-            eos_token_id=[1],
-            num_beams=5,
-        )
-        config._set_sampling_method()
-        self.assertEqual(config.sampling_mode, SamplingMode.BEAM_SEARCH)
-
-        config = SamplingConfig(
             temperature=0.0,
             eos_token_id=[1],
         )
@@ -155,6 +145,13 @@ class TestSamplingConfig(TestCase):
         self.assertEqual(config1.top_p, 0.9)
         self.assertEqual(config1.eos_token_id, [1, 2])
 
+    def test_merge_from_defaults_do_not_override_explicit(self):
+        config1 = SamplingConfig(top_k=50, temperature=0.7, eos_token_id=[1])
+        config2 = SamplingConfig(eos_token_id=[1])
+        config1.merge_from(config2)
+        self.assertEqual(config1.top_k, 50)
+        self.assertEqual(config1.temperature, 0.7)
+
     def test_finalize(self):
         sampling_config = SamplingConfig(
             temperature=0.0,
@@ -207,18 +204,6 @@ class TestSamplingConfig(TestCase):
             config.verify_max_new_tokens()
             config.finalize()
 
-    def test_set_sampling_method_beam_search(self):
-        sampling_config = SamplingConfig(
-            num_beams=5,
-            return_probs=False,
-            return_logprobs=False,
-            return_input_logprobs=False,
-            eos_token_id=[0],
-        )
-        sampling_config.verify_max_new_tokens()
-        sampling_config.finalize()
-        self.assertEqual(sampling_config.sampling_mode, SamplingMode.BEAM_SEARCH)
-
     def test_set_sampling_method_greedy_search(self):
         sampling_config = SamplingConfig(
             do_sample=False,
@@ -238,16 +223,6 @@ class TestSamplingConfig(TestCase):
         sampling_config.verify_max_new_tokens()
         sampling_config.finalize()
         self.assertEqual(sampling_config.sampling_mode, SamplingMode.RANDOM_SAMPLING)
-
-    def test_set_sampling_method_invalid_beam_search(self):
-        sampling_config = SamplingConfig(
-            num_beams=5,
-            return_probs=True,
-            eos_token_id=[0],
-        )
-        with self.assertRaises(AssertionError):
-            sampling_config.verify_max_new_tokens()
-            sampling_config.finalize()
 
     def test_verify_max_new_tokens_sets_default_and_warns(self):
         config = SamplingConfig(
@@ -272,3 +247,22 @@ class TestSamplingConfig(TestCase):
         )
         config.verify_max_new_tokens()
         self.assertEqual(config.max_new_tokens, 10)
+
+
+@suppress_logging_cls()
+class TestPardSpecDecodeConfig(TestCase):
+
+    def test_draft_kv_cache_memory_gb_default(self):
+        config = PardSpecDecodeConfig(model_name_or_path="test-model")
+        self.assertIsNone(config.draft_kv_cache_memory_gb)
+
+    def test_draft_kv_cache_memory_gb_set(self):
+        config = PardSpecDecodeConfig(
+            model_name_or_path="test-model",
+            draft_kv_cache_memory_gb=4.0,
+        )
+        self.assertEqual(config.draft_kv_cache_memory_gb, 4.0)
+
+    def test_default_num_speculative_tokens(self):
+        config = PardSpecDecodeConfig(model_name_or_path="test-model")
+        self.assertEqual(config.num_speculative_tokens, 12)

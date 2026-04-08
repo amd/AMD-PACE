@@ -12,9 +12,11 @@ import pace
 This will dynamically link the ops registered in the `pace` library to the `torch` library. Ops defined in the AMD PACE are listed below.
 
 1. [Linear Ops](#linear-ops)
-2. [Embedding Bag Ops](#embedding-ops)
-3. [Binary Ops](#binary-ops)
-4. [mlp_mlp_fusion](#mlp_mlp_fusion-ops)
+2. [Rotary Embedding Ops](#rotary-embedding-ops)
+3. [Normalization Ops](#normalization-ops)
+4. [Embedding Bag Ops](#embedding-ops)
+5. [Binary Ops](#binary-ops)
+6. [mlp_mlp_fusion](#mlp_mlp_fusion)
 
 # Linear Ops
 These Op implements an inner product of input and weight matrices. The input is a 2D tensor of shape `[batch_size, input_features]` and the weight matrix is a 2D tensor of shape `[output_features, input_features]`. Optionally a bias tensor of shape `[output_features]` can be passed. The output is a 2D matrix of shape `[batch_size, output_features]`. The Op is implemented using ZenDNN/OneDNN primitive: `matmul`.
@@ -24,7 +26,7 @@ These Op implements an inner product of input and weight matrices. The input is 
 3. [qlinear](#qlinear)
 4. [qlinear_relu](#qlinear_relu)
 5. [qlinear_mul_add](#qlinear_mul_add)
-6. [qlinear_sigmod](#qlinear_sigmod)
+6. [qlinear_sigmoid](#qlinear_sigmoid)
 
 
 ### linear
@@ -111,9 +113,9 @@ These Op implements an inner product of input and weight matrices. The input is 
     * `alpha`: Alpha for the addend of type float. Only 1 is supported for now.
 * File: `csrc/ops/kernels/linear.cpp`
 
-### qlinear_sigmod
-* Operation: `torch.ops.pace.qlinear_sigmod`
-* Graph node type: `pace::qlinear_sigmod`
+### qlinear_sigmoid
+* Operation: `torch.ops.pace.qlinear_sigmoid`
+* Graph node type: `pace::qlinear_sigmoid`
 * PostOps: Sigmoid
 * Input Types Supported: QUINT8/QINT8
 * Weight Types Supported: QINT8
@@ -124,6 +126,100 @@ These Op implements an inner product of input and weight matrices. The input is 
     * `weight`: Weight tensor of shape 2D `[output_features, input_features]`.
     * `bias`: Bias tensor of shape 1D `[output_features]`.
 * File: `csrc/ops/kernels/linear.cpp`
+
+# Rotary Embedding Ops
+These ops apply Rotary Position Embeddings (RoPE) to query and key tensors. The fused kernel applies neox-style RoPE to both Q and K in a single OMP-parallel pass per tensor, avoiding the 6 intermediate tensor allocations of the Python chunk/mul/cat approach.
+
+1. [fused_rope](#fused_rope)
+
+### fused_rope
+* Operation: `torch.ops.pace.fused_rope_apply`
+* Graph node type: `pace::fused_rope_apply`
+* PostOps: None
+* Input Types Supported: BF16
+* Output Types Supported: BF16
+* Arguments:
+    * `query`: Query tensor of shape 4D `[BS, num_heads, seq_len, head_dim]` (BNSH) or `[BS, seq_len, num_heads, head_dim]` (BSNH).
+    * `key`: Key tensor of same layout as `query`.
+    * `cos`: Cosine tensor of shape `[BS, seq_len, head_dim // 2]`.
+    * `sin`: Sine tensor of shape `[BS, seq_len, head_dim // 2]`.
+    * `unsqueeze_dim`: 1 for BNSH layout, 2 for BSNH layout (int).
+* Returns: Tuple of `(query_out, key_out)` with RoPE applied.
+* File: `csrc/ops/rope.cpp`, `csrc/ops/kernels/fused_rope.h`
+* Correctness Verified: Yes
+* Note: `head_dim` must be even. The Python `RotaryEmbedding.apply_rotary_emb` method automatically dispatches to this fused kernel when inputs are contiguous BF16 neox-style.
+
+# Normalization Ops
+These ops implement normalization operations using a pure-fused AVX-512 kernel with OMP parallelism. Each row is processed in two vectorized passes: Pass 1 accumulates statistics (and fuses the residual add for the fused variants) entirely in fp32, Pass 2 normalizes and scales the output. A thread-local fp32 scratch buffer avoids bf16 round-trips in the fused path. All four ops share a single templatized kernel (`norm_impl<IsRMSNorm, IsFusedResidual>`) in `csrc/ops/kernels/fused_norm_kernel_avx512.cpp`.
+
+1. [rmsnorm](#rmsnorm)
+2. [fused_add_rmsnorm](#fused_add_rmsnorm)
+3. [layernorm](#layernorm)
+4. [fused_add_layernorm](#fused_add_layernorm)
+
+### rmsnorm
+* Operation: `torch.ops.pace.rmsnorm`
+* Graph node type: `pace::rmsnorm`
+* PostOps: None
+* Input Types Supported: BF16
+* Weight Types Supported: BF16
+* Output Types Supported: BF16
+* Arguments:
+    * `x`: Input tensor of shape ND `[batch_size, ..., hidden_size]`.
+    * `weight`: Scale tensor of shape 1D `[hidden_size]`.
+    * `eps`: Epsilon for numerical stability (float).
+* File: `csrc/ops/norm.cpp`, `csrc/ops/kernels/fused_norm_kernel.h`
+* Correctness Verified: Yes
+
+### fused_add_rmsnorm
+* Operation: `torch.ops.pace.fused_add_rmsnorm`
+* Graph node type: `pace::fused_add_rmsnorm`
+* PostOps: Binary Add (residual)
+* Input Types Supported: BF16
+* Weight Types Supported: BF16
+* Output Types Supported: BF16
+* Arguments:
+    * `x`: Input tensor of shape ND `[batch_size, ..., hidden_size]`.
+    * `residual`: Residual tensor of same shape as `x`.
+    * `weight`: Scale tensor of shape 1D `[hidden_size]`.
+    * `eps`: Epsilon for numerical stability (float).
+* Returns: Tuple of `(normed_output, residual_output)` where `residual_output = x + residual`.
+* File: `csrc/ops/norm.cpp`, `csrc/ops/kernels/fused_norm_kernel.h`
+* Correctness Verified: Yes
+
+### layernorm
+* Operation: `torch.ops.pace.layernorm`
+* Graph node type: `pace::layernorm`
+* PostOps: None
+* Input Types Supported: BF16
+* Weight Types Supported: BF16
+* Bias Types Supported: BF16
+* Output Types Supported: BF16
+* Arguments:
+    * `x`: Input tensor of shape ND `[batch_size, ..., hidden_size]`.
+    * `weight`: Scale tensor of shape 1D `[hidden_size]`.
+    * `bias`: Shift tensor of shape 1D `[hidden_size]`.
+    * `eps`: Epsilon for numerical stability (float).
+* File: `csrc/ops/norm.cpp`, `csrc/ops/kernels/fused_norm_kernel.h`
+* Correctness Verified: Yes
+
+### fused_add_layernorm
+* Operation: `torch.ops.pace.fused_add_layernorm`
+* Graph node type: `pace::fused_add_layernorm`
+* PostOps: Binary Add (residual)
+* Input Types Supported: BF16
+* Weight Types Supported: BF16
+* Bias Types Supported: BF16
+* Output Types Supported: BF16
+* Arguments:
+    * `x`: Input tensor of shape ND `[batch_size, ..., hidden_size]`.
+    * `residual`: Residual tensor of same shape as `x`.
+    * `weight`: Scale tensor of shape 1D `[hidden_size]`.
+    * `bias`: Shift tensor of shape 1D `[hidden_size]`.
+    * `eps`: Epsilon for numerical stability (float).
+* Returns: Tuple of `(normed_output, residual_output)` where `residual_output = x + residual`.
+* File: `csrc/ops/norm.cpp`, `csrc/ops/kernels/fused_norm_kernel.h`
+* Correctness Verified: Yes
 
 # Embedding Ops
 The embedding bag ops

@@ -3,7 +3,7 @@
 # All rights reserved.
 # ******************************************************************************
 
-from .version import __version__
+from .version import __version__, __version_tuple__
 
 try:
     import torch  # noqa F401
@@ -13,5 +13,6 @@ from . import _C as core
 from . import utils
 from . import llm
 from . import ops
+from ._register_fake import *  # noqa: F401,F403
 
-__all__ = ["__version__", "core", "utils", "llm", "ops"]
+__all__ = ["__version__", "__version_tuple__", "core", "utils", "llm", "ops"]

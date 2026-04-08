@@ -46,7 +46,22 @@ class BaseModelForCausalLM(ABC, nn.Module):
         return self.config
 
     @abstractmethod
-    def forward(self, *args, **kwargs):
+    def forward(self, input_ids, positions, kv_cache):
+        """
+        Forward pass for the model.
+
+        Args:
+            input_ids (torch.LongTensor): Only the new (unprocessed) token IDs.
+                The caller is responsible for sending only tokens not yet in the
+                KV cache. Shape: [batch_size, num_new_tokens].
+            positions (torch.LongTensor): Absolute position indices for each token
+                in input_ids. Computed by the caller from a num_computed_tokens
+                counter. Shape: [batch_size, num_new_tokens].
+            kv_cache: The key-value cache manager (KVCacheManager or list of them).
+
+        Returns:
+            ModelOutput: The model outputs containing logits.
+        """
         pass
 
     @abstractmethod
@@ -55,7 +70,7 @@ class BaseModelForCausalLM(ABC, nn.Module):
 
     def rename_fused_params(self, param_name: str) -> str:
         if not self.rename_layers:
-            return
+            return param_name
 
         for old_name, new_name in self.rename_layers.items():
             if old_name in param_name:

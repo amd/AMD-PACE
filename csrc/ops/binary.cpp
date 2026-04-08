@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright (c) 2024 Advanced Micro Devices, Inc.
+ * Copyright (c) 2026 Advanced Micro Devices, Inc.
  * All rights reserved.
  * Portions of this file consist of AI-generated content
  ******************************************************************************/
@@ -81,12 +81,13 @@ at::Tensor qmul_add(
 
 namespace {
 
-// clang-format off
 TORCH_LIBRARY_FRAGMENT(pace, m) {
-
-  m.def("qmul_add(Tensor a, Tensor b, Tensor addend, Scalar o_scale, Scalar o_zero_point, ScalarType o_dtype) -> Tensor", pace::qmul_add);
-
+  m.def(
+      "qmul_add(Tensor a, Tensor b, Tensor addend, Scalar o_scale, Scalar o_zero_point, ScalarType o_dtype) -> Tensor");
 }
-// clang-format on
+
+TORCH_LIBRARY_IMPL(pace, QuantizedCPU, m) {
+  m.impl("qmul_add", pace::qmul_add);
+}
 
 } // namespace

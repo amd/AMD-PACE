@@ -21,6 +21,30 @@ try:
 except ModuleNotFoundError:
     raise RuntimeError("PyTorch not found, please install PyTorch to continue.")
 
+try:
+    from setuptools_scm import get_version
+
+    PACKAGE_VERSION = get_version(root=".", relative_to=__file__)
+except (ImportError, LookupError):
+    # Fallback if setuptools_scm is not available or not in a git repo
+    PACKAGE_VERSION = "0.0.0+unknown"
+
+
+# Extract a CMake-compatible version (major.minor.patch only)
+# CMake doesn't support PEP 440 local version identifiers
+def extract_cmake_compatible_version(version_string):
+    """Extract CMake-compatible version from PEP 440 version string."""
+    import re
+
+    # Match major.minor.patch at the start of the version
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version_string)
+    if match:
+        return f"{match.group(1)}.{match.group(2)}.{match.group(3)}"
+    return "0.0.0"
+
+
+PACKAGE_CMAKE_VERSION = extract_cmake_compatible_version(PACKAGE_VERSION)
+
 PYTORCH_VERSION = torch.__version__
 PYTORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__))
 
@@ -28,10 +52,6 @@ BUILD_TYPE = "Release"
 
 PACKAGE_NAME = "pace"
 CPP_PACKAGE_NAME = PACKAGE_NAME + "_cpp"
-# Read the version from the version.txt file
-PACKAGE_VERSION = (
-    open(os.path.join(os.path.dirname(__file__), "version.txt"), "r").read().strip()
-)
 PACKAGE_DIR = os.path.abspath(os.path.dirname(__file__))
 PACKAGE_CSRC = os.path.join(PACKAGE_DIR, "csrc")
 PACKAGE_BUILD_DIR = os.path.join(PACKAGE_DIR, "build")
@@ -43,6 +63,8 @@ class CPPLibBuild(build_clib):
     def run(self):
         print(torch.__config__.show())
         print("*" * 45 + "\nBuilding CPP library\n" + "*" * 45)
+        print(f"PACE Version: {PACKAGE_VERSION}")
+        print(f"CMake Version: {PACKAGE_CMAKE_VERSION}")
         if not os.path.exists(PACKAGE_BUILD_DIR):
             os.makedirs(PACKAGE_BUILD_DIR)
 
@@ -51,7 +73,7 @@ class CPPLibBuild(build_clib):
         cmake_cmd += f" -S {PACKAGE_DIR}"
         cmake_cmd += f" -DCMAKE_BUILD_TYPE={BUILD_TYPE}"
         cmake_cmd += f" -DPACKAGE_NAME={CPP_PACKAGE_NAME}"
-        cmake_cmd += f" -DPACKAGE_VERSION={PACKAGE_VERSION}"
+        cmake_cmd += f" -DPACKAGE_VERSION={PACKAGE_CMAKE_VERSION}"
         cmake_cmd += f" -DCMAKE_PREFIX_PATH={torch.utils.cmake_prefix_path}"
         cmake_cmd += f" -DPYTHON_INCLUDE_DIR={sysconfig.get_paths()['include']}"
         cmake_cmd += f" -DCMAKE_INSTALL_PREFIX={PACKAGE_INSALL_DIR}"
@@ -140,12 +162,6 @@ class CleanCmd(clean, object):
 
 class PythonPackageBuild(build_py, object):
     def run(self) -> None:
-
-        # Dump the version to a file within the PACKAGE_NAME directory
-        version_file = os.path.join(PACKAGE_DIR, PACKAGE_NAME, "version.py")
-        with open(version_file, "w") as f:
-            f.write(f'__version__ = "{PACKAGE_VERSION}"\n')
-
         ret = get_src_py_and_dst()
         for src, dst in ret:
             self.copy_file(src, dst)
@@ -177,7 +193,6 @@ data_files_list = [
 
 setup(
     name=PACKAGE_NAME,
-    version=PACKAGE_VERSION,
     data_files=data_files_list,
     packages=[PACKAGE_NAME],
     package_data={PACKAGE_NAME: ["*.so", "lib/*.so", "bin/*.dll", "lib/*.lib"]},

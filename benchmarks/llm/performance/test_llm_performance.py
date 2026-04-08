@@ -4,6 +4,7 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 import time
+import torch
 from unittest import mock
 from typing import Optional
 
@@ -20,7 +21,7 @@ from datastructs import (
     ModelArgs,
     GenerationArgs,
     TokenArgs,
-    GeneraterOutput,
+    GeneratorOutput,
     GeneratorOutputAggregator,
     Metrics,
     SystemMetrics,
@@ -154,7 +155,7 @@ class TestDataStructs(TestCase):
         time_per_tokens: Optional[list[float]],
         mean_accepted_tokens: Optional[float],
     ):
-        generator_output = GeneraterOutput(
+        generator_output = GeneratorOutput(
             total_time=total_time,
             input_tokens=input_tokens,
             total_tokens=total_tokens,
@@ -175,7 +176,7 @@ class TestDataStructs(TestCase):
         token_args = TokenArgs(time_per_tokens=True, time_to_first_token=True)
         aggregator = GeneratorOutputAggregator(token_args)
 
-        output1 = GeneraterOutput(
+        output1 = GeneratorOutput(
             total_time=1.0,
             input_tokens=10,
             total_tokens=20,
@@ -183,7 +184,7 @@ class TestDataStructs(TestCase):
             time_per_tokens=[0.1] * 10,
             mean_accepted_tokens=[0.5] * 10,
         )
-        output2 = GeneraterOutput(
+        output2 = GeneratorOutput(
             total_time=2.0,
             input_tokens=20,
             total_tokens=30,
@@ -205,14 +206,14 @@ class TestDataStructs(TestCase):
         token_args = TokenArgs(time_per_tokens=False, time_to_first_token=False)
         aggregator = GeneratorOutputAggregator(token_args)
 
-        output1 = GeneraterOutput(
+        output1 = GeneratorOutput(
             total_time=1.0,
             input_tokens=10,
             total_tokens=20,
             ttft=0.5,
             time_per_tokens=[0.1] * 10,
         )
-        output2 = GeneraterOutput(
+        output2 = GeneratorOutput(
             total_time=2.0,
             input_tokens=20,
             total_tokens=30,
@@ -378,12 +379,11 @@ class TestDataStructs(TestCase):
 
         benchmark_results = BenchmarkResults(
             framework=framework,
-            model_args=ModelArgs(model_name=model_name, dtype="bf16"),
+            model_args=ModelArgs(model_name=model_name, dtype=torch.bfloat16),
             generation_args=GenerationArgs(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 batch_size=batch_size,
-                num_beams=1,
                 do_sample=False,
                 manual_seed=42,
                 kv_cache_type=KVCacheType.BMC,
@@ -396,11 +396,10 @@ class TestDataStructs(TestCase):
 
         self.assertEqual(benchmark_results.framework, framework)
         self.assertEqual(benchmark_results.model_args.model_name, model_name)
-        self.assertEqual(benchmark_results.model_args.dtype, "bf16")
+        self.assertEqual(benchmark_results.model_args.dtype, torch.bfloat16)
         self.assertEqual(benchmark_results.generation_args.input_tokens, input_tokens)
         self.assertEqual(benchmark_results.generation_args.output_tokens, output_tokens)
         self.assertEqual(benchmark_results.generation_args.batch_size, batch_size)
-        self.assertEqual(benchmark_results.generation_args.num_beams, 1)
         self.assertEqual(benchmark_results.generation_args.do_sample, False)
         self.assertEqual(benchmark_results.generation_args.manual_seed, 42)
         self.assertEqual(benchmark_results.num_runs, num_runs)
@@ -410,8 +409,10 @@ class TestDataStructs(TestCase):
 
         benchmark_results_dict = benchmark_results.to_dict()
         self.assertEqual(benchmark_results_dict["framework"], framework)
-        self.assertEqual(benchmark_results_dict["model_name"], model_name)
-        self.assertEqual(benchmark_results_dict["dtype"], "bf16")
+        self.assertEqual(benchmark_results_dict["model_args"]["model_name"], model_name)
+        self.assertEqual(
+            benchmark_results_dict["model_args"]["dtype"], str(torch.bfloat16)
+        )
         self.assertEqual(
             benchmark_results_dict["generation_args"]["input_tokens"], input_tokens
         )
@@ -421,7 +422,6 @@ class TestDataStructs(TestCase):
         self.assertEqual(
             benchmark_results_dict["generation_args"]["batch_size"], batch_size
         )
-        self.assertEqual(benchmark_results_dict["generation_args"]["num_beams"], 1)
         self.assertEqual(benchmark_results_dict["generation_args"]["do_sample"], False)
         self.assertEqual(benchmark_results_dict["generation_args"]["manual_seed"], 42)
         self.assertEqual(benchmark_results_dict["num_runs"], num_runs)
@@ -434,12 +434,11 @@ class TestDataStructs(TestCase):
     def test_benchmark_results_list(self):
         benchmark_results_list = BenchmarkResultsList()
 
-        model_args = ModelArgs(model_name="test_model", dtype="bf16")
+        model_args = ModelArgs(model_name="test_model", dtype=torch.bfloat16)
         generation_args = GenerationArgs(
             input_tokens=50,
             output_tokens=50,
             batch_size=1,
-            num_beams=1,
             do_sample=False,
             manual_seed=42,
             kv_cache_type=KVCacheType.BMC,
@@ -501,12 +500,11 @@ class TestDataStructs(TestCase):
 
         # Convert to dictionary and check
         results_dict = benchmark_results_list.to_dict()
-        self.assertEqual(results_dict["model_name"], "test_model")
-        self.assertEqual(results_dict["dtype"], "bf16")
+        self.assertEqual(results_dict["model_args"]["model_name"], "test_model")
+        self.assertEqual(results_dict["model_args"]["dtype"], str(torch.bfloat16))
         self.assertEqual(results_dict["generation_args"]["input_tokens"], 50)
         self.assertEqual(results_dict["generation_args"]["output_tokens"], 50)
         self.assertEqual(results_dict["generation_args"]["batch_size"], 1)
-        self.assertEqual(results_dict["generation_args"]["num_beams"], 1)
         self.assertEqual(results_dict["generation_args"]["do_sample"], False)
         self.assertEqual(results_dict["generation_args"]["manual_seed"], 42)
         self.assertEqual(results_dict["num_runs"], 10)
@@ -515,12 +513,11 @@ class TestDataStructs(TestCase):
     def test_benchmark_results_list_append_error(self):
         benchmark_results_list = BenchmarkResultsList()
 
-        model_args1 = ModelArgs(model_name="test_model", dtype="bf16")
+        model_args1 = ModelArgs(model_name="test_model", dtype=torch.bfloat16)
         generation_args1 = GenerationArgs(
             input_tokens=50,
             output_tokens=50,
             batch_size=1,
-            num_beams=1,
             do_sample=False,
             manual_seed=42,
             kv_cache_type=KVCacheType.BMC,
@@ -551,12 +548,11 @@ class TestDataStructs(TestCase):
 
         # Create a second BenchmarkResults object with different framework
         # and model_args to trigger the assertion error
-        model_args2 = ModelArgs(model_name="different_model", dtype="bf16")
+        model_args2 = ModelArgs(model_name="different_model", dtype=torch.bfloat16)
         generation_args2 = GenerationArgs(
             input_tokens=50,
             output_tokens=50,
             batch_size=1,
-            num_beams=1,
             do_sample=False,
             manual_seed=42,
             kv_cache_type=KVCacheType.BMC,

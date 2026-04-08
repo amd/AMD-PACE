@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright (c) 2025 Advanced Micro Devices, Inc.
+ * Copyright (c) 2026 Advanced Micro Devices, Inc.
  * All rights reserved.
  * Portions of this file consist of AI-generated content
  ******************************************************************************/
@@ -109,12 +109,13 @@ at::Tensor mlp_mlp_fusion(
 
 namespace {
 
-// clang-format off
-  TORCH_LIBRARY_FRAGMENT(pace, m) {
+TORCH_LIBRARY_FRAGMENT(pace, m) {
+  m.def(
+      "mlp_mlp_fusion(Tensor src, Tensor[] weights1, Tensor[] ? bias1, Tensor[] weights2, Tensor ? bias2, str nlf, Tensor[] ? weights_gateProj, Tensor[] ? bias_gateProj)->Tensor");
+}
 
-    m.def("mlp_mlp_fusion(Tensor src, Tensor[] weights1, Tensor[] ? bias1, Tensor[] weights2, Tensor ? bias2, str nlf, Tensor[] ? weights_gateProj, Tensor[] ? bias_gateProj)->Tensor", pace::mlp_mlp_fusion);
-
-  }
-// clang-format on
+TORCH_LIBRARY_IMPL(pace, CPU, m) {
+  m.impl("mlp_mlp_fusion", pace::mlp_mlp_fusion);
+}
 
 } // namespace

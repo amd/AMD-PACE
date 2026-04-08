@@ -1,11 +1,15 @@
 # *******************************************************************************
-# Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
 # Portions of this file consist of AI-generated content
 # *******************************************************************************
 
 import os
+import math
 import json
+import re
+import functools
+import inspect
 from enum import Enum
 from collections import UserDict
 from dataclasses import dataclass
@@ -15,7 +19,22 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from pace.llm.ops import LLMOperatorType, BackendType
+from pace.llm.attention import AttentionBackendType, KVCacheType
 from pace.utils.logging import PACE_LLM_ASSERT, PACE_LLM_WARNING, PACE_LLM_DEBUG
+
+CACHE_COMPATIBLE_ATTENTION = {
+    KVCacheType.DYNAMIC: {AttentionBackendType.JIT, AttentionBackendType.NATIVE},
+    KVCacheType.BMC: {AttentionBackendType.JIT, AttentionBackendType.NATIVE},
+    KVCacheType.SLAB_POOL: {AttentionBackendType.SLAB},
+    KVCacheType.PAGED: {AttentionBackendType.PAGED},
+}
+
+CACHE_DEFAULT_ATTENTION = {
+    KVCacheType.DYNAMIC: AttentionBackendType.JIT,
+    KVCacheType.BMC: AttentionBackendType.JIT,
+    KVCacheType.SLAB_POOL: AttentionBackendType.SLAB,
+    KVCacheType.PAGED: AttentionBackendType.PAGED,
+}
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4/vllm/model_executor/sampling_metadata.py#L13
 # to check for a small value (instead of directly checking for 0)
@@ -28,8 +47,7 @@ class SamplingMode(Enum):
     """
 
     GREEDY_SEARCH = 1
-    BEAM_SEARCH = 2
-    RANDOM_SAMPLING = 3
+    RANDOM_SAMPLING = 2
 
 
 # Adapted from GenerationConfig in
@@ -44,10 +62,9 @@ class SamplingConfig(object):
     Args:
         max_new_tokens (int, optional): The maximum number of tokens to generate. Defaults to None. But will be set to 20 if not provided.
         min_new_tokens (int, optional): The minimum number of tokens to generate. Defaults to 0.
-        early_stopping (bool, optional): Whether to stop the generation process early. Defaults to False.
-        frequency_penalty(float, optional): Increase/Decrease the likelihood of repeating tokens already generated.
+        repetition_penalty(float, optional): Multiplicative penalty on tokens present in the prompt+output. >1 discourages repetition, <1 encourages it. (Matches HuggingFace/vLLM convention.)
+        frequency_penalty(float, optional): Additive penalty proportional to how often a token has appeared in the generated output so far. >0 discourages repetition, <0 encourages it. (Matches OpenAI/vLLM convention.)
         do_sample (bool, optional): Whether to use sampling. Defaults to False.
-        num_beams (int, optional): The number of beams to use. Defaults to 1.
         temperature (float, optional): The temperature to use for sampling. Defaults to 1.0.
         top_k (int, optional): The number of tokens to sample from. Defaults to 0.
         top_p (float, optional): The cumulative probability for sampling from the top_k tokens. Defaults to 1.0.
@@ -69,6 +86,9 @@ class SamplingConfig(object):
         """
         Create a SamplingConfig object from the generation_config.json file saved in the model directory.
 
+        Tolerates trailing commas in JSON, which are common in HuggingFace
+        model repositories but rejected by Python's strict json parser.
+
         Args:
             generation_config_from_model: Path to the generation_config.json file saved in the model directory.
 
@@ -77,7 +97,11 @@ class SamplingConfig(object):
         """
         with open(generation_config_from_model, "r", encoding="utf-8") as reader:
             text = reader.read()
-        config_dict = json.loads(text)
+        try:
+            config_dict = json.loads(text)
+        except json.JSONDecodeError:
+            text = re.sub(r",\s*([}\]])", r"\1", text)
+            config_dict = json.loads(text)
         return cls.from_dict(**config_dict)
 
     @classmethod
@@ -93,14 +117,43 @@ class SamplingConfig(object):
         """
         return cls(**kwargs)
 
+    @staticmethod
+    def _track_explicit_args(init_fn):
+        """Decorator that records which ``__init__`` args the caller explicitly passed.
+
+        After construction, ``self._explicit_keys`` is a frozenset of the
+        parameter names that were supplied by the caller (as opposed to falling
+        back to their signature defaults).
+        """
+        sig = inspect.signature(init_fn)
+
+        @functools.wraps(init_fn)
+        def wrapper(self, *args, **kwargs):
+            bound = sig.bind(self, *args, **kwargs)
+            explicit = set()
+            for k, v in bound.arguments.items():
+                if v is None:
+                    continue
+                if k == "self":
+                    continue
+                if k == "kwargs":
+                    explicit.update(v.keys())
+                else:
+                    explicit.add(k)
+            self._explicit_keys = frozenset(explicit)
+            return init_fn(self, *args, **kwargs)
+
+        return wrapper
+
+    @_track_explicit_args.__func__
     def __init__(
         self,
         max_new_tokens: Optional[int] = None,
         min_new_tokens: Optional[int] = 0,
-        early_stopping: Optional[bool] = False,
-        frequency_penalty: Optional[float] = 1.0,
+        ignore_eos: Optional[bool] = False,
+        repetition_penalty: Optional[float] = 1.0,
+        frequency_penalty: Optional[float] = 0.0,
         do_sample: Optional[bool] = False,
-        num_beams: Optional[int] = 1,
         temperature: Optional[float] = 1.0,
         top_k: Optional[int] = 0,
         top_p: Optional[float] = 1.0,
@@ -115,15 +168,24 @@ class SamplingConfig(object):
         return_text: Optional[bool] = False,
         **kwargs,
     ):
+        # Warn about removed beam search parameters that may still be
+        # present in generation_config.json files or user code
+        _removed_params = {"num_beams", "early_stopping", "use_beam_search"}
+        _found = _removed_params & kwargs.keys()
+        if _found:
+            PACE_LLM_WARNING(
+                f"Beam search has been removed. The following parameters "
+                f"will be ignored: {_found}"
+            )
+
         # Parameters that control the length of the output
         self.max_new_tokens: int = max_new_tokens
         self.min_new_tokens: int = min_new_tokens
-        self.early_stopping: bool = early_stopping
+        self.ignore_eos: bool = bool(ignore_eos)
+        self.repetition_penalty: float = repetition_penalty
         self.frequency_penalty: float = frequency_penalty
         # Parameters that control the generation strategy used
         self.do_sample: bool = do_sample
-        self.num_beams: int = num_beams
-        self.use_beam_search: bool = False if self.num_beams == 1 else True
 
         # Parameters for manipulation of the model output logits
         self.temperature: float = temperature
@@ -205,16 +267,20 @@ class SamplingConfig(object):
 
         # The other SamplingConfig object will override the current object (takes precedence)
         if other is not None:
+            explicit = getattr(other, "_explicit_keys", frozenset())
             for key, value in other.__dict__.items():
+                if key.startswith("_"):
+                    continue
                 # For pad_token_id and eos_token_id, we will merge the values
                 if key in ["pad_token_id", "eos_token_id"]:
                     self._merge_lists(other, key)
                     continue
 
-                # Avoid setting the new value in 2 cases
-                # 1. if the value is None
-                # 2. If the value is the default value set at initialization
-                if value is not None and value != getattr(SamplingConfig(), key):
+                # Only apply values that the caller explicitly provided.
+                # This lets us distinguish "user wrote do_sample=False" from
+                # "do_sample just defaulted to False", so defaults from one
+                # config never silently overwrite explicit values in another.
+                if key in explicit:
                     setattr(self, key, value)
 
     def _set_sampling_method(
@@ -224,22 +290,10 @@ class SamplingConfig(object):
         Set the sampling method based on the configuration parameters.
 
         The sampling method can be one of the following:
-        - BEAM_SEARCH
         - GREEDY_SEARCH
         - RANDOM_SAMPLING (default)
         """
-        if self.use_beam_search:
-            PACE_LLM_ASSERT(
-                not (
-                    self.return_probs
-                    or self.return_logprobs
-                    or self.return_input_logprobs
-                ),
-                "Beam search requires return_probs, return_logprobs or return_input_logprobs to be False",
-            )
-
-            self.sampling_mode = SamplingMode.BEAM_SEARCH
-        elif (self.do_sample is False) or self.temperature == 0:
+        if (self.do_sample is False) or self.temperature == 0:
             self.sampling_mode = SamplingMode.GREEDY_SEARCH
         else:
             self.sampling_mode = SamplingMode.RANDOM_SAMPLING
@@ -253,7 +307,6 @@ class SamplingConfig(object):
         The configuration parameters must satisfy the following constraints:
             * max_new_tokens should be an integer >= 1
             * min_new_tokens should be an integer >= 0
-            * early_stopping should be a boolean value
 
             * temperature should be a float >= 0
             * top_k should be an integer >= 0
@@ -288,19 +341,6 @@ class SamplingConfig(object):
             f"min_new_tokens should be >=0, got {self.min_new_tokens}",
         )
 
-        PACE_LLM_ASSERT(
-            isinstance(self.early_stopping, bool),
-            f"early_stopping should be of type int, got: {type(self.early_stopping)}",
-        )
-        PACE_LLM_ASSERT(
-            self.early_stopping
-            in [
-                True,
-                False,
-            ],
-            f"Got early_stopping of {self.early_stopping}",
-        )
-
         # Temperature should be float and >= 0
         self.temperature = float(self.temperature)
         PACE_LLM_ASSERT(
@@ -325,9 +365,20 @@ class SamplingConfig(object):
             f"min_p should be between 0 and 1, Got min_p: {self.min_p}",
         )
 
+        self.repetition_penalty = float(self.repetition_penalty)
+        PACE_LLM_ASSERT(
+            self.repetition_penalty > 0,
+            f"repetition_penalty must be > 0 (division by zero), got: {self.repetition_penalty}",
+        )
+        self.frequency_penalty = float(self.frequency_penalty)
+        PACE_LLM_ASSERT(
+            math.isfinite(self.frequency_penalty),
+            f"frequency_penalty must be finite, got: {self.frequency_penalty}",
+        )
+
         # https://github.com/vllm-project/vllm/blob/v0.6.4/vllm/model_executor/sampling_metadata.py#L413
         # NOTE: Zero temperature means deterministic sampling
-        # (i.e., greedy sampling or beam search).
+        # (i.e., greedy sampling).
         # Set the temperature to 1 to avoid division by zero, also temperature,
         # as 0 means it's deterministic sampling, so override the values
         # of top_k, top_p and min_p to 0, 1.0 and 0.0 respectively (so that, they are not done)
@@ -455,12 +506,14 @@ class OperatorConfig(UserDict):
         super().__init__(**kwargs)
         self._finalized = False
 
-    def finalize(self):
+    def finalize(self, cache_type=None):
         """
         Finalize the OperatorConfig object. Once finalized, the configuration parameters cannot be modified.
 
-        Raises:
-            ValueError: If the OperatorConfig object is already finalized.
+        Args:
+            cache_type: Optional KVCacheType. If provided, validates that the
+                attention backend is compatible with the cache type and overrides
+                with a warning if not.
         """
 
         if hasattr(self, "_finalized") and self._finalized:
@@ -470,34 +523,53 @@ class OperatorConfig(UserDict):
             )
 
         for key in self.keys():
-            if not isinstance(key, LLMOperatorType) or not isinstance(key, str):
+            if not isinstance(key, (LLMOperatorType, str)):
                 PACE_LLM_ASSERT(
                     False,
                     f"{key} is not a valid LLMOperatorType. "
                     f"Valid keys are: {list(LLMOperatorType)} or str",
                 )
-            if not isinstance(self[key], BackendType):
+            if key == LLMOperatorType.Attention:
+                if not isinstance(self[key], AttentionBackendType):
+                    PACE_LLM_ASSERT(
+                        False,
+                        f"{self[key]} is not a valid AttentionBackendType. "
+                        f"Valid values are: {list(AttentionBackendType)}",
+                    )
+            elif not isinstance(self[key], BackendType):
                 PACE_LLM_ASSERT(
                     False,
                     f"{self[key]} is not a valid BackendType. "
                     f"Valid values are: {list(BackendType)}",
                 )
-        # Check if all keys in LLMOperatorType are present in the config
-        # If not, set them to BackendType.NATIVE and issue a warning
+
         for key in LLMOperatorType:
             if key not in self.keys():
+                if key == LLMOperatorType.Attention:
+                    self[key] = AttentionBackendType.JIT
+                else:
+                    self[key] = BackendType.NATIVE
                 PACE_LLM_DEBUG(
                     f"{key} is not set in the OperatorConfig. "
-                    f"If the model contains this operator, it will be set to "
-                    f"BackendType.NATIVE by default."
+                    f"Defaulting to {self[key]}."
                 )
-                self[key] = BackendType.NATIVE
+
+        if cache_type is not None:
+            user_attn = self.get(LLMOperatorType.Attention)
+            compatible = CACHE_COMPATIBLE_ATTENTION.get(cache_type, set())
+            if compatible and user_attn not in compatible:
+                forced = CACHE_DEFAULT_ATTENTION[cache_type]
+                PACE_LLM_WARNING(
+                    f"Attention backend '{user_attn}' is incompatible with "
+                    f"cache type '{cache_type.value}'. Overriding to '{forced}'."
+                )
+                self[LLMOperatorType.Attention] = forced
 
         self.qkv_projection = self.pop(
             LLMOperatorType.QKVProjection, BackendType.NATIVE
         )
         self.rope = self.pop(LLMOperatorType.RoPE, BackendType.NATIVE)
-        self.attention = self.pop(LLMOperatorType.Attention, BackendType.NATIVE)
+        self.attention = self.pop(LLMOperatorType.Attention, AttentionBackendType.JIT)
         self.out_projection = self.pop(
             LLMOperatorType.OutProjection, BackendType.NATIVE
         )
@@ -527,11 +599,24 @@ class OperatorConfig(UserDict):
 
 
 @dataclass
-class PardSpecDecodeConfig:
+class SpecDecodeConfig:
+    """Base configuration class for speculative decoding algorithms.
+
+    All speculative decoding configs should inherit from this class so that
+    ``Generator`` and ``LLMModel`` can accept any algorithm-specific config
+    through a single ``spec_config`` parameter.
+    """
+
+    pass
+
+
+@dataclass
+class PardSpecDecodeConfig(SpecDecodeConfig):
 
     model_name_or_path: str
     pard_token: Optional[torch.Tensor] = None
     num_speculative_tokens: int = 12
+    draft_kv_cache_memory_gb: Optional[float] = None
 
     def merge_and_verify(
         self,

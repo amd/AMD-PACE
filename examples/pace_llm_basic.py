@@ -18,6 +18,7 @@ from pace.llm import (
     LLMBackendType,
     OperatorConfig,
 )
+from pace.llm.attention import AttentionBackendType
 
 
 def generate_and_time(model, input_encoded, gen_kwargs, pace_model=True):
@@ -75,7 +76,7 @@ def run_pace_llm():
         **{
             LLMOperatorType.Norm: LLMBackendType.NATIVE,
             LLMOperatorType.QKVProjection: LLMBackendType.TPP,
-            LLMOperatorType.Attention: LLMBackendType.JIT,
+            LLMOperatorType.Attention: AttentionBackendType.JIT,
             LLMOperatorType.OutProjection: LLMBackendType.TPP,
             LLMOperatorType.MLP: LLMBackendType.TPP,
             LLMOperatorType.LMHead: LLMBackendType.NATIVE,
@@ -90,7 +91,6 @@ def run_pace_llm():
         "max_new_tokens": 50,
         "do_sample": True,
         "temperature": 0.7,
-        "num_beams": 1,
         "top_k": 50,
         "random_seed": 123,
         "stop_strings": ["\n\n"],
@@ -101,7 +101,6 @@ def run_pace_llm():
     print("Model Name: ", model_name)
     print("Input: ", inputs_str)
     print("Encoded Input: ", input_encoded.input_ids)
-    print("Attention Mask: ", input_encoded.attention_mask)
     pace_output = generate_and_time(pace_model, input_encoded, sampling_config)
     decode_outputs(tokenizer, pace_output.output_token_ids)
 

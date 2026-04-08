@@ -31,21 +31,28 @@ class StoppingCriteria(object):
     ):
 
         self.initial_decoder_input_length = input_prompts.shape[-1]
+        self._min_length = (
+            getattr(sampling_config, "min_new_tokens", 0) or 0
+        ) + self.initial_decoder_input_length
 
+        self._max_length = None
         self.stop_conditions = []  # To be used with conditions implemented in PACE
         self.hf_stop_conditions = []  # To be used with conditions implemented in HF
         if sampling_config.max_new_tokens is not None:
-            max_length = (
+            self._max_length = (
                 sampling_config.max_new_tokens + self.initial_decoder_input_length
             )
             self.stop_conditions.append(
-                partial(self._stop_if_max_len, max_length=max_length)
+                partial(self._stop_if_max_len, max_length=self._max_length)
             )
 
-        if sampling_config.eos_token_id is not None:
-            for eos_token_id in sampling_config.eos_token_id:
+        if not getattr(sampling_config, "ignore_eos", False):
+            if sampling_config.eos_token_id is not None:
                 self.stop_conditions.append(
-                    partial(self._stop_if_eos_token, eos_token_id=eos_token_id)
+                    partial(
+                        self._stop_if_eos_token,
+                        eos_token_id=torch.as_tensor(sampling_config.eos_token_id),
+                    )
                 )
 
         if (
@@ -70,13 +77,15 @@ class StoppingCriteria(object):
     def __repr__(self):
         return str(self)
 
-    def _stop_if_max_len(self, logits: torch.Tensor, max_length: int) -> torch.Tensor:
+    def _stop_if_max_len(
+        self, logits: torch.Tensor, max_length: int, **kwargs
+    ) -> torch.Tensor:
         """
         Check if the number of new tokens generated is greater than max_new_tokens.
 
         Args:
             logits (torch.Tensor): The logits tensor.
-            max_new_tokens (int): The maximum number of new tokens allowed.
+            max_length (int): The maximum total sequence length allowed.
 
         Returns:
             torch.Tensor: A tensor of boolean values indicating if the length
@@ -87,27 +96,40 @@ class StoppingCriteria(object):
         return torch.full((logits.shape[0],), is_done, dtype=torch.bool)
 
     def _stop_if_eos_token(
-        self, logits: torch.Tensor, eos_token_id: int
+        self,
+        logits: torch.Tensor,
+        eos_token_id: torch.Tensor,
+        num_new_tokens: int = 1,
     ) -> torch.Tensor:
         """
-        Check if the last token generated is the EOS token.
+        Check if any of the newly appended tokens is an EOS token.
+
+        ``eos_token_id`` can be a scalar or a tensor of multiple IDs;
+        ``torch.isin`` handles both transparently.  With speculative
+        decoding multiple tokens can be appended in a single step, so
+        ``num_new_tokens`` tells the method how many trailing tokens to
+        inspect.
 
         Args:
-            logits (torch.Tensor): The logits tensor.
-            eos_token_id (int): The EOS token id.
+            logits (torch.Tensor): The full token sequence so far.
+            eos_token_id (torch.Tensor): One or more EOS token ids.
+            num_new_tokens (int): Number of tokens appended this step.
 
         Returns:
-            torch.Tensor: A tensor of boolean values indicating if the last
-                token generated is the EOS token.
+            torch.Tensor: A boolean tensor indicating whether any of the
+                new tokens is an EOS token.
         """
-        return torch.isin(logits[:, -1], eos_token_id)
+        return torch.isin(logits[:, -num_new_tokens:], eos_token_id).any(dim=-1)
 
-    def _check_for_conditions(self, logits: torch.Tensor) -> torch.Tensor:
+    def _check_for_conditions(
+        self, logits: torch.Tensor, num_new_tokens: int = 1
+    ) -> torch.Tensor:
         """
         Check if any of the stop conditions are met.
 
         Args:
             logits (torch.Tensor): The logits tensor.
+            num_new_tokens (int): Number of tokens appended this step.
 
         Returns:
             torch.Tensor: A tensor of boolean values indicating if the sampling
@@ -119,24 +141,30 @@ class StoppingCriteria(object):
         # corresponding value in is_done is set to True.
         is_done = torch.full((logits.shape[0],), False, dtype=torch.bool)
         for condition in self.stop_conditions:
-            is_done = is_done | condition(logits=logits)
+            is_done = is_done | condition(logits=logits, num_new_tokens=num_new_tokens)
 
         if self.hf_stop_conditions:
             for condition in self.hf_stop_conditions:
                 is_done = is_done | condition(logits, scores=None)
         return is_done
 
-    def stop_now(self, logits: torch.Tensor) -> torch.Tensor:
+    def stop_now(self, logits: torch.Tensor, num_new_tokens: int = 1) -> torch.Tensor:
         """
         Check if the sampling should be stopped. If any of the stop conditions
         are met, the corresponding value in the output tensor is set to True.
 
         Args:
             logits (torch.Tensor): The logits tensor.
+            num_new_tokens (int): Number of tokens appended this step
+                (defaults to 1).
 
         Returns:
             torch.Tensor: A tensor of boolean values indicating if the sampling
                 should be stopped.
         """
 
-        return self._check_for_conditions(logits)
+        if logits.shape[-1] < self._min_length:
+            if self._max_length is not None:
+                return self._stop_if_max_len(logits, self._max_length)
+            return torch.full((logits.shape[0],), False, dtype=torch.bool)
+        return self._check_for_conditions(logits, num_new_tokens)

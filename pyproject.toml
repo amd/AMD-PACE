@@ -1,9 +1,10 @@
 [build-system]
 requires = [
-    "torch==2.7.0+cpu",
+    "torch==2.9.0+cpu",
     "clang-format>=17.0.6",
     "cmake==3.31.6",
     "setuptools>=77.0.3",
+    "setuptools-scm>=8.1",
     "ninja>=1.11",
 ]
 build-backend = "setuptools.build_meta"
@@ -13,8 +14,11 @@ name = "pace"
 authors = [{name = "AMD"}]
 readme = "README.md"
 description = "PACE is a plugin to PyTorch for efficient and scalable inference of deep learning models."
-requires-python = ">=3.9,<3.14"
+requires-python = ">=3.10,<3.14"
 dynamic = ["version", "dependencies"]
+
+[tool.setuptools_scm]
+version_file = "pace/_version.py"
 
 [project.scripts]
 pace-server = "pace.server.launcher:main"

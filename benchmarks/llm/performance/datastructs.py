@@ -4,59 +4,19 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 
+import copy
 import json
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from pace.utils.logging import PACE_LLM_ASSERT
+import torch
+from utils import PACE_LLM_ASSERT
 
 
-@dataclass
-class ModelArgs:
-    model_name: str
-    dtype: str
-    llm_operators: Optional[dict] = None
-    spec_config: Optional[dict] = None
+class BaseData:
 
-
-@dataclass
-class GenerationArgs:
-    input_tokens: int
-    output_tokens: int
-    batch_size: int
-    num_beams: int
-    kv_cache_type: str
-    do_sample: bool
-    manual_seed: int
-
-
-@dataclass
-class TokenArgs:
-    time_to_first_token: bool = False
-    time_per_tokens: bool = False
-
-
-@dataclass
-class BenchmarkArgs:
-    frameworks: List[str]
-    model_args: ModelArgs
-    generation_args: GenerationArgs
-    use_real_data: bool
-    num_runs: int
-    warmup_runs: int
-    visualize: bool
-    verbose: bool
-    output_dir: str
-    token_args: TokenArgs
-    system_metrics: bool
-
-
-class BaseData(ABC):
-
-    @abstractmethod
     def to_dict(self):
-        pass
+        return vars(self)
 
     def __str__(self):
         # remove None values
@@ -69,11 +29,56 @@ class BaseData(ABC):
         return str(self)
 
     def dump(self, filename):
-        json.dump(self.to_dict(), open(filename, "w"), indent=4)
+        with open(filename, "w") as f:
+            json.dump(self.to_dict(), f, indent=4)
 
 
 @dataclass
-class GeneraterOutput:
+class ModelArgs(BaseData):
+    model_name: str
+    dtype: torch.dtype
+    llm_operators: Optional[dict] = None
+    spec_config: Optional[dict] = None
+
+    def to_dict(self):
+        # dtype is not always serializable, convert to str
+        dict_val = copy.deepcopy(vars(self))
+        dict_val["dtype"] = str(dict_val["dtype"])
+        return dict_val
+
+
+@dataclass
+class GenerationArgs(BaseData):
+    input_tokens: int
+    output_tokens: int
+    batch_size: int
+    kv_cache_type: str
+    do_sample: bool
+    manual_seed: int
+
+
+@dataclass
+class TokenArgs(BaseData):
+    time_to_first_token: bool = False
+    time_per_tokens: bool = False
+
+
+@dataclass
+class BenchmarkArgs(BaseData):
+    frameworks: List[str]
+    model_args: ModelArgs
+    generation_args: GenerationArgs
+    use_real_data: bool
+    num_runs: int
+    warmup_runs: int
+    verbose: bool
+    output_dir: str
+    token_args: TokenArgs
+    system_metrics: bool
+
+
+@dataclass
+class GeneratorOutput:
     total_time: float
     input_tokens: int
     total_tokens: int
@@ -95,7 +100,11 @@ class GeneratorOutputAggregator:
         self.time_per_tokens = []
         self.mean_accepted_tokens = []
 
-    def append(self, generation_output: GeneraterOutput):
+    def append(self, generation_output: GeneratorOutput):
+        assert isinstance(
+            generation_output, GeneratorOutput
+        ), "generation_output must be an instance of GeneratorOutput"
+
         self.total_generation_times.append(generation_output.total_time)
         # Count newly generated tokens
         self.generated_tokens_count += (
@@ -124,19 +133,6 @@ class Metrics(BaseData):
     time_per_tokens: Optional[List[float]] = None
     mean_accepted_tokens: Optional[float] = None
 
-    def to_dict(self):
-        return {
-            "total_tokens": self.total_tokens,
-            "total_gen_tokens": self.total_gen_tokens,
-            "average_gen_time": self.average_gen_time,
-            "average_latency_per_token": self.average_latency_per_token,
-            "total_tps": self.total_tps,
-            "output_tps": self.output_tps,
-            "average_ttft": self.average_ttft,
-            "time_per_tokens": self.time_per_tokens,
-            "mean_accepted_tokens": self.mean_accepted_tokens,
-        }
-
 
 @dataclass
 class SystemMetrics(BaseData):
@@ -144,14 +140,6 @@ class SystemMetrics(BaseData):
     cpu_usage: List[float]
     ram_usage: List[float]
     peak_ram_usage: float
-
-    def to_dict(self):
-        return {
-            "interval": self.interval,
-            "cpu_usage": self.cpu_usage,
-            "ram_usage": self.ram_usage,
-            "peak_ram_usage": self.peak_ram_usage,
-        }
 
 
 @dataclass
@@ -167,17 +155,8 @@ class BenchmarkResults(BaseData):
     def to_dict(self):
         return {
             "framework": self.framework,
-            "model_name": self.model_args.model_name,
-            "dtype": str(self.model_args.dtype),
-            "llm_operators": self.model_args.llm_operators,
-            "generation_args": {
-                "input_tokens": self.generation_args.input_tokens,
-                "output_tokens": self.generation_args.output_tokens,
-                "batch_size": self.generation_args.batch_size,
-                "num_beams": self.generation_args.num_beams,
-                "do_sample": self.generation_args.do_sample,
-                "manual_seed": self.generation_args.manual_seed,
-            },
+            "model_args": self.model_args.to_dict(),
+            "generation_args": self.generation_args.to_dict(),
             "num_runs": self.num_runs,
             "warmup_runs": self.warmup_runs,
             "metrics": self.metrics.to_dict(),
@@ -218,21 +197,12 @@ class BenchmarkResultsList(BaseData):
         if not self.results:
             return {}
 
-        first_result = self.results[0]
-        return_dict = {
-            "model_name": first_result.model_args.model_name,
-            "dtype": str(first_result.model_args.dtype),
-            "llm_operators": first_result.model_args.llm_operators,
-            "num_runs": first_result.num_runs,
-            "warmup_runs": first_result.warmup_runs,
-            "generation_args": {
-                "input_tokens": first_result.generation_args.input_tokens,
-                "output_tokens": first_result.generation_args.output_tokens,
-                "batch_size": first_result.generation_args.batch_size,
-                "num_beams": first_result.generation_args.num_beams,
-                "do_sample": first_result.generation_args.do_sample,
-                "manual_seed": first_result.generation_args.manual_seed,
-            },
+        # For the common cases, only add them in the dict once
+        return {
+            "model_args": self.results[0].model_args.to_dict(),
+            "generation_args": self.results[0].generation_args.to_dict(),
+            "num_runs": self.results[0].num_runs,
+            "warmup_runs": self.results[0].warmup_runs,
             "benchmark_results": [
                 {
                     "framework": res.framework,
@@ -244,4 +214,3 @@ class BenchmarkResultsList(BaseData):
                 for res in self.results
             ],
         }
-        return return_dict

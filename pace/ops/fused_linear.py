@@ -1,5 +1,5 @@
 # ******************************************************************************
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
@@ -21,7 +21,7 @@ class FusedLinearActivation(OperatorBase):
     Fused Linear ReLU operator.
     """
 
-    _supported_activations = ["relu", "gelu", "gelu_new", "silu"]
+    _supported_activations = ["relu", "gelu", "gelu_new", "gelu_pytorch_tanh", "silu"]
 
     def __init__(
         self,
@@ -261,7 +261,7 @@ def _get_fused_linear(
             dtype=dtype,
             backend_impl=backend_impl,
         )
-    elif activation == "gelu" or activation == "gelu_new":
+    elif activation in ("gelu", "gelu_new", "gelu_pytorch_tanh"):
         return FusedLinearGelu(
             in_features=in_features,
             out_features=out_features,
@@ -289,5 +289,5 @@ def _get_fused_linear(
         PACE_ASSERT(
             False,
             f"Unsupported activation function: {activation}. Supported"
-            " functions are: relu, gelu, gelu_new, silu, mul.",
+            " functions are: relu, gelu, gelu_new, gelu_pytorch_tanh, silu, mul.",
         )
