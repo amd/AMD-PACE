@@ -1,0 +1,5 @@
+{
+  "workdir": "/sandbox",
+  "deps_mount": "/sandbox_deps",
+  "stockfish_path": "/opt/stockfish"
+}

@@ -1,0 +1,7 @@
+# Accelerator libraries for the library-backed optimized tiers (v2).
+# Installed via the `fast` extra: `pip install pace-agent[fast]`.
+# Optional: when absent, the affected optimized tiers honestly fall back to naive
+# (never a phantom speedup) -- see tests/testing.md.
+orjson>=3.9
+selectolax>=0.3.21
+google-re2>=1.1

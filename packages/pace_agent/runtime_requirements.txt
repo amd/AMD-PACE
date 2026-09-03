@@ -1,0 +1,26 @@
+# Runtime dependencies installed by `pip install pace-agent`.
+# Sourced into [project].dependencies via [tool.setuptools.dynamic] in pyproject.toml.
+
+numpy==2.4.6
+msgpack==1.2.1
+openai==2.46.0
+anthropic==0.121.0
+langgraph==1.2.9
+selenium==4.12.0
+# Attachment readers used by GAIA closed-book (--no-tools) inlining:
+#   openpyxl -> xlsx/xls, python-docx -> docx, pdfminer.six -> pdf.
+# Host-side pypdf (pdf_text_extract) lives in pdf_requirements.txt via the `pdf` extra.
+# Sandbox GAIA attachment parsing still uses system Python packages mounted into nsjail;
+# these host deps do not replace that sandbox install.
+openpyxl==3.1.5
+python-docx==1.2.0
+pdfminer.six==20260107
+# Vendored gaia_planner + nsjail_agent (HF dataset load, vision/audio tools, FastAPI API).
+# nsjail_agent also needs the `nsjail` binary on PATH (or NSJAIL_BIN) for real sandboxing.
+pydantic>=2.0
+yt-dlp>=2024.0.0
+faster-whisper>=1.0
+datasets>=2.14
+huggingface_hub>=0.20
+fastapi>=0.111
+uvicorn[standard]>=0.29

@@ -1,0 +1,20 @@
+[
+  {
+    "task_id": "gaia_007",
+    "question": "When you take the average of the standard population deviation of the red numbers and the standard sample deviation of the green numbers in the image colored_numbers.png, using the statistics module in Python 3.11, what is the result rounded to the nearest three decimal points?",
+    "expected": "17.056",
+    "files": ["../pace_agent/examples/fixtures/gaia/colored_numbers.png"]
+  },
+  {
+    "task_id": "gaia_010",
+    "question": "The attached file shows a list of books in the collection of Scribe County Public Library. How many of the library's books that are authored by Rick Riordan are not currently on the library's shelves?",
+    "expected": "7",
+    "files": ["../pace_agent/examples/fixtures/gaia/library_books.pdf"]
+  },
+  {
+    "task_id": "gaia_015",
+    "question": "The attached spreadsheet contains the sales of menu items for a regional fast-food chain. Which city had the greater total sales: Wharvton or Algrimand?",
+    "expected": "Wharvton",
+    "files": ["../pace_agent/examples/fixtures/gaia/menu_sales.xlsx"]
+  }
+]

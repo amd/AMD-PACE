@@ -1,0 +1,18 @@
+{
+  "embed":            { "n": 512, "dim": 256, "toklen": 32 },
+  "vector_search":    { "N": 10000, "dim": 256, "top_k": 10 },
+  "bm25":             { "N_docs": 2000, "doclen": 40, "qlen": 5, "top_k": 10 },
+  "rerank":           { "n": 2000, "dim": 256, "top_k": 10 },
+  "quantize":         { "size": 200000 },
+  "json_serialize":   { "n": 2000 },
+  "json_deserialize": { "n": 2000 },
+  "tokenize":         { "n": 4000 },
+  "html_parse":       { "n": 1500 },
+  "ast_parse":        { "n": 400 },
+  "regex_extract":    { "n": 5000 },
+  "assemble":         { "n": 3000 },
+  "chunk":            { "n": 8000, "size": 128, "overlap": 16 },
+  "dedup":            { "n": 3000 },
+  "summarize":        { "n": 2000, "budget": 500 },
+  "pdf_text_extract": { "file": "sample.pdf", "pages": "1-1" }
+}

@@ -28,6 +28,7 @@ AMD PACE is a high-performance LLM inference engine built from the ground up for
 
 * [Installation](#installation)
 * [vLLM Plugin (`pace-vllm`)](packages/pace_vllm/README.md)
+* [PACE Agent (`pace-agent`)](packages/pace_agent/README.md)
 * [Inference Server](docs/InferenceServer.md)
 * [More about AMD PACE](docs/Plugin.md)
 * [Models Supported](#models-supported)

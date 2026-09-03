@@ -1,0 +1,10 @@
+{
+    "graphs": [
+        { "spec": "webvoyager", "kwargs": { "query": "derivative of x^2 when x=5.6", "start_url": "https://www.wolframalpha.com/", "max_iter": 12, "max_tokens": 1024, "browser_config": { "type": "selenium", "headless": true } } },
+        { "spec": "webvoyager", "kwargs": { "query": "Provide a recipe for vegetarian lasagna with more than 100 reviews and a rating of at least 4.5 stars suitable for 6 people.", "start_url": "https://www.allrecipes.com/", "max_iter": 12, "max_tokens": 1024, "browser_config": { "type": "selenium", "headless": true } } },
+        { "spec": "webvoyager", "kwargs": { "query": "Find a report on the BBC News website about recent developments in renewable energy technologies in the UK.", "start_url": "https://www.bbc.com/news/", "max_iter": 12, "max_tokens": 1024, "browser_config": { "type": "selenium", "headless": true } } }
+    ],
+    "llm_backend": { "type": "openai", "base_url": "ADD YOUR LLM ENDPOINT HERE (e.g. http://localhost:8000/v1)", "model": "openai/gpt-oss-20b", "temperature": 0.0, "seed": 0, "api_key_env": "ADD YOUR API-KEY ENV VAR HERE (if the endpoint needs auth)", "subscription_header": "ADD YOUR GATEWAY KEY HEADER HERE (e.g. Ocp-Apim-Subscription-Key; omit if none)" },
+    "num_runs": 1,
+    "warmup_runs": 0
+}

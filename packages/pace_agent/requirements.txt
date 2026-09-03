@@ -1,0 +1,8 @@
+# Developer convenience: runtime deps + optional extras + dev tools.
+# `pip install pace-agent` only pulls runtime_requirements.txt.
+
+-r runtime_requirements.txt
+-r pdf_requirements.txt
+-r fast_requirements.txt
+flake8>=7.1.1
+black==26.3.1

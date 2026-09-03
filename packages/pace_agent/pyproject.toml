@@ -1,0 +1,57 @@
+# ******************************************************************************
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# All rights reserved.
+# Portions of this file consist of AI-generated content
+# ******************************************************************************
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pace-agent"
+version = "0.1.0"
+description = "PACE Agent — CPU performance benchmark and optimizer for the non-model layer of agentic AI"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+dynamic = ["dependencies", "optional-dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["runtime_requirements.txt"] }
+
+# Each optional extra is sourced from its own requirements file (single source of truth,
+# shared with the dev requirements.txt) instead of being duplicated inline. The `fast`
+# accelerator libs are optional: when absent, the library-backed optimized tiers honestly
+# fall back to naive (never a phantom speedup).
+#
+# GAIA / nsjail deps are in runtime_requirements.txt (installed by default with pace-agent).
+# No `[agents]` / `[amd-pace]` extras and no `gaia-planner` console script. GAIA is a PACE Agent
+# example like WebVoyager: `pace-agent profile run_gaia --config <cfg> --out <dir>` (or
+# `python -m pace_agent.examples.run_gaia`; see docs/gaia-planner.md).
+[tool.setuptools.dynamic.optional-dependencies]
+pdf = { file = ["pdf_requirements.txt"] }
+fast = { file = ["fast_requirements.txt"] }
+
+[project.scripts]
+# Sole public CLI entry point — GAIA runs through `pace-agent profile run_gaia`, not a separate
+# gaia-planner console script.
+pace-agent = "pace_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+# Vendored `gaia_planner/` and `nsjail_agent/` live beside `pace_agent/` (PACE Agent namespace
+# re-export at `pace_agent/gaia_planner/`). Setuptools only auto-discovers `pace_agent*`; the
+# extra patterns are
+# required so `pip install -e .` installs those sibling trees for the GAIA runner and
+# tests_agents/. They are internal implementation packages — not separate PyPI products and
+# not exposed via console scripts or extras. Prefer `from pace_agent.gaia_planner import ...`.
+include = ["pace_agent*", "gaia_planner*", "nsjail_agent*"]
+
+[tool.setuptools.package-data]
+pace_agent = ["bench/fixtures/*", "examples/fixtures/**/*"]
+
+[tool.pytest.ini_options]
+# Keep PACE Agent's own suite scoped to tests/. Vendored agent suites live under
+# tests_agents/ and are run explicitly with unittest discover (see tests/testing.md).
+testpaths = ["tests"]

@@ -1,0 +1,27 @@
+{
+  "workload": "gaia",
+  "impl": "pace_agent.examples.run_gaia",
+  "parallel": 1,
+  "out": "pace-agent-gaia",
+  "llm": {
+    "endpoint": "${OPENAI_BASE_URL}",
+    "model": "${OPENAI_MODEL}",
+    "api_key_env": "OPENAI_API_KEY"
+  },
+  "gaia": {
+    "engine": "langgraph",
+    "huggingface": true,
+    "level": 1,
+    "split": "validation",
+    "max_tasks": 5,
+    "task_id": null,
+    "task_ids": null,
+    "skip_preflight": false,
+    "no_tools": false
+  },
+  "sandbox": {
+    "workdir": "/sandbox",
+    "deps_mount": "/sandbox_deps",
+    "stockfish_path": "/opt/stockfish"
+  }
+}

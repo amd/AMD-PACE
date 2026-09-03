@@ -1,0 +1,14 @@
+{
+  "impl": "pace",
+  "llm_backend": {
+    "type": "openai",
+    "base_url": "ADD YOUR LLM ENDPOINT HERE (e.g. http://localhost:8000/v1)",
+    "model": "GPT-oss-20B",
+    "api_key_env": "ADD YOUR API-KEY ENV VAR HERE (if the endpoint needs auth)",
+    "temperature": 0.0,
+    "seed": 0,
+    "max_tokens": 1024
+  },
+  "num_runs": 10,
+  "warmup_runs": 1
+}

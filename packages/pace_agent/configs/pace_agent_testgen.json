@@ -1,0 +1,20 @@
+{
+    "impl": "naive",
+    "graphs": [
+        {
+            "spec": "testgen",
+            "kwargs": {
+                "function": "def compound_interest(principal, rate, years):\n    \"\"\"Final amount for annually-compounded interest, rounded to 2 decimals.\n\n    `rate` is a percent (5 means 5%). Raises ValueError if principal or\n    years is negative. Example: compound_interest(1000, 5, 3) == 1157.63.\n    \"\"\"\n    if principal < 0 or years < 0:\n        raise ValueError(\"principal and years must be non-negative\")\n    return round(principal * (1 + rate / 100) ** years, 2)\n"
+            }
+        }
+    ],
+    "llm": {
+        "endpoint": "ADD YOUR LLM ENDPOINT HERE (e.g. http://localhost:8000)",
+        "model": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "seed": 0,
+        "max_tokens": 4096
+    },
+    "num_runs": 10,
+    "warmup": 0
+}
