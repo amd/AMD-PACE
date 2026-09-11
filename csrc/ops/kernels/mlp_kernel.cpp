@@ -5,13 +5,13 @@
  ******************************************************************************/
 // Standard includes
 #include <iostream>
+#include <unordered_map>
 #include <vector>
 
 // extension includes
-#include <ops/cpu.h>
-#include <pace_tensor/pace_aten_interface.h>
+#include <ops/onednn.h>
+#include <ops/onednn_utils.h>
 #include <utils/utils.h>
-#include <utils/zen_utils.h>
 
 #include <ops/kernels/mlp_kernel.h>
 using dt = memory::data_type;
@@ -89,14 +89,14 @@ void IMBPS_MLP(
   }
 
   // Get dimensions and Data type
-  memory::dims src_dims = {GET_DIMS(src_md, 0), GET_DIMS(src_md, 1)};
+  memory::dims src_dims = {src_md.get_dims()[0], src_md.get_dims()[1]};
   memory::dims weights_dims = {
-      GET_DIMS(weights_md, 0), GET_DIMS(weights_md, 1)};
+      weights_md.get_dims()[0], weights_md.get_dims()[1]};
   memory::dims weights_gateProj_dims;
   if (weight_gateProj.has_value())
     weights_gateProj_dims = {
-        GET_DIMS(weights_gateProj_md, 0), GET_DIMS(weights_gateProj_md, 1)};
-  dt data_type = GET_DATA_TYPE(src_mem);
+        weights_gateProj_md.get_dims()[0], weights_gateProj_md.get_dims()[1]};
+  dt data_type = src_mem.get_desc().get_data_type();
 
   memory::dim M = src_dims[0], K = src_dims[1], N = weights_dims[1];
 
@@ -105,12 +105,12 @@ void IMBPS_MLP(
   auto up_proj_md = memory::desc(up_proj_dims, data_type, tag::ab);
   memory::dims down_proj_dims = {M, K};
   auto down_proj_md = memory::desc(down_proj_dims, dt::f32, tag::ab);
-  memory up_proj_mem = memory(up_proj_md, cpu_eng(), JIT_MEMORY_ALLOCATE);
+  memory up_proj_mem = memory(up_proj_md, cpu_eng(), DNNL_MEMORY_ALLOCATE);
   memory gateProj_mem;
   memory::desc gateProj_md;
   if (weight_gateProj.has_value()) {
     gateProj_md = memory::desc(up_proj_dims, data_type, tag::ab);
-    gateProj_mem = memory(gateProj_md, cpu_eng(), JIT_MEMORY_ALLOCATE);
+    gateProj_mem = memory(gateProj_md, cpu_eng(), DNNL_MEMORY_ALLOCATE);
   }
   // Create empty tensors for bias
   // Added to ensure bias doesn't get added in multiple blocks
@@ -128,29 +128,17 @@ void IMBPS_MLP(
   float alpha = 0.f, beta = 0.f;
   if (weight_gateProj.has_value()) {
     alpha = 1.f;
-#ifdef USE_ZENDNN
-    gateProj_ops.append_eltwise(1.0f, algorithm::eltwise_swish, alpha, beta);
-#else
     gateProj_ops.append_eltwise(algorithm::eltwise_swish, alpha, beta);
-#endif
     gateProj_attr.set_post_ops(gateProj_ops);
   }
   primitive_attr upProj_attr;
   post_ops upProj_ops;
   std::transform(nlf.begin(), nlf.end(), nlf.begin(), ::tolower);
-#ifdef USE_ZENDNN
-  if (nlf == "gelu") {
-    upProj_ops.append_eltwise(1.0f, algorithm::eltwise_gelu_tanh, alpha, beta);
-  } else if (nlf == "relu") {
-    upProj_ops.append_eltwise(1.0f, algorithm::eltwise_relu, alpha, beta);
-  }
-#else
   if (nlf == "gelu") {
     upProj_ops.append_eltwise(algorithm::eltwise_gelu_tanh, alpha, beta);
   } else if (nlf == "relu") {
     upProj_ops.append_eltwise(algorithm::eltwise_relu, alpha, beta);
   }
-#endif
   upProj_attr.set_post_ops(upProj_ops);
 
   primitive_attr downProj_attr;
@@ -159,19 +147,6 @@ void IMBPS_MLP(
   downProj_attr.set_post_ops(downProj_ops);
 
   matmul::primitive_desc gateProj_pd;
-#ifdef USE_ZENDNN
-  if (weight_gateProj.has_value()) {
-    auto gateProj_d = matmul::desc(
-        src_md, weights_gateProj_md, bias_gateProj_md, gateProj_md);
-    gateProj_pd = matmul::primitive_desc(gateProj_d, cpu_eng());
-  }
-  auto upProj_d = matmul::desc(src_md, weights_md, bias_md, up_proj_md);
-  auto upProj_pd = matmul::primitive_desc(upProj_d, cpu_eng());
-  auto downProj_d =
-      matmul::desc(up_proj_md, weights2_md, bias2_md, down_proj_md);
-  auto downProj_pd =
-      matmul::primitive_desc(downProj_d, downProj_attr, cpu_eng());
-#else
   if (weight_gateProj.has_value())
     gateProj_pd = matmul::primitive_desc(
         cpu_eng(), src_md, weights_gateProj_md, bias_gateProj_md, gateProj_md);
@@ -184,7 +159,6 @@ void IMBPS_MLP(
       bias2_md,
       down_proj_md,
       downProj_attr);
-#endif
 
   int last_block = iterations - 1;
   bool fringe_block = false;
@@ -220,10 +194,10 @@ void IMBPS_MLP(
     // Primitive arguments for the gateProj linear
     if (weight_gateProj.has_value()) {
       std::unordered_map<int, memory> gateProj_args = {
-          {JIT_ARG_SRC, src_mem},
-          {JIT_ARG_WEIGHTS, weights_gateProj_mem},
-          {JIT_ARG_BIAS, bias_gateProjmem},
-          {JIT_ARG_DST, gateProj_mem}};
+          {DNNL_ARG_SRC, src_mem},
+          {DNNL_ARG_WEIGHTS, weights_gateProj_mem},
+          {DNNL_ARG_BIAS, bias_gateProjmem},
+          {DNNL_ARG_DST, gateProj_mem}};
       auto gateProj = matmul(gateProj_pd);
       prim_args_vec.push_back(gateProj_args);
       prim_vec.push_back(gateProj);
@@ -231,20 +205,20 @@ void IMBPS_MLP(
 
     // Primitive arguments for the upProj linear
     std::unordered_map<int, memory> upProj_args = {
-        {JIT_ARG_SRC, src_mem},
-        {JIT_ARG_WEIGHTS, weights_mem},
-        {JIT_ARG_BIAS, bias_mem},
-        {JIT_ARG_DST, up_proj_mem}};
+        {DNNL_ARG_SRC, src_mem},
+        {DNNL_ARG_WEIGHTS, weights_mem},
+        {DNNL_ARG_BIAS, bias_mem},
+        {DNNL_ARG_DST, up_proj_mem}};
     auto upProj = matmul(upProj_pd);
     prim_args_vec.push_back(upProj_args);
     prim_vec.push_back(upProj);
 
     // Primitive arguments for the second linear
     std::unordered_map<int, memory> downProj_args = {
-        {JIT_ARG_SRC, up_proj_mem},
-        {JIT_ARG_WEIGHTS, weights2_mem},
-        {JIT_ARG_BIAS, (i + 1 < iterations) ? bias2_empty_mem : bias2_mem},
-        {JIT_ARG_DST, dst2_mem}};
+        {DNNL_ARG_SRC, up_proj_mem},
+        {DNNL_ARG_WEIGHTS, weights2_mem},
+        {DNNL_ARG_BIAS, (i + 1 < iterations) ? bias2_empty_mem : bias2_mem},
+        {DNNL_ARG_DST, dst2_mem}};
     auto downProj = matmul(downProj_pd);
     prim_args_vec.push_back(downProj_args);
     prim_vec.push_back(downProj);
@@ -297,13 +271,13 @@ void IMBPS_MLP(
       bias_gateProj_md = bias_gateProjmem.get_desc();
 
     // Get dimensions and Data type
-    memory::dims src_dims = {GET_DIMS(src_md, 0), GET_DIMS(src_md, 1)};
+    memory::dims src_dims = {src_md.get_dims()[0], src_md.get_dims()[1]};
     memory::dims weights_dims = {
-        GET_DIMS(weights_md, 0), GET_DIMS(weights_md, 1)};
+        weights_md.get_dims()[0], weights_md.get_dims()[1]};
     if (weight_gateProj.has_value())
       weights_gateProj_dims = {
-          GET_DIMS(weights_gateProj_md, 0), GET_DIMS(weights_gateProj_md, 1)};
-    dt data_type = GET_DATA_TYPE(src_mem);
+          weights_gateProj_md.get_dims()[0], weights_gateProj_md.get_dims()[1]};
+    dt data_type = src_mem.get_desc().get_data_type();
     memory::dim M = src_dims[0], K = src_dims[1], N = weights_dims[1];
 
     // Destination (dst) tensors dimensions
@@ -311,10 +285,11 @@ void IMBPS_MLP(
     auto up_proj_md = memory::desc(up_proj_dims, data_type, tag::ab);
     memory::dims down_proj_dims = {M, K};
     auto down_proj_md = memory::desc(down_proj_dims, dt::f32, tag::ab);
-    up_proj_mem_fringe = memory(up_proj_md, cpu_eng(), JIT_MEMORY_ALLOCATE);
+    up_proj_mem_fringe = memory(up_proj_md, cpu_eng(), DNNL_MEMORY_ALLOCATE);
     if (weight_gateProj.has_value()) {
       gateProj_md = memory::desc(up_proj_dims, data_type, tag::ab);
-      gateProj_mem_fringe = memory(gateProj_md, cpu_eng(), JIT_MEMORY_ALLOCATE);
+      gateProj_mem_fringe =
+          memory(gateProj_md, cpu_eng(), DNNL_MEMORY_ALLOCATE);
     }
 
     // Create empty tensors for bias
@@ -330,31 +305,18 @@ void IMBPS_MLP(
     float alpha = 0.f, beta = 0.f;
     if (weight_gateProj.has_value()) {
       alpha = 1.f;
-#ifdef USE_ZENDNN
-      gateProj_ops.append_eltwise(1.0f, algorithm::eltwise_swish, alpha, beta);
-#else
       gateProj_ops.append_eltwise(algorithm::eltwise_swish, alpha, beta);
-#endif
       gateProj_attr.set_post_ops(gateProj_ops);
     }
 
     primitive_attr upProj_attr;
     post_ops upProj_ops;
     std::transform(nlf.begin(), nlf.end(), nlf.begin(), ::tolower);
-#ifdef USE_ZENDNN
-    if (nlf == "gelu") {
-      upProj_ops.append_eltwise(
-          1.0f, algorithm::eltwise_gelu_tanh, alpha, beta);
-    } else if (nlf == "relu") {
-      upProj_ops.append_eltwise(1.0f, algorithm::eltwise_relu, alpha, beta);
-    }
-#else
     if (nlf == "gelu") {
       upProj_ops.append_eltwise(algorithm::eltwise_gelu_tanh, alpha, beta);
     } else if (nlf == "relu") {
       upProj_ops.append_eltwise(algorithm::eltwise_relu, alpha, beta);
     }
-#endif
     upProj_attr.set_post_ops(upProj_ops);
 
     primitive_attr downProj_attr;
@@ -362,19 +324,6 @@ void IMBPS_MLP(
     downProj_ops.append_sum(1.f);
     downProj_attr.set_post_ops(downProj_ops);
 
-#ifdef USE_ZENDNN
-    if (weight_gateProj.has_value()) {
-      auto gateProj_d = matmul::desc(
-          src_md, weights_gateProj_md, bias_gateProj_md, gateProj_md);
-      gateProj_pd = matmul::primitive_desc(gateProj_d, cpu_eng());
-    }
-    auto upProj_d = matmul::desc(src_md, weights_md, bias_md, up_proj_md);
-    auto upProj_pd = matmul::primitive_desc(upProj_d, cpu_eng());
-    auto downProj_d =
-        matmul::desc(up_proj_md, weights2_md, bias2_md, down_proj_md);
-    auto downProj_pd =
-        matmul::primitive_desc(downProj_d, downProj_attr, cpu_eng());
-#else
     if (weight_gateProj.has_value()) {
       gateProj_pd = matmul::primitive_desc(
           cpu_eng(),
@@ -392,15 +341,14 @@ void IMBPS_MLP(
         bias2_md,
         down_proj_md,
         downProj_attr);
-#endif
 
     // Primitive arguments for the gateProj linear
     if (weight_gateProj.has_value()) {
       std::unordered_map<int, memory> gateProj_args = {
-          {JIT_ARG_SRC, src_mem},
-          {JIT_ARG_WEIGHTS, weights_gateProj_mem_fringe},
-          {JIT_ARG_BIAS, bias_gateProjmem},
-          {JIT_ARG_DST, gateProj_mem_fringe}};
+          {DNNL_ARG_SRC, src_mem},
+          {DNNL_ARG_WEIGHTS, weights_gateProj_mem_fringe},
+          {DNNL_ARG_BIAS, bias_gateProjmem},
+          {DNNL_ARG_DST, gateProj_mem_fringe}};
       auto gateProj = matmul(gateProj_pd);
       prim_args_vec.push_back(gateProj_args);
       prim_vec.push_back(gateProj);
@@ -408,20 +356,20 @@ void IMBPS_MLP(
 
     // Primitive arguments for the upProj linear
     std::unordered_map<int, memory> upProj_args = {
-        {JIT_ARG_SRC, src_mem},
-        {JIT_ARG_WEIGHTS, weights_mem},
-        {JIT_ARG_BIAS, bias_mem},
-        {JIT_ARG_DST, up_proj_mem_fringe}};
+        {DNNL_ARG_SRC, src_mem},
+        {DNNL_ARG_WEIGHTS, weights_mem},
+        {DNNL_ARG_BIAS, bias_mem},
+        {DNNL_ARG_DST, up_proj_mem_fringe}};
     auto upProj = matmul(upProj_pd);
     prim_args_vec.push_back(upProj_args);
     prim_vec.push_back(upProj);
 
     // Primitive arguments for the second linear
     std::unordered_map<int, memory> downProj_args = {
-        {JIT_ARG_SRC, up_proj_mem_fringe},
-        {JIT_ARG_WEIGHTS, weights2_mem},
-        {JIT_ARG_BIAS, bias2_empty_mem},
-        {JIT_ARG_DST, dst2_mem}};
+        {DNNL_ARG_SRC, up_proj_mem_fringe},
+        {DNNL_ARG_WEIGHTS, weights2_mem},
+        {DNNL_ARG_BIAS, bias2_empty_mem},
+        {DNNL_ARG_DST, dst2_mem}};
     auto downProj = matmul(downProj_pd);
     prim_args_vec.push_back(downProj_args);
     prim_vec.push_back(downProj);
@@ -430,7 +378,7 @@ void IMBPS_MLP(
     for (int i = 0; i < prim_vec.size(); i = i + 2) {
       prim_vec.at(i).execute(engine_stream, prim_args_vec.at(i));
       at::Tensor downProj_src_tensor = view_memory_as_tensor(
-          prim_args_vec.at(i).at(JIT_ARG_DST),
+          prim_args_vec.at(i).at(DNNL_ARG_DST),
           src.scalar_type(),
           transpose_dims(0, 0));
       if (nlf == "gelu")
@@ -439,31 +387,31 @@ void IMBPS_MLP(
         downProj_src_tensor = at::relu(downProj_src_tensor);
       prim_vec.at(i + 1).execute(
           engine_stream,
-          {{JIT_ARG_SRC, view_tensor_as_memory(downProj_src_tensor)},
-           {JIT_ARG_WEIGHTS, prim_args_vec.at(i + 1).at(JIT_ARG_WEIGHTS)},
-           {JIT_ARG_BIAS, prim_args_vec.at(i + 1).at(JIT_ARG_BIAS)},
-           {JIT_ARG_DST, dst2_mem}} /* prim_args_vec.at(i+1)*/);
+          {{DNNL_ARG_SRC, view_tensor_as_memory(downProj_src_tensor)},
+           {DNNL_ARG_WEIGHTS, prim_args_vec.at(i + 1).at(DNNL_ARG_WEIGHTS)},
+           {DNNL_ARG_BIAS, prim_args_vec.at(i + 1).at(DNNL_ARG_BIAS)},
+           {DNNL_ARG_DST, dst2_mem}} /* prim_args_vec.at(i+1)*/);
     }
   } else {
     for (int i = 0; i < prim_vec.size(); i = i + 3) {
       prim_vec.at(i).execute(engine_stream, prim_args_vec.at(i));
       prim_vec.at(i + 1).execute(engine_stream, prim_args_vec.at(i + 1));
       at::Tensor gateProj_tensor = view_memory_as_tensor(
-          prim_args_vec.at(i).at(JIT_ARG_DST),
+          prim_args_vec.at(i).at(DNNL_ARG_DST),
           src.scalar_type(),
           transpose_dims(0, 0));
       gateProj_tensor = at::silu(gateProj_tensor);
       at::Tensor upProj_tensor = view_memory_as_tensor(
-          prim_args_vec.at(i + 1).at(JIT_ARG_DST),
+          prim_args_vec.at(i + 1).at(DNNL_ARG_DST),
           src.scalar_type(),
           transpose_dims(0, 0));
       upProj_tensor = upProj_tensor * gateProj_tensor;
       prim_vec.at(i + 2).execute(
           engine_stream,
-          {{JIT_ARG_SRC, view_tensor_as_memory(upProj_tensor)},
-           {JIT_ARG_WEIGHTS, prim_args_vec.at(i + 2).at(JIT_ARG_WEIGHTS)},
-           {JIT_ARG_BIAS, prim_args_vec.at(i + 2).at(JIT_ARG_BIAS)},
-           {JIT_ARG_DST, dst2_mem}} /* prim_args_vec.at(i+2)*/);
+          {{DNNL_ARG_SRC, view_tensor_as_memory(upProj_tensor)},
+           {DNNL_ARG_WEIGHTS, prim_args_vec.at(i + 2).at(DNNL_ARG_WEIGHTS)},
+           {DNNL_ARG_BIAS, prim_args_vec.at(i + 2).at(DNNL_ARG_BIAS)},
+           {DNNL_ARG_DST, dst2_mem}} /* prim_args_vec.at(i+2)*/);
     }
   }
   // TODO: Parallelize this loop(IMBPS_PARALLEL_FLOW) continuation of line 107
@@ -475,9 +423,9 @@ void IMBPS_MLP(
   //     binary(binary_pd);
   //     // print_data(result_mems[i]);
   //     binary_prim.execute(engine_stream, {
-  //         {JIT_ARG_SRC_0, result_mems[i]},
-  //         {JIT_ARG_SRC_1, dst2_mem},
-  //         {JIT_ARG_DST, dst2_mem}
+  //         {DNNL_ARG_SRC_0, result_mems[i]},
+  //         {DNNL_ARG_SRC_1, dst2_mem},
+  //         {DNNL_ARG_DST, dst2_mem}
   //     });
 
   //     engine_stream.wait();

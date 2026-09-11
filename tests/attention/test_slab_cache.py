@@ -9,6 +9,9 @@ Tests for SLAB Python cache layer: SlabPoolManager, SlabPoolContext,
 SlabPoolLayerView. Tests duck-type compatibility with KVCacheManager.
 """
 
+import os
+from unittest.mock import patch
+
 import torch
 from torch.testing._internal.common_utils import TestCase
 
@@ -18,6 +21,8 @@ from pace.llm.attention.slab.cache import (
     SlabPoolManager,
     SlabPoolContext,
     SlabPoolLayerView,
+    autotune_block_size,
+    kv_cache_bytes_per_token,
 )
 
 
@@ -43,6 +48,23 @@ class _MockConfig:
 
 
 class TestSlabPoolManager(TestCase):
+    def test_autotuner_environment_override(self):
+        with patch.dict(os.environ, {"SLAB_BLOCK_SIZE": "128"}):
+            self.assertEqual(autotune_block_size(8, 128), 128)
+
+    def test_autotuner_rejects_invalid_environment_override(self):
+        with patch.dict(os.environ, {"SLAB_BLOCK_SIZE": "7"}):
+            with self.assertRaisesRegex(RuntimeError, "SLAB_BLOCK_SIZE"):
+                autotune_block_size(8, 128)
+
+    def test_manager_uses_autotuned_block_size(self):
+        with patch.dict(os.environ, {"SLAB_BLOCK_SIZE": "128"}):
+            manager = SlabPoolManager(_MockConfig(), max_total_tokens=1024)
+        self.assertEqual(manager.block_size, 128)
+
+    def test_kv_cache_bytes_per_token(self):
+        self.assertEqual(kv_cache_bytes_per_token(8, 128), 4096)
+
     def test_creation_with_max_total_tokens(self):
         config = _MockConfig()
         mgr = SlabPoolManager(config, max_total_tokens=1024)
@@ -100,9 +122,7 @@ class TestSlabPoolManager(TestCase):
     def test_compute_max_tokens_from_memory(self):
         tokens = SlabPoolManager.compute_max_tokens_from_memory(
             kv_cache_memory_gb=1.0,
-            num_layers=32,
-            num_kv_heads=8,
-            head_dim=128,
+            bytes_per_token_all_layers=32 * kv_cache_bytes_per_token(8, 128),
         )
         self.assertGreater(tokens, 0)
         expected = int(1.0 * 1024**3) // (32 * 2 * 8 * 128 * 2)

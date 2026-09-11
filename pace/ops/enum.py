@@ -29,7 +29,11 @@ class OperatorType(StrEnum):
     SIGMOID = auto()
     LAYERNORM = auto()
     RMSNORM = auto()
+    L2NORM = auto()
     ROTARYEMBEDDING = auto()
+    MOEROUTER_SOFTMAX = auto()
+    MOEROUTER_SIGMOID = auto()
+    MOEROUTER_GROUPED_SIGMOID = auto()
 
 
 class FusedOperatorType(StrEnum):
@@ -40,6 +44,7 @@ class FusedOperatorType(StrEnum):
     FUSEDLINEARMUL = auto()
     FUSED_RMSNORM_RESIDUAL = auto()
     FUSED_LAYERNORM_RESIDUAL = auto()
+    FUSEDMOE = auto()
 
 
 class BackendType(StrEnum):

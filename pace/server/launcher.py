@@ -77,6 +77,24 @@ def main():
         help="Memory budget for SLAB KV cache pool in GB",
     )
     parser.add_argument(
+        "--token_budget",
+        type=int,
+        default=2048,
+        help="Max tokens per step for continuous_batch scheduler",
+    )
+    parser.add_argument(
+        "--max_num_running_reqs",
+        type=int,
+        default=128,
+        help="Hard cap on concurrent decode sequences per engine for continuous_batch",
+    )
+    parser.add_argument(
+        "--max_prefill_chunk",
+        type=int,
+        default=0,
+        help="Max prefill chunk size (0=no cap) for continuous_batch scheduler",
+    )
+    parser.add_argument(
         "--enable_prometheus",
         action="store_true",
         help="Start Prometheus when launcher starts; downloads binary to cache if not present",
@@ -306,6 +324,17 @@ def main():
     ]
     if args.kv_cache_memory_gb is not None:
         router_cmd.extend(["--kv_cache_memory_gb", str(args.kv_cache_memory_gb)])
+    if args.serve_type == "continuous_batch":
+        router_cmd.extend(
+            [
+                "--token_budget",
+                str(args.token_budget),
+                "--max_num_running_reqs",
+                str(args.max_num_running_reqs),
+                "--max_prefill_chunk",
+                str(args.max_prefill_chunk),
+            ]
+        )
     prometheus_proc = None
     prometheus_config_path = None
     prometheus_cleanup_config = False

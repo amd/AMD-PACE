@@ -147,7 +147,7 @@ The directory structure should look like:
     - Multiple operators with the same signature can share a fake implementation by stacking `@register_fake` decorators
     - See `pace/_register_fake.py` for examples
 
-7. Once the method is implemented, it needs to be documented in the `docs/Ops.md` file. The documentation should include the method signature, the input and output types, and a brief description of the operator.
+7. Once the method is implemented, add a brief note in the relevant documentation under `docs/` if the op is user-facing.
 
 > For a complete example of an operator, refer to the binary operator in `csrc/ops/binary.h` and `csrc/ops/binary.cpp` for operator implementation, `csrc/ops/kernels/binary_kernel.h`, `csrc/ops/kernels/binary_kernel.cpp`, and `csrc/ops/kernels/binary_kernel_avx512.cpp` for kernel implementation, and `pace/_register_fake.py` for fake op registration for torch.compile support.
 
@@ -319,7 +319,7 @@ Before raising patches for review make sure of the following:
 
 > Currently basic linting/formatting is only available. Later more linting will be enforced.
 
-1. Code styling for C++: All the C++ files within AMD PACE follows the PyTorch format of formatting. The formatting module is integrated into AMD PACE itself. To make use of it while building the extension, use the environment variable `ENABLE_CLANG_FORMAT`.
+1. Code styling for C++: All C++ files use the PyTorch clang-format style. Formatting is applied during the build when `ENABLE_CLANG_FORMAT=ON`.
 
     ```shell
     ENABLE_CLANG_FORMAT=ON pip install [-v] .

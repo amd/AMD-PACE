@@ -6,7 +6,7 @@
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Union, Tuple, List
+from typing import Any, Optional, Union, Tuple, List
 
 import torch
 from torch import nn
@@ -100,8 +100,45 @@ class Cache(ABC):
         pass
 
 
+class _ContiguousKVSharingView:
+    """Read-only alias of a source layer's contiguous KV cache (KV sharing).
+
+    A layer with a ``kv_sharing_target`` owns one of these instead of its own
+    cache: it proxies the source's key/value and discards anything the backend
+    tries to append.
+    """
+
+    def __init__(self, source: KVCacheBase, token: str = ""):
+        self._src = source
+        self.token = token
+
+    @property
+    def key(self):
+        return self._src.key
+
+    @property
+    def value(self):
+        return self._src.value
+
+    def update_cache(self, key_states, value_states, concat_dim):
+        return self._src.key, self._src.value
+
+    @property
+    def seq_len(self):
+        return self._src.seq_len
+
+    def remove_cache(self, remove_len: int) -> None:
+        # The source cache is removed via its own entry; this view is a no-op.
+        pass
+
+
 class KVCacheManager(CacheContext):
-    """Manages key-value caches for multiple layers (contiguous backend)."""
+    """Manages key-value caches for multiple layers (contiguous backend).
+
+    KV sharing is resolved here (not in models): layers whose spec sets a
+    ``kv_sharing_target`` get a read-only view over the target layer's cache
+    instead of their own storage.
+    """
 
     def __init__(
         self,
@@ -111,16 +148,26 @@ class KVCacheManager(CacheContext):
         token: str = "",
     ):
         from pace.llm.attention import get_kv_cache_class
+        from pace.llm.attention.specs import compute_layer_kv_specs
 
         self.token = token
-        self.num_layers = config.num_hidden_layers
         self.cache_type = cache_type
         self.kv_cache_class = get_kv_cache_class(self.cache_type)
-        self.cache_objects: List[KVCacheBase] = [
-            self.kv_cache_class(max_seq_length) for _ in range(self.num_layers)
-        ]
-        for obj in self.cache_objects:
-            obj.token = token
+
+        specs = compute_layer_kv_specs(config)
+        self.num_layers = len(specs)
+        cache_objects: List[object] = [None] * self.num_layers
+        for layer_idx, spec in enumerate(specs):
+            if spec.kv_sharing_target is None:
+                obj = self.kv_cache_class(max_seq_length)
+                obj.token = token
+                cache_objects[layer_idx] = obj
+        for layer_idx, spec in enumerate(specs):
+            if spec.kv_sharing_target is not None:
+                cache_objects[layer_idx] = _ContiguousKVSharingView(
+                    cache_objects[spec.kv_sharing_target], token=token
+                )
+        self.cache_objects: List[KVCacheBase] = cache_objects
 
     def __len__(self) -> int:
         return int(self.cache_objects[0].seq_len)
@@ -140,8 +187,8 @@ class AttentionBackend(ABC, nn.Module):
     def forward(
         self,
         Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
+        K: Optional[torch.Tensor],
+        V: Optional[torch.Tensor],
         kv_cache,
         positions: torch.Tensor,
         **kwargs,
@@ -149,7 +196,10 @@ class AttentionBackend(ABC, nn.Module):
         """
         Args:
             Q, K, V: [BS, q_len, num_heads/num_kv_heads, head_dim] (BSHD).
-                Already projected and RoPE'd by the model.
+                Already projected and RoPE'd by the model. K and V are None for
+                a layer that reuses another layer's KV (``kv_sharing_target``):
+                there is nothing to store, and the layer attends against the
+                target layer's cached KV.
             positions: [BS, q_len] absolute position indices.  Used to
                 detect left-padding and build causal+padding masks internally.
         Returns:

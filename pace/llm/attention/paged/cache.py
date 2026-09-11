@@ -23,7 +23,16 @@ from typing import List, Optional, Tuple, Dict, Any
 import torch
 from transformers import PretrainedConfig
 
-from pace.llm.attention.base import Cache, KVCacheBase, KVCacheType, KVCacheManager
+from pace.llm.attention.base import (
+    Cache,
+    KVCacheBase,
+    KVCacheType,
+    KVCacheManager,
+)
+from pace.llm.attention.prefix_cache import (
+    PrefixCacheContextMixin,
+    PrefixCacheMixin,
+)
 from pace.utils.logging import (
     PACE_INFO,
     PACE_WARNING,
@@ -94,6 +103,51 @@ def compute_slot_mapping(
     return torch.cat(all_slots)
 
 
+class _PagedKVSharingView:
+    """Read-only alias of a source layer's paged cache (KV sharing).
+
+    A layer that reuses another layer's KV owns one of these instead of its
+    own cache. It forwards ``get_cache_tensors`` to the source and performs no
+    write; the paged backend detects ``kv_sharing_readonly`` and skips the
+    ``reshape_and_cache`` call. Mirrors vLLM's ``kv_sharing_target_layer_name``:
+    the sharing layer allocates no storage and reads the target's blocks.
+    """
+
+    kv_sharing_readonly = True
+
+    def __init__(self, source):
+        self._src = source
+
+    def get_cache_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._src.get_cache_tensors()
+
+    @property
+    def seq_len(self):
+        return self._src.seq_len
+
+    @seq_len.setter
+    def seq_len(self, value):
+        # The source layer owns seq_len and is advanced through its own entry.
+        pass
+
+    @property
+    def allocated_blocks(self):
+        return self._src.allocated_blocks
+
+    @property
+    def block_size(self):
+        return self._src.block_size
+
+    def _ensure_blocks_allocated(self, required_len: int) -> None:
+        self._src._ensure_blocks_allocated(required_len)
+
+    def update_cache(self, key_states, value_states, concat_dim):
+        return self._src.get_cache_tensors()
+
+    def remove_cache(self, remove_len: int) -> None:
+        pass
+
+
 class PagedKVCache(KVCacheBase):
     """
     Paged key-value cache implementation for efficient memory management.
@@ -111,6 +165,9 @@ class PagedKVCache(KVCacheBase):
         block_table: Mapping from sequence positions to block indices
         slot_mapping: Mapping from token positions to cache slots
     """
+
+    # Read-only sharing views set this True; the backend then skips the write.
+    kv_sharing_readonly = False
 
     def __init__(
         self,
@@ -222,12 +279,21 @@ class PagedKVCache(KVCacheBase):
 
         self.seq_len = new_seq_len
 
-        if new_seq_len > 0:
+        if new_seq_len <= 0:
+            self.block_table = None
+            return
+
+        # In-place truncate instead of a full rebuild.
+        if (
+            self.block_table is not None
+            and self.block_table.size(0) >= new_blocks_needed
+        ):
+            self.block_table = self.block_table[:new_blocks_needed]
+        else:
+            # Defensive fallback: block_table missing or unexpectedly short
             self.block_table = torch.tensor(
                 self.allocated_blocks, dtype=torch.int32, device=self.device
             )
-        else:
-            self.block_table = None
 
     def update_cache(
         self, key_states: torch.Tensor, value_states: torch.Tensor, concat_dim: int
@@ -328,19 +394,29 @@ class PagedKVCachePool:
         num_layers: int,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device = torch.device("cpu"),
+        specs: Optional[list] = None,
     ):
         """
-        Initialize the unified KV cache pool.
+        Initialize the KV cache pool.
 
         Args:
             total_blocks: Total number of blocks across all requests
             block_size: Number of tokens per block
-            num_kv_heads: Number of KV heads
-            head_dim: Head dimension
+            num_kv_heads: Number of KV heads (uniform fallback when specs=None)
+            head_dim: Head dimension (uniform fallback when specs=None)
             num_layers: Number of transformer layers
             dtype: Data type for cache tensors
             device: Device to allocate on
+            specs: Optional per-layer :class:`LayerKVSpec` list. When provided,
+                layers are grouped by (num_kv_heads, head_dim) and each group
+                gets its own storage tensor, so per-layer head_dim just works.
+                KV-sharing layers (spec.kv_sharing_target set) allocate no
+                storage and alias their target's slot. When None, a uniform
+                spec is synthesized and the layout matches the legacy single
+                unified tensor exactly.
         """
+        from pace.llm.attention.specs import LayerKVSpec
+
         self.total_blocks = total_blocks
         self.block_size = block_size
         self.num_kv_heads = num_kv_heads
@@ -349,14 +425,75 @@ class PagedKVCachePool:
         self.dtype = dtype
         self.device = device
 
+        if specs is None:
+            specs = [LayerKVSpec(num_kv_heads, head_dim) for _ in range(num_layers)]
+        self.specs = list(specs)
+
+        if len(self.specs) != num_layers:
+            raise ValueError(
+                f"PagedKVCachePool: got {len(self.specs)} layer KV specs but "
+                f"num_layers={num_layers}. Both must be derived from the same "
+                f"config (use pace.llm.attention.specs.resolve_text_config)."
+            )
+
+        # One tensor per (num_kv_heads, head_dim) group, shaped
+        # [num_group_layers, total_blocks, nkvh, block_size, hd]. Slot mappings
+        # are token-position based, so they stay valid across groups and global
+        # block allocation below is unaffected.
         # zeros (not empty) so stale slots after rollback are deterministic.
-        # One-time allocation per model load; zeroing cost is negligible.
-        cache_shape = (num_layers, total_blocks, num_kv_heads, block_size, head_dim)
-        self.key_cache = torch.zeros(cache_shape, dtype=dtype, device=device)
-        self.value_cache = torch.zeros(cache_shape, dtype=dtype, device=device)
+        storage_order: Dict[Tuple[int, int], List[int]] = {}
+        for layer_idx, spec in enumerate(self.specs):
+            if spec.kv_sharing_target is not None:
+                continue
+            storage_order.setdefault((spec.num_kv_heads, spec.head_dim), []).append(
+                layer_idx
+            )
+
+        self._groups: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for key, layers in storage_order.items():
+            nkvh, hd = key
+            shape = (len(layers), total_blocks, nkvh, block_size, hd)
+            self._groups[key] = {
+                "layers": layers,
+                "key": torch.zeros(shape, dtype=dtype, device=device),
+                "value": torch.zeros(shape, dtype=dtype, device=device),
+            }
+
+        # layer_idx -> (group_key, local_index); shared layers alias target.
+        self._layer_slot: List[Optional[Tuple[Tuple[int, int], int]]] = [
+            None
+        ] * num_layers
+        for key, group in self._groups.items():
+            for local, layer_idx in enumerate(group["layers"]):
+                self._layer_slot[layer_idx] = (key, local)
+        for layer_idx, spec in enumerate(self.specs):
+            if spec.kv_sharing_target is not None:
+                self._layer_slot[layer_idx] = self._layer_slot[spec.kv_sharing_target]
+
+        # A uniform, unshared model has one group whose tensor matches the old
+        # unified cache, so keep exposing it for external readers.
+        if len(self._groups) == 1 and all(
+            s.kv_sharing_target is None for s in self.specs
+        ):
+            only = next(iter(self._groups.values()))
+            self.key_cache = only["key"]
+            self.value_cache = only["value"]
+        else:
+            self.key_cache = None
+            self.value_cache = None
 
         self.free_blocks: deque = deque(range(total_blocks))
         self.allocated_blocks: Dict[int, List[int]] = {}
+        # Persistent int32 tensor mirror of allocated_blocks[request_id], kept
+        # in sync on allocate/free. merge_contexts copies block rows from this
+        # tensor (tensor->tensor) instead of rebuilding torch.tensor(list) every
+        # decode step, which avoids the per-step O(blocks) Python-list creation
+        # and per-element boxing on the hot path.
+        self.allocated_blocks_tensor: Dict[int, torch.Tensor] = {}
+
+        # Set by PagedCache when prefix caching is enabled; reclaims LRU
+        # cached blocks when the pool is low on free blocks.
+        self._eviction_callback = None
 
         PACE_LLM_DEBUG(
             f"PagedKVCachePool initialized with {total_blocks} blocks, "
@@ -392,6 +529,7 @@ class PagedKVCachePool:
         """Reset all block allocations (free all blocks). Use with caution."""
         self.free_blocks = deque(range(self.total_blocks))
         self.allocated_blocks = {}
+        self.allocated_blocks_tensor = {}
         PACE_LLM_DEBUG(
             f"PagedKVCachePool: Reset all allocations, "
             f"{self.total_blocks} blocks now free"
@@ -407,11 +545,21 @@ class PagedKVCachePool:
         num_layers: int,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device = torch.device("cpu"),
+        specs: Optional[list] = None,
     ) -> "PagedKVCachePool":
         """Initialize the singleton pool instance.
 
         If the pool already exists with different parameters, it will be reset.
         """
+        from pace.llm.attention.specs import LayerKVSpec
+
+        # Resolved before the comparison below so the layout is part of the
+        # pool's identity: an omitted `specs` means uniform layers, which must
+        # not silently match a pool built with per-layer specs.
+        if specs is None:
+            specs = [LayerKVSpec(num_kv_heads, head_dim) for _ in range(num_layers)]
+        specs = list(specs)
+
         if cls._instance is not None:
             if (
                 cls._instance.total_blocks != total_blocks
@@ -420,6 +568,7 @@ class PagedKVCachePool:
                 or cls._instance.head_dim != head_dim
                 or cls._instance.num_layers != num_layers
                 or cls._instance.dtype != dtype
+                or specs != cls._instance.specs
             ):
                 PACE_LLM_DEBUG("PagedKVCachePool: Parameters changed, recreating pool")
                 cls._instance = None
@@ -433,11 +582,20 @@ class PagedKVCachePool:
                 num_layers,
                 dtype,
                 device,
+                specs=specs,
             )
         return cls._instance
 
     def allocate_blocks(self, request_id: int, num_blocks: int) -> List[int]:
-        """Allocate blocks for a request from the free pool."""
+        """Allocate blocks for a request from the free pool.
+
+        If the pool is low on free blocks and an eviction callback is
+        registered (by PagedCache when prefix caching is enabled), it is
+        invoked to reclaim LRU cached blocks before failing.
+        """
+        if len(self.free_blocks) < num_blocks and self._eviction_callback:
+            self._eviction_callback(num_blocks)
+
         if len(self.free_blocks) < num_blocks:
             total_allocated = sum(
                 len(blocks) for blocks in self.allocated_blocks.values()
@@ -459,6 +617,14 @@ class PagedKVCachePool:
         if request_id not in self.allocated_blocks:
             self.allocated_blocks[request_id] = []
         self.allocated_blocks[request_id].extend(allocated)
+        # Refresh the tensor mirror. Allocation only happens when a sequence
+        # crosses a block boundary (every block_size tokens), so this O(blocks)
+        # rebuild is amortized away from the per-step decode path.
+        self.allocated_blocks_tensor[request_id] = torch.tensor(
+            self.allocated_blocks[request_id],
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
 
         total_for_req = len(self.allocated_blocks[request_id])
         PACE_LLM_DEBUG(
@@ -472,6 +638,7 @@ class PagedKVCachePool:
         """Free all blocks allocated to a request."""
         if request_id in self.allocated_blocks:
             blocks = self.allocated_blocks.pop(request_id)
+            self.allocated_blocks_tensor.pop(request_id, None)
             self.free_blocks.extend(blocks)
             PACE_INFO(
                 f"[POOL] Freed {len(blocks)} blocks for request_id={request_id}, "
@@ -486,12 +653,27 @@ class PagedKVCachePool:
             )
 
     def get_cache_tensors(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get the cache tensors for a specific layer."""
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        """Get the cache tensors for a specific layer.
+
+        Resolves the layer's storage group and local slot; KV-sharing layers
+        resolve to their target layer's slot.
+        """
+        key, local = self._layer_slot[layer_idx]
+        group = self._groups[key]
+        return group["key"][local], group["value"][local]
 
     def get_blocks_for_request(self, request_id: int) -> List[int]:
         """Get the list of blocks allocated to a request."""
         return self.allocated_blocks.get(request_id, [])
+
+    def get_blocks_tensor(self, request_id: int) -> Optional[torch.Tensor]:
+        """Get the int32 tensor mirror of a request's allocated blocks.
+
+        Returns None if the request has no allocation. The tensor is kept in
+        sync with allocated_blocks on every allocate/free, so callers can copy
+        block rows directly instead of rebuilding torch.tensor(list) per step.
+        """
+        return self.allocated_blocks_tensor.get(request_id)
 
     def ensure_blocks_for_request(
         self, request_id: int, required_blocks: int
@@ -538,8 +720,10 @@ class SharedPagedKVCache(PagedKVCache):
         self.max_seq_length = max_seq_length
         self.block_size = pool.block_size
         self.seq_len = 0
-        self.num_kv_heads = pool.num_kv_heads
-        self.head_dim = pool.head_dim
+        spec = pool.specs[layer_idx]
+        self.num_kv_heads = spec.num_kv_heads
+        self.head_dim = spec.head_dim
+        self.kv_sharing_readonly = spec.kv_sharing_target is not None
         self.dtype = pool.dtype
         self.device = pool.device
         self.num_blocks = pool.total_blocks
@@ -585,7 +769,7 @@ class SharedPagedKVCache(PagedKVCache):
         )
 
 
-class _PagedCacheContext:
+class _PagedCacheContext(PrefixCacheContextMixin):
     """Wraps a KVCacheManager with optional paged_attn_metadata for serving."""
 
     def __init__(self, kv_cache_manager, pool_request_id=None):
@@ -593,6 +777,7 @@ class _PagedCacheContext:
         self.cache_objects = kv_cache_manager.cache_objects
         self.pool_request_id = pool_request_id
         self.paged_attn_metadata = None
+        self._init_prefix_fields()
 
     def __len__(self):
         return len(self.kv_cache_manager)
@@ -601,12 +786,15 @@ class _PagedCacheContext:
         self.kv_cache_manager.remove_cache(remove_len)
 
 
-class PagedCache(Cache):
+class PagedCache(PrefixCacheMixin, Cache):
     """Engine-level cache backend for paged attention. Implements Cache ABC.
 
     Mirrors SlabCache: pool is created eagerly in __init__, contexts are
     created per-request via create_context, batched decode metadata is
     built in merge_contexts. Server code stays cache-type agnostic.
+
+    Mixes in PrefixCacheMixin for automatic prefix caching (enabled by
+    default; disable via ``PACE_PREFIX_CACHE=0`` or ``enable_prefix_cache=False``).
     """
 
     _query_start_loc_cache: Dict[Tuple[int, int], torch.Tensor] = {}
@@ -616,10 +804,18 @@ class PagedCache(Cache):
         self._config = config
         self._kwargs = kwargs
 
-        num_heads = config.num_attention_heads
-        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-        head_dim = getattr(config, "head_dim", config.hidden_size // num_heads)
-        num_layers = config.num_hidden_layers
+        from pace.llm.attention.specs import (
+            compute_layer_kv_specs,
+            resolve_text_config,
+        )
+
+        text_config = resolve_text_config(config)
+        num_heads = text_config.num_attention_heads
+        num_kv_heads = getattr(text_config, "num_key_value_heads", num_heads)
+        head_dim = getattr(
+            text_config, "head_dim", text_config.hidden_size // num_heads
+        )
+        num_layers = text_config.num_hidden_layers
         self._block_size = kwargs.get("block_size", 16)
         self._dtype = kwargs.get("dtype", torch.bfloat16)
         self._num_kv_heads = num_kv_heads
@@ -632,6 +828,8 @@ class PagedCache(Cache):
         )
         total_blocks = (max_total_tokens + self._block_size - 1) // self._block_size
 
+        self._specs = compute_layer_kv_specs(config)
+
         PagedKVCachePool.reset()
         self._pool = PagedKVCachePool(
             total_blocks=total_blocks,
@@ -640,11 +838,16 @@ class PagedCache(Cache):
             head_dim=head_dim,
             num_layers=num_layers,
             dtype=self._dtype,
+            specs=self._specs,
         )
         PACE_INFO(
             f"PagedCache: pool initialized with {max_total_tokens} tokens, "
             f"{total_blocks} blocks, {num_layers} layers"
         )
+
+        self._init_prefix_cache_from_config(config, "PagedCache", **kwargs)
+        if self.prefix_cache_enabled:
+            self._pool._eviction_callback = self.try_evict_for_allocation
 
         self._next_request_id = 0
 
@@ -671,7 +874,7 @@ class PagedCache(Cache):
         pool_request_id = self._next_request_id
         self._next_request_id += 1
 
-        num_layers = config.num_hidden_layers
+        num_layers = len(self._pool.specs)
         manager = KVCacheManager.__new__(KVCacheManager)
         manager.num_layers = num_layers
         manager.cache_type = KVCacheType.PAGED
@@ -687,6 +890,31 @@ class PagedCache(Cache):
         ]
 
         return _PagedCacheContext(manager, pool_request_id=pool_request_id)
+
+    @staticmethod
+    def _fill_block_table(block_table, kv_managers, max_blocks_per_seq, pool):
+        """Copy each request's allocated block IDs into the batched block_table.
+
+        Uses the pool's persistent int32 tensor mirror (a tensor->tensor copy)
+        when available, so the per-step decode path no longer rebuilds
+        torch.tensor(python_list) for every request. Falls back to the list
+        rebuild only when a request has no tensor mirror (e.g. a non-pooled
+        cache or a not-yet-allocated request).
+        """
+        for i, mgr in enumerate(kv_managers):
+            layer_cache = mgr.cache_objects[0]
+            blocks = layer_cache.allocated_blocks
+            nb = min(len(blocks), max_blocks_per_seq)
+            if nb == 0:
+                continue
+            blocks_t = None
+            req_id = getattr(layer_cache, "request_id", None)
+            if pool is not None and req_id is not None:
+                blocks_t = pool.get_blocks_tensor(req_id)
+            if blocks_t is not None and blocks_t.numel() >= nb:
+                block_table[i, :nb].copy_(blocks_t[:nb])
+            else:
+                block_table[i, :nb] = torch.tensor(blocks[:nb], dtype=torch.int32)
 
     def merge_contexts(self, contexts, query_len=1) -> _PagedCacheContext:
         """Merge per-request contexts and build batched paged attention metadata.
@@ -727,8 +955,6 @@ class PagedCache(Cache):
             if total_seq_len > max_seq_len:
                 max_seq_len = total_seq_len
 
-            # Cache allocated_blocks in a local variable to avoid repeated
-            # property dispatch + dict lookup via pool.get_blocks_for_request.
             blocks = layer_cache.allocated_blocks
             need_blocks = (total_seq_len + block_size - 1) // block_size
             if need_blocks > len(blocks):
@@ -768,14 +994,10 @@ class PagedCache(Cache):
         else:
             block_table = torch.zeros(num_reqs, max_blocks_per_seq, dtype=torch.int32)
 
-        # TODO: allocated_blocks returns a fresh Python list on every access.
-        # Consider maintaining blocks as a tensor at the pool level to avoid
-        # list creation and the subsequent torch.tensor conversion per request.
-        for i, mgr in enumerate(kv_managers):
-            layer_cache = mgr.cache_objects[0]
-            blocks = layer_cache.allocated_blocks
-            nb = min(len(blocks), max_blocks_per_seq)
-            block_table[i, :nb] = torch.tensor(blocks[:nb], dtype=torch.int32)
+        # Fill block rows from the pool's persistent int32 tensor mirror
+        # (tensor->tensor copy) instead of rebuilding torch.tensor(list) per
+        # request every step. See PagedKVCachePool.allocated_blocks_tensor.
+        self._fill_block_table(block_table, kv_managers, max_blocks_per_seq, self._pool)
 
         cache_key = (num_reqs, query_len)
         if cache_key not in PagedCache._query_start_loc_cache:
@@ -811,6 +1033,127 @@ class PagedCache(Cache):
         merged._all_managers = kv_managers
         return merged
 
+    def merge_contexts_mixed(
+        self, contexts_with_query_lens: list
+    ) -> "_PagedCacheContext":
+        """Merge contexts where each request has a different query length.
+
+        Args:
+            contexts_with_query_lens: List of ``(kv_cache_manager, query_len)``
+                tuples.  Used by continuous batching where prefill chunks and
+                decode sequences (possibly with K+1 spec tokens) coexist in
+                one packed forward pass.
+        """
+        from pace.llm.attention.paged.ops import PagedAttentionMetadata
+
+        num_reqs = len(contexts_with_query_lens)
+        isa = PagedCache._isa_cache
+
+        query_lens_list = [ql for _, ql in contexts_with_query_lens]
+        total_tokens = sum(query_lens_list)
+        max_query_len = max(query_lens_list)
+        is_uniform_decode = max_query_len == 1
+
+        use_decode_buffers = is_uniform_decode and num_reqs <= self._max_batch_size
+        if use_decode_buffers:
+            seq_lens = self._decode_seq_lens[:num_reqs]
+            slot_mapping = self._decode_slot_mapping[:num_reqs]
+        else:
+            seq_lens = torch.zeros(num_reqs, dtype=torch.int32)
+            slot_mapping = torch.zeros(total_tokens, dtype=torch.int64)
+        seq_lens.zero_()
+
+        max_blocks_per_seq = 0
+        max_seq_len = 0
+        kv_managers = []
+
+        block_size = self._block_size
+        slot_offset = 0
+        for i, (ctx, query_len) in enumerate(contexts_with_query_lens):
+            mgr = ctx.kv_cache_manager if hasattr(ctx, "kv_cache_manager") else ctx
+            kv_managers.append(mgr)
+            layer_cache = mgr.cache_objects[0]
+            past_len = layer_cache.seq_len
+            total_seq_len = past_len + query_len
+
+            seq_lens[i] = total_seq_len
+            if total_seq_len > max_seq_len:
+                max_seq_len = total_seq_len
+
+            blocks = layer_cache.allocated_blocks
+            need_blocks = (total_seq_len + block_size - 1) // block_size
+            if need_blocks > len(blocks):
+                layer_cache._ensure_blocks_allocated(total_seq_len)
+                blocks = layer_cache.allocated_blocks
+
+            if is_uniform_decode:
+                block_idx = past_len // block_size
+                block_offset = past_len % block_size
+                if block_idx < len(blocks):
+                    slot_mapping[i] = blocks[block_idx] * block_size + block_offset
+                else:
+                    slot_mapping[i] = -1
+            else:
+                for t in range(query_len):
+                    pos = past_len + t
+                    block_idx = pos // block_size
+                    block_offset = pos % block_size
+                    if block_idx < len(blocks):
+                        slot_mapping[slot_offset + t] = (
+                            blocks[block_idx] * block_size + block_offset
+                        )
+                    else:
+                        slot_mapping[slot_offset + t] = -1
+                slot_offset += query_len
+
+            num_blocks = len(blocks)
+            if num_blocks > max_blocks_per_seq:
+                max_blocks_per_seq = num_blocks
+
+        if (
+            use_decode_buffers
+            and max_blocks_per_seq <= self._decode_block_table.shape[1]
+        ):
+            block_table = self._decode_block_table[:num_reqs, :max_blocks_per_seq]
+            block_table.zero_()
+        else:
+            block_table = torch.zeros(num_reqs, max_blocks_per_seq, dtype=torch.int32)
+        self._fill_block_table(block_table, kv_managers, max_blocks_per_seq, self._pool)
+
+        if is_uniform_decode:
+            cache_key = (num_reqs, 1)
+            if cache_key not in PagedCache._query_start_loc_cache:
+                PagedCache._query_start_loc_cache[cache_key] = torch.arange(
+                    num_reqs + 1, dtype=torch.int32
+                )
+            query_start_loc = PagedCache._query_start_loc_cache[cache_key]
+        else:
+            query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32)
+            for i, ql in enumerate(query_lens_list):
+                query_start_loc[i + 1] = query_start_loc[i] + ql
+
+        meta = PagedAttentionMetadata(
+            isa=isa,
+            num_actual_tokens=total_tokens,
+            max_query_len=max_query_len,
+            query_start_loc=query_start_loc,
+            max_seq_len=max_seq_len,
+            seq_lens=seq_lens,
+            block_table=block_table.contiguous(),
+            slot_mapping=slot_mapping,
+            causal=True,
+        )
+
+        for i, mgr in enumerate(kv_managers):
+            new_seq_len = int(seq_lens[i].item())
+            for co in mgr.cache_objects:
+                co.seq_len = new_seq_len
+
+        merged = _PagedCacheContext(kv_managers[0])
+        merged.paged_attn_metadata = meta
+        merged._all_managers = kv_managers
+        return merged
+
     def build_prefill_metadata(self, context, seq_len, past_len=0):
         """Build single-sequence metadata for prefill or draft decode."""
         from pace.llm.attention.paged.utils import build_paged_attention_metadata
@@ -835,15 +1178,95 @@ class PagedCache(Cache):
             co.seq_len = new_seq_len
         return meta
 
+    # ---- PrefixCacheMixin hooks ----
+
+    def _claim_prefix_blocks_impl(
+        self, context, token_ids, matched_blocks, num_matched_tokens
+    ):
+        if context.pool_request_id is None:
+            return
+        rid = context.pool_request_id
+        self._pool.allocated_blocks[rid] = list(matched_blocks)
+        # Keep the block-table fast-path mirror in sync so decode steps don't
+        # rebuild it with torch.tensor(list) every step for reused prefixes.
+        self._pool.allocated_blocks_tensor[rid] = torch.tensor(
+            self._pool.allocated_blocks[rid],
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
+        for co in context.kv_cache_manager.cache_objects:
+            co.seq_len = num_matched_tokens
+
+    def _get_block_indices_for_context(self, context):
+        if getattr(context, "pool_request_id", None) is not None:
+            return self._pool.get_blocks_for_request(context.pool_request_id)
+        return []
+
+    def _reserve_blocks_for_context(self, context, num_full_blocks):
+        rid = getattr(context, "pool_request_id", None)
+        if rid is None:
+            return []
+        self._pool.ensure_blocks_for_request(rid, num_full_blocks)
+        return self._pool.get_blocks_for_request(rid)
+
+    def _free_duplicate_block(self, block_idx: int) -> None:
+        if block_idx not in self._pool.free_blocks:
+            self._pool.free_blocks.append(block_idx)
+
+    def _repoint_duplicate_block(
+        self, context, block_pos: int, old_block: int, canonical_block: int
+    ) -> None:
+        """Point the request's logical block at the canonical pool block so the
+        duplicate can be freed without leaving a dangling reference."""
+        rid = getattr(context, "pool_request_id", None)
+        if rid is None:
+            return
+        blocks = self._pool.allocated_blocks.get(rid)
+        if not blocks or block_pos >= len(blocks) or blocks[block_pos] != old_block:
+            return
+        blocks[block_pos] = canonical_block
+        tensor = self._pool.allocated_blocks_tensor.get(rid)
+        if tensor is not None:
+            tensor[block_pos] = canonical_block
+
+    def try_evict_for_allocation(self, num_needed: int) -> int:
+        """Evict LRU cached blocks to satisfy a pending allocation.
+
+        Returns the number of blocks freed back to the pool.
+        """
+        if not self.prefix_cache_enabled:
+            return 0
+        deficit = num_needed - len(self._pool.free_blocks)
+        if deficit <= 0:
+            return 0
+        evicted = self.evict_prefix_blocks(deficit)
+        for idx in evicted:
+            if idx not in self._pool.free_blocks:
+                self._pool.free_blocks.append(idx)
+        return len(evicted)
+
     def remove_context(self, context) -> None:
-        """Release pool blocks for the request."""
-        if hasattr(context, "pool_request_id") and context.pool_request_id is not None:
-            blocks_before = len(self._pool.free_blocks)
-            self._pool.free_blocks_for_request(context.pool_request_id)
-            blocks_after = len(self._pool.free_blocks)
-            freed = blocks_after - blocks_before
-            if freed > 0:
-                PACE_INFO(
-                    f"[POOL] Freed {freed} blocks for "
-                    f"pool_request_id={context.pool_request_id}"
-                )
+        """Release the request's non-cached pool blocks and drop its prefix refs.
+
+        Blocks still held by the prefix cache are owned by the cache, not the
+        request, so they must stay out of the free list until LRU eviction.
+        Freeing them on completion would let a new allocation overwrite KV the
+        hash map still points at (stale reuse / corruption).
+        """
+        rid = getattr(context, "pool_request_id", None)
+        if rid is None:
+            return
+        # Resolve this request's cache-owned blocks before _release_prefix_refs
+        # clears its held hashes; they survive completion (freed via LRU only).
+        cached = set()
+        if self.prefix_cache_enabled:
+            for bh in getattr(context, "prefix_held_hashes", None) or []:
+                entry = self._prefix_map.peek(bh)
+                if entry is not None:
+                    cached.add(entry.block_idx)
+        self._release_prefix_refs(context)
+        if cached:
+            self._pool.allocated_blocks[rid] = [
+                b for b in self._pool.allocated_blocks.get(rid, []) if b not in cached
+            ]
+        self._pool.free_blocks_for_request(rid)

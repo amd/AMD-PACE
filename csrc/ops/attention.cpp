@@ -6,9 +6,8 @@
 
 #include <core/logging.h>
 #include <ops/attention.h>
-#include <ops/cpu.h>
-#include <ops/jit_helper.h>
-#include <pace_tensor/pace_aten_interface.h>
+#include <ops/onednn.h>
+#include <ops/onednn_utils.h>
 #include <torch/library.h>
 #include <utils/utils.h>
 

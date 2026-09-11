@@ -4,7 +4,7 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 set(AOCLDLP_PROJECT libaocl-dlp)
-set(AOCLDLP_VERSION 3256da129b879d09301c966026a603f3f86e1233)
+set(AOCLDLP_VERSION 5.3)
 include(ExternalProject)
 
 set(AOCLDLP_PROJ_DIR
@@ -27,3 +27,18 @@ set(AOCLDLP_INCLUDE_DIR ${AOCLDLP_PROJ_BUILD_DIR}/include)
 set(AOCLDLP_STATIC_LIB
 ${AOCLDLP_PROJ_BUILD_DIR}/lib/libaocl-dlp.a
 )
+
+set(AOCLDLP_LOCALIZED_OBJ ${CMAKE_CURRENT_BINARY_DIR}/aocl_dlp_isolated.o)
+set(AOCLDLP_ISOLATE_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/isolate_aocl_xbyak.sh)
+find_program(AOCLDLP_LD ld REQUIRED)
+find_program(AOCLDLP_OBJCOPY objcopy REQUIRED)
+find_program(AOCLDLP_NM nm REQUIRED)
+add_custom_command(
+  OUTPUT ${AOCLDLP_LOCALIZED_OBJ}
+  COMMAND sh ${AOCLDLP_ISOLATE_SCRIPT} ${AOCLDLP_LD} ${AOCLDLP_OBJCOPY}
+          ${AOCLDLP_NM} ${AOCLDLP_STATIC_LIB} ${AOCLDLP_LOCALIZED_OBJ}
+          ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS ${AOCLDLP_PROJECT} ${AOCLDLP_ISOLATE_SCRIPT}
+  COMMENT "AOCL-DLP: partial-link + privatize bundled Xbyak"
+  VERBATIM)
+add_custom_target(aocl_dlp_localized DEPENDS ${AOCLDLP_LOCALIZED_OBJ})

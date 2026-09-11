@@ -23,6 +23,7 @@ import torch
 
 from pace.llm.attention.base import AttentionBackend
 from pace.llm.attention.paged.ops import get_paged_attention_scheduler_metadata
+from pace.utils.logging import PACE_LLM_ASSERT
 
 
 class PagedAttentionBackend(AttentionBackend):
@@ -35,6 +36,7 @@ class PagedAttentionBackend(AttentionBackend):
         sliding_window: int = 0,
         sinks: Optional[torch.Tensor] = None,
         scale: Optional[float] = None,
+        chunk_size: int = 0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -42,13 +44,43 @@ class PagedAttentionBackend(AttentionBackend):
         self.head_dim = head_dim
         self.scaling = scale if scale is not None else 1.0 / math.sqrt(head_dim)
         self.sliding_window = sliding_window
+        self.chunk_size = chunk_size
         self.sinks = sinks
+        # ISA depends on head_dim, so it must be resolved per-layer rather than
+        # taken from the pool-wide value on the shared metadata.
+        self._isa_by_dtype = {}
+
+    def _local_metadata(self, meta, block_size: int):
+        """Return chunked (local-attention) metadata for ``meta``, computed once
+        per step and shared across all chunked layers of the same chunk_size.
+
+        The transform depends only on the step's shared metadata and chunk_size,
+        so we memoize it on the metadata object to avoid recomputing it for every
+        local layer.
+        """
+        from pace.llm.attention.paged.utils import (
+            make_local_attention_virtual_batches,
+        )
+
+        cache = getattr(meta, "_local_by_chunk", None)
+        if cache is None:
+            cache = {}
+            # dataclass is mutable; stash a small per-step memo on it.
+            object.__setattr__(meta, "_local_by_chunk", cache)
+        key = (self.chunk_size, block_size)
+        local = cache.get(key)
+        if local is None:
+            local = make_local_attention_virtual_batches(
+                self.chunk_size, meta, block_size
+            )
+            cache[key] = local
+        return local
 
     def forward(
         self,
         Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
+        K: Optional[torch.Tensor],
+        V: Optional[torch.Tensor],
         kv_cache,
         positions,
         **kwargs,
@@ -56,8 +88,9 @@ class PagedAttentionBackend(AttentionBackend):
         """
         Args:
             Q: [B, S, num_heads, head_dim] — already RoPE'd, BSNH
-            K: [B, S, num_kv_heads, head_dim]
-            V: [B, S, num_kv_heads, head_dim]
+            K: [B, S, num_kv_heads, head_dim], or None on a layer that reuses
+                another layer's KV (no write, read the target's blocks)
+            V: [B, S, num_kv_heads, head_dim], or None (see K)
             kv_cache: PagedKVCache (single layer cache with get_cache_tensors)
             positions: ignored (paged attention uses causal masking internally)
             **kwargs: must contain paged_attn_metadata
@@ -71,23 +104,50 @@ class PagedAttentionBackend(AttentionBackend):
 
         # Flatten BSNH [B, S, N, H] -> [T, N, H]
         Q_flat = Q.reshape(num_tokens, self.num_heads, self.head_dim)
-        K_flat = K.reshape(num_tokens, self.num_kv_heads, self.head_dim)
-        V_flat = V.reshape(num_tokens, self.num_kv_heads, self.head_dim)
 
         # Get cache tensors from the per-layer PagedKVCache
         key_cache, value_cache = kv_cache.get_cache_tensors()
 
-        # Write K/V into paged cache
-        torch.ops.pace.paged_attention_reshape_and_cache(
-            K_flat.contiguous(),
-            V_flat.contiguous(),
-            key_cache,
-            value_cache,
-            paged_attn_metadata.slot_mapping,
-            paged_attn_metadata.isa,
-        )
+        isa = self._isa_by_dtype.get(Q.dtype)
+        if isa is None:
+            from pace.llm.attention.paged.ops import get_optimal_attention_isa
 
-        sw = self.sliding_window
+            isa = get_optimal_attention_isa(Q.dtype, key_cache.shape[2], self.head_dim)
+            self._isa_by_dtype[Q.dtype] = isa
+
+        PACE_LLM_ASSERT(
+            (K is None) == (V is None),
+            "PagedAttentionBackend: K and V must both be provided or both be "
+            "None (None only for a layer that reuses another layer's KV).",
+        )
+        # Uses the untransformed slot mapping, not the chunked-attention
+        # metadata built below.
+        if (
+            K is not None
+            and V is not None
+            and not getattr(kv_cache, "kv_sharing_readonly", False)
+        ):
+            torch.ops.pace.paged_attention_reshape_and_cache(
+                K.reshape(num_tokens, self.num_kv_heads, self.head_dim).contiguous(),
+                V.reshape(num_tokens, self.num_kv_heads, self.head_dim).contiguous(),
+                key_cache,
+                value_cache,
+                paged_attn_metadata.slot_mapping,
+                isa,
+            )
+
+        # Chunked (local) attention: rewrite the metadata into per-chunk virtual
+        # batches so the ordinary causal kernel yields chunked attention. The KV
+        # write above already used the real slots, so only the read side changes.
+        attn_meta = paged_attn_metadata
+        if self.chunk_size > 0:
+            attn_meta = self._local_metadata(
+                paged_attn_metadata, block_size=key_cache.shape[2]
+            )
+
+        # Chunked attention is expressed via virtual batches, not a window, so
+        # no sliding window is applied when chunking.
+        sw = 0 if self.chunk_size > 0 else self.sliding_window
         sw_left = sw - 1 if sw > 0 else -1
         sw_right = 0
 
@@ -97,16 +157,16 @@ class PagedAttentionBackend(AttentionBackend):
         # creates splits outside the window — avoiding empty KV splits that
         # would corrupt output for models with attention sinks (e.g. GPT-OSS).
         scheduler_metadata = get_paged_attention_scheduler_metadata(
-            num_reqs=paged_attn_metadata.seq_lens.shape[0],
+            num_reqs=attn_meta.seq_lens.shape[0],
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            seq_lens=paged_attn_metadata.seq_lens,
+            seq_lens=attn_meta.seq_lens,
             dtype=Q.dtype,
-            query_start_loc=paged_attn_metadata.query_start_loc,
-            causal=paged_attn_metadata.causal,
-            sliding_window_size=self.sliding_window if self.sliding_window > 0 else -1,
-            isa=paged_attn_metadata.isa,
+            query_start_loc=attn_meta.query_start_loc,
+            causal=attn_meta.causal,
+            sliding_window_size=sw if sw > 0 else -1,
+            isa=isa,
             enable_kv_split=True,
         )
 
@@ -125,14 +185,14 @@ class PagedAttentionBackend(AttentionBackend):
             key_cache,
             value_cache,
             output,
-            paged_attn_metadata.query_start_loc,
-            paged_attn_metadata.seq_lens,
+            attn_meta.query_start_loc,
+            attn_meta.seq_lens,
             self.scaling,
-            paged_attn_metadata.causal,
+            attn_meta.causal,
             None,
             sw_left,
             sw_right,
-            paged_attn_metadata.block_table,
+            attn_meta.block_table,
             0.0,
             scheduler_metadata,
             s_aux,

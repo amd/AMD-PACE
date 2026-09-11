@@ -7,6 +7,7 @@
 MLPerf Server scenario: accuracy evaluation.
 Reads mlperf_log_accuracy.json (token IDs), decodes with tokenizer, computes ROUGE vs references.
 """
+
 import argparse
 import json
 import logging

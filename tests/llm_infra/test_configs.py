@@ -13,7 +13,9 @@ from hypothesis import strategies as st
 from torch.testing._internal.common_utils import TestCase
 
 from pace.llm import SamplingConfig
-from pace.llm.configs import SamplingMode, PardSpecDecodeConfig
+from pace.llm.configs import SamplingMode, PardSpecDecodeConfig, OperatorConfig
+from pace.llm.ops import LLMOperatorType
+from pace.ops.enum import BackendType
 from pace.utils.logging import suppress_logging_cls
 
 
@@ -266,3 +268,17 @@ class TestPardSpecDecodeConfig(TestCase):
     def test_default_num_speculative_tokens(self):
         config = PardSpecDecodeConfig(model_name_or_path="test-model")
         self.assertEqual(config.num_speculative_tokens, 12)
+
+
+@suppress_logging_cls()
+class TestOperatorConfig(TestCase):
+    def test_mlp_defaults_to_tpp(self):
+        config = OperatorConfig()
+        config.finalize()
+        self.assertEqual(config.mlp, BackendType.TPP)
+
+    def test_explicit_native_mlp_is_preserved(self):
+        config = OperatorConfig()
+        config[LLMOperatorType.MLP] = BackendType.NATIVE
+        config.finalize()
+        self.assertEqual(config.mlp, BackendType.NATIVE)

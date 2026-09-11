@@ -4,7 +4,7 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 set(LIBXSMM_PROJECT libxsmm)
-set(LIBXSMM_VERSION c14cbc6f8bc7964f8c5190a3a16b8cace03e5889) #TODO: Use the latest version of TPP and add libxsmm_dependency during build
+set(LIBXSMM_VERSION 2.0.0)
 include(ExternalProject)
 set(LIBXSMM_PROJ_DIR
     ${CMAKE_CURRENT_BINARY_DIR}/${LIBXSMM_PROJECT}/src/${LIBXSMM_PROJECT})

@@ -94,7 +94,8 @@ at::Tensor checked_attention(
     const std::vector<int64_t>& q_start_offsets,
     double scale,
     int64_t sliding_window,
-    const at::Tensor& sinks) {
+    const at::Tensor& sinks,
+    int64_t chunk_size) {
   TORCH_CHECK(
       query.dim() == 3 || query.dim() == 4,
       "SlabPool: query must be 3D [T, H, D] or 4D [B, S, H, D]");
@@ -169,7 +170,8 @@ at::Tensor checked_attention(
       q_start_offsets,
       scale,
       sliding_window,
-      sinks_f32);
+      sinks_f32,
+      chunk_size);
 }
 
 TORCH_LIBRARY_FRAGMENT(pace, m) {
@@ -181,7 +183,24 @@ TORCH_LIBRARY_FRAGMENT(pace, m) {
       .def("get_sequence_length", &Pool::get_sequence_length)
       .def("get_free_block_count", &Pool::get_free_block_count)
       .def("cache_update", checked_cache_update)
-      .def("attention", checked_attention);
+      .def(
+          "attention",
+          checked_attention,
+          /*doc_string=*/"",
+          {torch::arg("sequence_ids"),
+           torch::arg("query"),
+           torch::arg("query_lens"),
+           torch::arg("q_start_offsets"),
+           torch::arg("scale"),
+           torch::arg("sliding_window"),
+           torch::arg("sinks"),
+           torch::arg("chunk_size") = 0})
+      .def("get_block_indices", &Pool::get_block_indices)
+      .def("reserve_blocks", &Pool::reserve_blocks)
+      .def("assign_prefix_blocks", &Pool::assign_prefix_blocks)
+      .def("reassign_block", &Pool::reassign_block)
+      .def("retain_blocks", &Pool::retain_blocks)
+      .def("release_retained_blocks", &Pool::release_retained_blocks);
   // Pick the largest SlabPool block_size (from {32, 64, 128, 256}) whose
   // K+V working set for `(num_kv_heads, head_dim)` bf16 fits in 1/4 of
   // L2. Geometry-only -- no SlabPool state -- so it lives as a free op

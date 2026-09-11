@@ -7,7 +7,7 @@
 #define PACE_MLP_KERNEL_H
 
 #include <ATen/ATen.h>
-#include <ops/jit_helper.h>
+#include <ops/onednn.h>
 
 namespace pace {
 

@@ -36,6 +36,35 @@ class TestKVCacheManager(TestCase):
         cache_layer = self.kv_cache_manager[0]
         self.assertIsInstance(cache_layer, DynamicKVCache)
 
+    def test_layer_count_follows_text_config(self):
+        """Multimodal wrappers report their own depth; the text config wins."""
+        wrapper = MockConfig(num_hidden_layers=2)
+        wrapper.text_config = MockConfig(num_hidden_layers=5)
+        manager = KVCacheManager(wrapper, self.max_seq_length, KVCacheType.DYNAMIC)
+        self.assertEqual(manager.num_layers, 5)
+        self.assertEqual(len(manager.cache_objects), 5)
+        for obj in manager.cache_objects:
+            self.assertIsInstance(obj, DynamicKVCache)
+
+    def test_kv_sharing_layers_view_target_cache(self):
+        config = MockConfig(num_hidden_layers=4)
+        config.num_attention_heads = 4
+        config.num_key_value_heads = 4
+        config.head_dim = 16
+        config.num_kv_shared_layers = 2
+        manager = KVCacheManager(config, self.max_seq_length, KVCacheType.DYNAMIC)
+        self.assertEqual(len(manager.cache_objects), 4)
+
+        key = torch.rand(1, 3, 4, 16)
+        value = torch.rand(1, 3, 4, 16)
+        manager.cache_objects[1].update_cache(key, value, concat_dim=1)
+        shared_key, shared_value = manager.cache_objects[3].update_cache(
+            torch.zeros_like(key), torch.zeros_like(value), concat_dim=1
+        )
+        self.assertEqual(shared_key.data_ptr(), manager.cache_objects[1].key.data_ptr())
+        torch.testing.assert_close(shared_key, key)
+        torch.testing.assert_close(shared_value, value)
+
 
 class TestBMCKVCache(TestCase):
     def setUp(self):

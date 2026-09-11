@@ -18,11 +18,25 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
-from prometheus_client import Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 from pace.server.router.protocol import CompletionRequest  # noqa: F401 - re-export
+
+
+class TokenStepResult(TypedDict, total=False):
+    """Shape yielded by the engine client when logprobs are present.
+
+    ``token_ids`` is always present. ``logprobs`` carries the sampled
+    (generated) token logprobs for the step; ``prompt_logprobs`` carries the
+    prompt/echo logprobs and appears only on the prefill step when echo is
+    requested.
+    """
+
+    token_ids: List[int]
+    logprobs: dict
+    prompt_logprobs: dict
 
 
 TTFT_BUCKETS = [
@@ -81,6 +95,88 @@ tpot_histogram = Histogram(
     "Time Per Output Token (seconds)",
     buckets=TPOT_BUCKETS,
 )
+
+REQUEST_LATENCY_BUCKETS = [
+    0.3,
+    0.5,
+    0.8,
+    1.0,
+    1.5,
+    2.0,
+    2.5,
+    5.0,
+    10.0,
+    15.0,
+    20.0,
+    30.0,
+    60.0,
+    120.0,
+    240.0,
+    480.0,
+]
+
+e2e_latency_histogram = Histogram(
+    "pace_e2e_request_latency_seconds",
+    "End-to-end request latency (seconds)",
+    buckets=REQUEST_LATENCY_BUCKETS,
+)
+
+queue_time_histogram = Histogram(
+    "pace_request_queue_time_seconds",
+    "Time spent waiting in queue before processing (seconds)",
+    buckets=REQUEST_LATENCY_BUCKETS,
+)
+
+prompt_tokens_counter = Counter(
+    "pace_prompt_tokens_total",
+    "Total prompt tokens processed",
+)
+
+generation_tokens_counter = Counter(
+    "pace_generation_tokens_total",
+    "Total generation tokens produced",
+)
+
+requests_total_counter = Counter(
+    "pace_requests_total",
+    "Total requests by status (completed or error)",
+    ["status"],
+)
+
+requests_running_gauge = Gauge(
+    "pace_requests_running",
+    "Number of requests currently being processed",
+)
+
+requests_waiting_gauge = Gauge(
+    "pace_requests_waiting",
+    "Number of requests waiting in queue",
+)
+
+prefix_cache_hits_gauge = Gauge(
+    "pace_prefix_cache_hits", "Cumulative prefix-cache hits, in cached tokens"
+)
+prefix_cache_queries_gauge = Gauge(
+    "pace_prefix_cache_queries", "Cumulative prefix-cache queries, in queried tokens"
+)
+prefix_cache_hit_rate_gauge = Gauge(
+    "pace_prefix_cache_hit_rate", "Prefix-cache hit rate (cached/queried tokens, 0-1)"
+)
+kv_cache_usage_gauge = Gauge(
+    "pace_kv_cache_usage_perc", "KV-cache pool utilization (0-1)"
+)
+
+
+def update_cache_gauges(cache_stats: Dict[str, Any]) -> None:
+    """Refresh prefix-cache/pool Prometheus gauges from an engine cache_stats dict."""
+    prefix = cache_stats.get("prefix_cache", {})
+    pool = cache_stats.get("pool", {})
+    if prefix:
+        prefix_cache_hits_gauge.set(prefix.get("prefix_cache_hits", 0))
+        prefix_cache_queries_gauge.set(prefix.get("prefix_cache_queries", 0))
+        prefix_cache_hit_rate_gauge.set(prefix.get("prefix_cache_hit_rate", 0.0))
+    if pool:
+        kv_cache_usage_gauge.set(pool.get("utilization_pct", 0.0) / 100.0)
 
 
 class RequestStatus(str, Enum):

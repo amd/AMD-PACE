@@ -64,7 +64,7 @@ def eval(
     if output_file:
         PACE_LLM_INFO(f"Writing evaluation results to {output_file}")
         with open(output_file, "w") as f:
-            json.dump(evaluation_results, f, indent=4)
+            json.dump(evaluation_results, f, indent=4, default=str)
 
 
 def main():

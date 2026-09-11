@@ -6,11 +6,12 @@
 
 """PaceModelRunner: vLLM v1 CPU model runner subclass.
 
-Owns the slab-backed KV state. `initialize_kv_cache_tensors` ships zero-sized
-placeholders (real K/V lives in `SlabPool`); `initialize_kv_cache` builds the
-`PaceKVCache` and populates the attention backend's layer registry;
-`_update_states` fans out request lifecycle events (create / remove / reset
-on preempt) to the slab.
+Owns the slab-backed KV state. `_allocate_kv_cache_tensors` ships zero-sized
+placeholders for attention layers (real K/V lives in `SlabPool`) while vLLM
+allocates and reshapes Mamba / linear-attention state through its native path;
+`initialize_kv_cache` builds the `PaceKVCache` and populates the attention
+backend's layer registry; `_update_states` fans out request lifecycle events
+(create / remove / reset on preempt) to the slab.
 """
 
 from __future__ import annotations
@@ -19,10 +20,13 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
-from vllm.v1.worker.utils import bind_kv_cache
 
 from pace_vllm.v1.attention.layer_registry import (
     register_layer,
@@ -42,7 +46,30 @@ class PaceModelRunner(CPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
         self.pace_kv_cache: PaceKVCache | None = None
+        self._pace_connector = None
         logger.info("pace-vllm: PaceModelRunner active.")
+
+    def _init_kv_zero_meta(self) -> None:
+        """Opt the slab-backed KV cache out of vLLM's ``KVBlockZeroer``.
+
+        Slab attention layers are zero-sized placeholders -- real K/V lives in
+        ``SlabPool``, not in vLLM-managed blocks -- and building a
+        ``KVBlockZeroer`` over them aborts engine startup while deriving their
+        per-block strides.
+        """
+        return
+
+    def _zero_block_ids(self, block_ids: list[int]) -> None:
+        """No-op block zeroing for the slab-backed attention layers.
+
+        vLLM zeroes each FullAttentionSpec layer's KV blocks in place, which
+        raises ``IndexError`` on our zero-sized placeholders. Zeroing is
+        unnecessary anyway: SlabPool tracks per-sequence length and CPU
+        attention masks invalid positions with -INF, so stale KV is never read.
+        Mamba/linear-attn state is excluded by vLLM's own FullAttentionSpec
+        filter, so this override does not affect it.
+        """
+        return
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         super().initialize_kv_cache(kv_cache_config)
@@ -76,69 +103,74 @@ class PaceModelRunner(CPUModelRunner):
             )
             register_layer(follower, self.pace_kv_cache, target_pool)
 
-    def initialize_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        expects_pace_connector = (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "PaceSlabConnector"
+        )
+        if expects_pace_connector:
+            from pace_vllm.v1.connector import PaceSlabConnector
+
+            if not has_kv_transfer_group():
+                raise RuntimeError(
+                    "pace-vllm: PaceSlabConnector worker instance is unavailable."
+                )
+            connector = get_kv_transfer_group()
+            if not isinstance(connector, PaceSlabConnector):
+                raise RuntimeError(
+                    "pace-vllm: worker initialized an unexpected KV connector."
+                )
+            connector.register_kv_cache(self.pace_kv_cache)
+            self._pace_connector = connector
+
+    def _allocate_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
         from vllm.v1.kv_cache_interface import (
             AttentionSpec,
             UniformTypeKVCacheSpecs,
         )
 
-        def _is_attention_group(group) -> bool:
-            """Hybrid models (Qwen3-Next, Jamba) ship Mamba / linear-attn
-            groups alongside attention groups; SlabPool only services
-            attention. Non-attention layers stay owned by vLLM's stock
-            state path -- we just don't bind a placeholder for them."""
-            raw = group.kv_cache_spec
-            if isinstance(raw, AttentionSpec):
-                return True
-            if isinstance(raw, UniformTypeKVCacheSpecs):
-                # All layers in a UniformType group share a spec class;
-                # sample any.
-                sample = next(iter(raw.kv_cache_specs.values()), None)
-                return isinstance(sample, AttentionSpec)
-            return False
-
-        def _layer_dtype(group, layer_name: str) -> torch.dtype:
-            raw_spec = group.kv_cache_spec
-            if isinstance(raw_spec, UniformTypeKVCacheSpecs):
-                return raw_spec.kv_cache_specs[layer_name].dtype
-            if not isinstance(raw_spec, AttentionSpec):
-                raise TypeError(
-                    "pace-vllm: expected AttentionSpec or UniformTypeKVCacheSpecs, "
-                    f"got {type(raw_spec).__name__}"
-                )
-            return raw_spec.dtype
-
-        kv_caches: dict[str, torch.Tensor] = {}
+        attention_layers: set[str] = set()
         for group in kv_cache_config.kv_cache_groups:
-            if not _is_attention_group(group):
-                continue
-            for layer_name in group.layer_names:
-                kv_caches[layer_name] = torch.empty(
-                    (0,), dtype=_layer_dtype(group, layer_name)
-                )
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()), None)
+            if isinstance(spec, AttentionSpec):
+                attention_layers.update(group.layer_names)
 
-        # KV-sharing models map the follower's kv_cache onto the target's.
-        for layer_name, target in self.shared_kv_cache_layers.items():
-            if layer_name in kv_caches and target in kv_caches:
-                kv_caches[layer_name] = kv_caches[target]
+        raw_tensors: dict[str, torch.Tensor] = {}
+        packed_backing: torch.Tensor | None = None
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            needs_storage = any(
+                name not in attention_layers for name in kv_cache_tensor.shared_by
+            )
+            tensor: torch.Tensor | None = None
+            if needs_storage:
+                if getattr(kv_cache_tensor, "block_stride", 0) > 0:
+                    if packed_backing is None:
+                        packed_backing = torch.zeros(
+                            kv_cache_tensor.size,
+                            dtype=torch.int8,
+                            device=self.device,
+                        )
+                    tensor = packed_backing
+                else:
+                    tensor = torch.zeros(
+                        kv_cache_tensor.size,
+                        dtype=torch.int8,
+                        device=self.device,
+                    )
+            for layer_name in kv_cache_tensor.shared_by:
+                if layer_name in attention_layers:
+                    raw_tensors[layer_name] = torch.empty(
+                        0, dtype=torch.int8, device=self.device
+                    )
+                else:
+                    assert tensor is not None
+                    raw_tensors[layer_name] = tensor
 
-        # longcat_flash uses num_attn_module=2; preserved for forward-compat.
-        num_attn_module = (
-            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
-        bind_kv_cache(
-            kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_caches,
-            num_attn_module,
-        )
-        logger.info(
-            "pace-vllm: bound %d zero-sized KV placeholders (slab owns all).",
-            len(kv_caches),
-        )
-        return kv_caches
+        return raw_tensors
 
     def _update_states(self, scheduler_output: "SchedulerOutput"):
         if self.pace_kv_cache is not None:
@@ -155,10 +187,30 @@ class PaceModelRunner(CPUModelRunner):
                     n_finished,
                     n_preempted,
                 )
-            for new_req in scheduler_output.scheduled_new_reqs:
-                self.pace_kv_cache.create_sequence(new_req.req_id, max_len)
+
+            connector_metadata = self._get_connector_metadata(scheduler_output)
+            if self._pace_connector is not None and connector_metadata is not None:
+                self._pace_connector.apply_worker_retains(connector_metadata)
+
             for preempted_rid in preempted:
                 self.pace_kv_cache.reset_sequence(preempted_rid)
             for finished_rid in scheduler_output.finished_req_ids:
                 self.pace_kv_cache.remove_sequence(finished_rid)
+
+            if self._pace_connector is not None and connector_metadata is not None:
+                self._pace_connector.apply_worker_releases(connector_metadata)
+
+            for new_req in scheduler_output.scheduled_new_reqs:
+                self.pace_kv_cache.create_sequence(new_req.req_id, max_len)
+
+            if self._pace_connector is not None and connector_metadata is not None:
+                self._pace_connector.apply_worker_assignments(connector_metadata)
         return super()._update_states(scheduler_output)
+
+    def _get_connector_metadata(self, scheduler_output: "SchedulerOutput"):
+        from pace_vllm.v1.connector import PaceSlabMetadata
+
+        meta = getattr(scheduler_output, "kv_connector_metadata", None)
+        if not isinstance(meta, PaceSlabMetadata):
+            return None
+        return meta

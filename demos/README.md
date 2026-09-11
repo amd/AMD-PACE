@@ -16,7 +16,8 @@ python server_chat_demo.py
 
 # Speculative decoding demo (requires PARD-enabled server)
 pace-server --server_model Qwen/Qwen2.5-7B-Instruct --dtype bfloat16 \
+  --kv_cache_type SLAB_POOL \
   --spec_config '{"model_name":"amd/PARD-Qwen2.5-0.5B","num_speculative_tokens":12}' \
-  --serve_type continuous_prefill_first
+  --serve_type continuous_batch
 python pace_server_speculative_demo.py
 ```

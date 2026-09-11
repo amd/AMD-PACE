@@ -46,9 +46,30 @@ struct KernelCtx {
   int64_t token_stride; // num_q_heads * head_dim
   float scale_f;
   int64_t sliding_window;
+  // Chunked (local) attention window (Llama4 iRoPE local layers). 0 disables.
+  // A query at position q attends only to keys in its own chunk
+  // [floor(q/chunk_size)*chunk_size, q]; see kv_visible_start().
+  int64_t chunk_size;
   bool has_sinks;
   const float* sinks_ptr;
 };
+
+// Inclusive lower bound on the visible KV position for a query at absolute
+// position q_pos, combining sliding-window and chunked (local) attention.
+// Both constraints are contiguous suffixes, so keys with position < this
+// bound are masked; keys in [bound, q_pos] are kept (causal upper bound is
+// applied separately by each kernel).
+inline int64_t kv_visible_start(const KernelCtx& ctx, int64_t q_pos) {
+  int64_t lo = 0;
+  if (ctx.sliding_window > 0)
+    lo = q_pos - ctx.sliding_window + 1;
+  if (ctx.chunk_size > 0) {
+    const int64_t chunk_start = q_pos - (q_pos % ctx.chunk_size);
+    if (chunk_start > lo)
+      lo = chunk_start;
+  }
+  return lo > 0 ? lo : 0;
+}
 
 // Function declarations
 // BRGeMM tiled prefill for one (kv_head, q_tile) work item.
@@ -99,6 +120,7 @@ void reduce_gqa_partials(
     int64_t num_splits,
     int64_t n_rep,
     int64_t head_dim,
+    const float* sink_biases,
     at::BFloat16* const* out_ptrs);
 
 void multi_token_decode_one_row(

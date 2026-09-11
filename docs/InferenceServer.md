@@ -21,6 +21,7 @@ Client Requests
 - **Router**: API surface for completions. Accepts `/v1/completions` requests, schedules them across engine instances, and streams responses back.
 - **Engine(s)**: Each engine instance loads the model, manages KV cache, and executes prefill/decode steps. Engines are pinned to specific NUMA nodes/cores for optimal performance.
 - **Launcher**: Orchestrates startup of all engine instances and the router via a single `pace-server` command.
+- **Continuous batching**: The `continuous_batch` scheduler combines active decodes with queued and chunked prefills in shared engine steps, subject to the configured token budget.
 
 ---
 
@@ -53,6 +54,9 @@ pace-server [-h] [--server_host SERVER_HOST] [--server_port SERVER_PORT]
             [--fastapi_log_level FASTAPI_LOG_LEVEL]
             [--spec_config SPEC_CONFIG]
             [--kv_cache_memory_gb KV_CACHE_MEMORY_GB]
+            [--token_budget TOKEN_BUDGET]
+            [--max_num_running_reqs MAX_NUM_RUNNING_REQS]
+            [--max_prefill_chunk MAX_PREFILL_CHUNK]
             [--enable_prometheus]
             [--numa_physcpubind NUMA_PHYSCPUBIND]
             [--numa_membind NUMA_MEMBIND]
@@ -77,8 +81,11 @@ pace-server
 | **Router Configuration** | | | |
 | `--router_host` | `str` | `"0.0.0.0"` | Host address for the request router component |
 | `--router_port` | `int` | `8080` | Port for the router |
-| `--serve_type` | `str` | `"iterative"` | Scheduling strategy<br>Options: `iterative`, `continuous_prefill_first` |
+| `--serve_type` | `str` | `"iterative"` | Scheduling strategy<br>Options: `iterative`, `continuous_prefill_first`, `continuous_batch` |
 | `--scheduler_metrics_enabled` | `str` | `"False"` | Enable scheduler-level session metrics<br>Values: `"True"`, `"False"` |
+| `--token_budget` | `int` | `2048` | Maximum total prefill and decode tokens in one `continuous_batch` engine step |
+| `--max_num_running_reqs` | `int` | `128` | Maximum active sequences per engine for `continuous_batch`; clamped to fit the token budget |
+| `--max_prefill_chunk` | `int` | `0` | Maximum prefill chunk size for `continuous_batch`; `0` means no additional cap beyond the remaining token budget |
 | **NUMA / Multi-Instance** | | | |
 | `--numa_physcpubind` | `str` | `None` | Per-instance physical CPU binding. Semicolon-separated for multi-instance<br>Example (2 instances): `"0-127;128-255"` |
 | `--numa_membind` | `str` | `None` | Per-instance NUMA memory binding. Semicolon-separated<br>Example: `"0;1"` |
@@ -87,7 +94,7 @@ pace-server
 | `--server_model` | `str` | `"facebook/opt-6.7b"` | HuggingFace model name or local path<br>Example: `meta-llama/Llama-3.1-8B-Instruct` |
 | `--dtype` | `str` | `"bfloat16"` | Data type for model weights/compute<br>Options: `float32`, `bfloat16` |
 | `--kv_cache_type` | `str` | `"BMC"` | KV cache implementation<br>Options: `BMC` (Balancing Memory & Compute), `dynamic`, `SLAB_POOL`, `PAGED` |
-| `--kv_cache_memory_gb` | `float` | `None` | KV cache memory budget in GB. When set, limits the total KV cache memory across all sequences. Required for `SLAB_POOL` cache type |
+| `--kv_cache_memory_gb` | `float` | `None` | Optional per-engine `SLAB_POOL` memory budget in GB. Providing it allocates each engine's slab pool eagerly; otherwise capacity is derived lazily. It does not configure `PAGED` capacity |
 | `--op_config` | `str` | `"{}"` | Operator backend configuration (JSON string, see [Operator Backends](#operator-backend-configuration)) |
 | `--spec_config` | `str` | `"{}"` | Speculative decoding configuration (JSON string)<br>Example: `'{"model_name": "amd/PARD-Qwen2.5-0.5B", "num_speculative_tokens": 12}'`<br>See [Online Speculative Decoding](#online-speculative-decoding-pard) for details |
 | **Monitoring** | | | |
@@ -98,7 +105,8 @@ pace-server
 | Strategy | Description |
 |----------|-------------|
 | `iterative` | Base scheduler. Each request gets its own prefill+decode loop on the assigned engine. No concurrency. |
-| `continuous_prefill_first` | Prefill is given priority. Drains all pending prefills first, then interleaves decode across active requests in shared batches. Supports concurrent decodes. |
+| `continuous_prefill_first` | Drains queued prefills before resuming a shared decode loop. Prefill and decode run in separate engine calls; prompts are not chunked. |
+| `continuous_batch` | Combines active decodes with queued or in-progress chunked prefills in one mixed engine step. Supported with `SLAB_POOL` and `PAGED`; other cache types are overridden to `SLAB_POOL`. |
 
 ### Operator Backend Configuration
 
@@ -107,20 +115,35 @@ The `--op_config` flag accepts a JSON string to configure operator backends. Six
 | Operator | Key | Backends | Default |
 |----------|-----|----------|---------|
 | Normalization | `norm_backend` | `NATIVE`, `JIT` | `NATIVE` |
-| QKV Projection | `qkv_proj_backend` | `NATIVE`, `TPP` | `TPP` |
-| Attention | `attention_backend` | `JIT`, `NATIVE`, `PAGED`, `SLAB` | `JIT` |
-| Output Projection | `out_proj_backend` | `NATIVE`, `TPP` | `TPP` |
-| MLP | `mlp_backend` | `NATIVE`, `TPP`, `IMBPS` | `TPP` |
-| LM Head | `lm_head_backend` | `NATIVE`, `TPP` | `NATIVE` |
+| QKV Projection | `qkv_projection_backend` | `NATIVE`, `JIT`, `TPP`, `AOCLDLP` | `TPP` |
+| Attention | `attention_backend` | `JIT`, `NATIVE`, `PAGED`, `SLAB` | Cache-dependent |
+| Output Projection | `out_projection_backend` | `NATIVE`, `JIT`, `TPP`, `AOCLDLP` | `TPP` |
+| MLP | `mlp_backend` | `NATIVE`, `JIT`, `TPP`, `IMBPS`, `AOCLDLP` | `TPP` |
+| LM Head | `lm_head_backend` | `NATIVE`, `JIT`, `TPP`, `AOCLDLP` | `NATIVE` |
 
 **Example:**
 ```bash
 pace-server \
   --server_model meta-llama/Llama-3.1-8B-Instruct \
-  --op_config '{"norm_backend": "JIT", "mlp_backend": "IMBPS"}'
+  --op_config '{"norm_backend": "JIT", "qkv_projection_backend": "TPP", "attention_backend": "SLAB", "out_projection_backend": "TPP", "mlp_backend": "TPP", "lm_head_backend": "TPP"}' \
+  --kv_cache_type SLAB_POOL
 ```
 
-> For the most performant operator configuration for offline/LLM inference, refer to the [Performance Guide](PerformanceGuide.md).
+The attention backend is finalized from the KV cache: `DYNAMIC`/`BMC` use
+`JIT` or `NATIVE`, `SLAB_POOL` uses `SLAB`, and `PAGED` uses `PAGED`.
+
+### Automatic Prefix Caching
+
+`SLAB_POOL` and `PAGED` reuse complete prompt-prefix blocks across requests by
+default. Set `PACE_PREFIX_CACHE=0` before launching the server to disable this,
+or set `PACE_PREFIX_HASH=sha256` to use SHA-256 instead of the default
+`xxhash` block hash. `PAGED` capacity is controlled by
+`PACE_MAX_CACHE_TOKENS` (default `262144`). Cache hit and pool utilization
+statistics are exposed through `/v1/server_metrics` and Prometheus. See the
+[Performance Guide](PerformanceGuide.md#environment-variables-reference) for
+the remaining cache and backend environment variables.
+
+> For backend selection and benchmarking guidance, refer to the [Performance Guide](PerformanceGuide.md).
 
 ---
 
@@ -128,8 +151,9 @@ pace-server \
 
 ### Completions
 
-Send text generation requests. Supports both streaming and non-streaming modes.
-The API follows the [OpenAI v1/completions](https://platform.openai.com/docs/api-reference/completions) specification.
+Send text generation requests. The route implements an OpenAI-shaped subset of
+the [v1 completions API](https://platform.openai.com/docs/api-reference/completions)
+plus PACE-specific fields. Both streaming and non-streaming modes are supported.
 
 **POST** `/v1/completions`
 
@@ -140,20 +164,35 @@ The API follows the [OpenAI v1/completions](https://platform.openai.com/docs/api
 | `model` | `str` | *required* | Model name (must match `--server_model`) |
 | `prompt` | `str`, `List[str]`, `List[int]`, or `List[List[int]]` | *required* | Input text(s) or token ID(s) for generation |
 | `stream` | `bool` | `false` | Enable Server-Sent Events streaming |
+| `stream_options` | `dict` | `None` | Set `{"include_usage": true}` to emit a final usage-only streaming chunk |
 | `max_tokens` | `int` | `16` | Maximum tokens to generate |
 | `temperature` | `float` | `None` | Sampling temperature (0 = greedy, >0 = random) |
 | `top_p` | `float` | `None` | Nucleus sampling threshold |
 | `top_k` | `int` | `None` | Top-k sampling (PACE extension) |
+| `min_p` | `float` | `None` | Minimum probability threshold (PACE extension) |
+| `min_tokens` | `int` | `None` | Minimum generated tokens (PACE extension) |
 | `seed` | `int` | `None` | Random seed for reproducibility |
 | `stop` | `str` or `List[str]` | `None` | Stop generation on these strings |
 | `echo` | `bool` | `false` | Prepend prompt text to output |
+| `logprobs` | `int` | `None` | Return sampled token logprobs and up to this many top alternatives |
 | `suffix` | `str` | `None` | Append this text after generated output |
 | `n` | `int` | `1` | Number of completions (only 1 supported) |
+| `best_of` | `int` | `None` | Accepted only when omitted or set to `1` |
 | `frequency_penalty` | `float` | `0.0` | Penalty based on token frequency |
 | `presence_penalty` | `float` | `0.0` | Accepted but not applied |
-| `mlperf_mode` | `bool` | `false` | Return raw token IDs instead of text (PACE extension) |
+| `repetition_penalty` | `float` | `None` | Multiplicative repetition penalty (PACE extension) |
+| `ignore_eos` | `bool` | `None` | Ignore EOS stopping (PACE extension) |
+| `do_sample` | `bool` | `None` | Explicitly select random or greedy sampling (PACE extension) |
+| `skip_special_tokens` | `bool` | `true` | Skip special tokens during decoding (PACE extension) |
+| `logit_bias` | `dict` | `None` | Accepted but not applied |
+| `user` | `str` | `None` | Accepted but not used |
+| `mlperf_mode` | `bool` | `false` | Return space-delimited token IDs as text; streaming uses `text/plain` |
 
 > **Note**: When `temperature` is `None` or `0`, greedy decoding is used. When `temperature > 0`, random sampling is enabled automatically.
+> `echo` and `suffix` currently affect non-streaming text completions only.
+> Prompt logprobs require non-streaming, non-chunked `echo=true`; chat
+> completions do not return logprobs.
+> `mlperf_mode` accepts one prompt per request.
 
 **Non-streaming example:**
 
@@ -222,6 +261,29 @@ data: [DONE]
 
 Every response includes an `id` field (e.g. `cmpl-a1b2c3d4-...`) in the JSON body following the OpenAI format.
 Streaming responses also include an `X-Request-ID` HTTP header: for single-prompt requests this is the per-prompt request ID; for multi-prompt requests it is the shared group ID that ties all `choices[].index` entries together.
+
+### Chat Completions
+
+Send OpenAI-compatible chat messages. The router applies the configured
+tokenizer's chat template and uses the same sampling and scheduling path as
+text completions. Both streaming and non-streaming responses are supported.
+Only text content is accepted.
+
+**POST** `/v1/chat/completions`
+
+```bash
+curl -sS -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  --data-binary '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Explain CPU inference briefly."}],
+    "max_completion_tokens": 64,
+    "temperature": 0
+  }' | jq
+```
+
+The tokenizer must provide a chat template. Chat requests currently generate
+one completion and do not return token logprobs.
 
 ### Health Check
 
@@ -316,6 +378,18 @@ Proxies through to the backend engine to return available models.
 curl -s http://localhost:8080/v1/models | jq
 ```
 
+### Current Configuration
+
+Returns the configured model, KV-cache type, and explicitly configured
+attention backend. If no attention backend was supplied in `--op_config`, the
+response reports `"N/A"` rather than the cache-derived effective backend.
+
+**GET** `/v1/config`
+
+```bash
+curl -s http://localhost:8080/v1/config | jq
+```
+
 ### Prometheus Metrics
 
 Raw Prometheus metrics endpoint for scraping.
@@ -374,6 +448,16 @@ Each engine instance also sets:
 pace-server --server_model meta-llama/Llama-3.1-8B-Instruct --dtype bfloat16
 ```
 
+**Continuous batching with chunked prefill:**
+```bash
+pace-server \
+  --server_model meta-llama/Llama-3.1-8B-Instruct \
+  --kv_cache_type SLAB_POOL \
+  --serve_type continuous_batch \
+  --token_budget 2048 \
+  --max_num_running_reqs 128
+```
+
 **Multi-instance with custom ports:**
 ```bash
 pace-server \
@@ -381,7 +465,8 @@ pace-server \
   --server_port 9000 \
   --router_port 9080 \
   --num_engine_instances 2 \
-  --serve_type continuous_prefill_first
+  --kv_cache_type SLAB_POOL \
+  --serve_type continuous_batch
 ```
 
 **With speculative decoding (PARD):**
@@ -389,8 +474,9 @@ pace-server \
 pace-server \
   --server_model Qwen/Qwen2.5-7B-Instruct \
   --dtype bfloat16 \
+  --kv_cache_type SLAB_POOL \
   --spec_config '{"model_name": "amd/PARD-Qwen2.5-0.5B", "num_speculative_tokens": 12}' \
-  --serve_type continuous_prefill_first
+  --serve_type continuous_batch
 ```
 
 **Complete setup with monitoring:**
@@ -401,7 +487,8 @@ pace-server \
   --num_engine_instances 2 \
   --numa_physcpubind "0-127;128-255" \
   --numa_membind "0;1" \
-  --serve_type continuous_prefill_first \
+  --kv_cache_type SLAB_POOL \
+  --serve_type continuous_batch \
   --scheduler_metrics_enabled True \
   --enable_prometheus \
   --kv_cache_memory_gb 16
@@ -442,8 +529,9 @@ Speculative decoding is configured at launch via `--spec_config`:
 pace-server \
   --server_model Qwen/Qwen2.5-7B-Instruct \
   --dtype bfloat16 \
+  --kv_cache_type SLAB_POOL \
   --spec_config '{"model_name": "amd/PARD-Qwen2.5-0.5B", "num_speculative_tokens": 12}' \
-  --serve_type continuous_prefill_first
+  --serve_type continuous_batch
 ```
 
 **`spec_config` JSON fields:**
@@ -491,7 +579,8 @@ data: [DONE]
 ### Important Notes
 
 1. PARD Speculative Decoding is **only enabled for Greedy Decoding** (`temperature=0`, `do_sample=false`).
-2. The `continuous_prefill_first` serve type is recommended for speculative decoding.
+2. The `continuous_batch` scheduler accounts for each speculative decode as
+   `num_speculative_tokens + 1` tokens when enforcing its token budget.
 3. Speculative decoding is configured **server-wide** at launch time — all requests automatically use it.
 
 For the interactive speculative decoding demo, see the [Server Speculative Demo](../demos/pace_server_speculative_demo.py).

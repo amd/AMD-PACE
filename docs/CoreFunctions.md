@@ -1,6 +1,6 @@
 # AMD PACE Core Functions
 
-These are the core helper functions of AMD PACE. They are not arithmetic ops in the traditional sense; they expose process-level utilities (thread binding, logging, JIT-pass toggle) to Python.
+These are the core helper functions of AMD PACE. They are not arithmetic ops in the traditional sense; they expose process-level utilities (thread binding, logging) to Python.
 
 The methods are registered as torch dispatcher ops on the `pace` namespace in [`csrc/core/core_ops.cpp`](../csrc/core/core_ops.cpp). At runtime they are reached via `torch.ops.pace.*`, and the `pace.core` Python module ([`pace/core.py`](../pace/core.py)) wraps them with familiar names so existing call sites keep working.
 
@@ -14,6 +14,7 @@ This method is implemented with the help of `pthread_setaffinity_np` and provide
 * Files: `csrc/core/threading.cpp` (implementation), `csrc/core/core_ops.cpp` (registration)
 * Example usage:
     ```python
+    import torch
     import pace
     from multiprocessing import Process
 

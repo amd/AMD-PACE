@@ -14,7 +14,7 @@ import pace  # noqa: F401
 from pace.ops.base import BackendBase
 from pace.ops.registry import backend_registry
 from pace.ops.enum import OperatorType, FusedOperatorType, BackendType, DataType
-
+from pace.utils.logging import PACE_LLM_ASSERT
 
 _TPP_BLOCK_SIZE = int(os.getenv("LIBXSMM_BLOCK_SIZE", 32))
 
@@ -156,7 +156,13 @@ class TPPFusedLinearMul(TPPLinear):
 _FUSED_MLP_ACTIVATIONS = {"silu", "gelu", "relu"}
 _FUSED_MLP_ENABLED = os.getenv("PACE_FUSED_MLP", "1") != "0"
 
-_GELU_ALIASES = {"gelu_new": "gelu", "gelu_pytorch_tanh": "gelu"}
+# The TPP kernels expose one GELU; the tanh-approximation spellings differ from
+# it by less than bf16 resolution, so they all route to it.
+_GELU_ALIASES = {
+    "gelu_new": "gelu",
+    "gelu_pytorch_tanh": "gelu",
+    "gelu_tanh": "gelu",
+}
 
 _ACT_LINEAR_OPS = {
     "silu": lambda: torch.ops.pace.libxsmmlinear_silu,
@@ -261,3 +267,141 @@ class TPPFusedMLP(BackendBase):
 
         out = torch.ops.pace.libxsmmlinear_plain(inter, wt_down, down_proj_bias)
         return out.reshape(*batch_shape, -1)
+
+
+@backend_registry.register(
+    FusedOperatorType.FUSEDMOE, BackendType.TPP, [DataType.BFLOAT16]
+)
+class TPPFusedMoE(BackendBase):
+    """TPP backend for MoEExperts — packs per-expert weights to 6D VNNI tensors.
+
+    preprocess() is called automatically by BaseModelForCausalLM.preprocess_weights()
+    after all expert weights have been loaded by load_weights(). It packs
+    gate_proj_weights, up_proj_weights, down_proj_weights into 6D VNNI format
+    and stacks across experts into layer._fused_wt_{gate,up,down}.
+    If packing fails (misaligned dimensions), preprocessing aborts via
+    PACE_LLM_ASSERT with an actionable message (packing is mandatory for the
+    fused backend; there is no implicit runtime fallback).
+    """
+
+    def preprocess(self, layer):
+        bs = int(os.environ.get("LIBXSMM_BLOCK_SIZE", "32"))
+
+        def _pack(weight_2d, what):
+            packed = _pack_weight_for_block_size(weight_2d, bs)
+            PACE_LLM_ASSERT(
+                packed is not None,
+                f"TPPFusedMoE: {what} packing failed — shape "
+                f"{tuple(weight_2d.shape)} not aligned to block_size={bs} or "
+                f"N%64!=0.",
+            )
+            return packed
+
+        gate_packed, up_packed, down_packed = [], [], []
+        gate_biases, up_biases, down_biases = [], [], []
+        has_bias = layer.bias_available
+
+        for e in range(layer.num_experts):
+            up_packed.append(_pack(layer.up_projs[e].weight.data, f"up[{e}]"))
+            down_packed.append(_pack(layer.down_projs[e].weight.data, f"down[{e}]"))
+            if layer.gate:
+                gate_packed.append(_pack(layer.gate_projs[e].weight.data, f"gate[{e}]"))
+            if has_bias:
+                up_biases.append(layer.up_projs[e].bias.data)
+                down_biases.append(layer.down_projs[e].bias.data)
+                if layer.gate:
+                    gate_biases.append(layer.gate_projs[e].bias.data)
+
+        # Fold same-shape shared experts into the stack as extra experts (indices
+        # [num_experts, num_experts + num_shared_experts)). The operator emits
+        # their (id, weight=1.0) routing entries. Shared MLPs are NATIVE, so
+        # their raw weights live in the sub-op linears.
+        if getattr(layer, "foldable_shared", False):
+            for s, mlp in enumerate(layer.shared_mlps):
+                up_packed.append(
+                    _pack(mlp.up_proj.linear.weight.data, f"shared up[{s}]")
+                )
+                down_packed.append(
+                    _pack(mlp.down_proj.weight.data, f"shared down[{s}]")
+                )
+                if layer.gate:
+                    gate_packed.append(
+                        _pack(mlp.gate_proj.linear.weight.data, f"shared gate[{s}]")
+                    )
+                if has_bias:
+                    up_biases.append(mlp.up_proj.linear.bias.data)
+                    down_biases.append(mlp.down_proj.bias.data)
+                    if layer.gate:
+                        gate_biases.append(mlp.gate_proj.linear.bias.data)
+            layer._folded_shared = True
+
+        layer._fused_wt_gate = torch.stack(gate_packed) if gate_packed else None
+        layer._fused_wt_up = torch.stack(up_packed)
+        layer._fused_wt_down = torch.stack(down_packed)
+        layer._fused_gate_bias = torch.stack(gate_biases) if gate_biases else None
+        layer._fused_up_bias = torch.stack(up_biases) if up_biases else None
+        layer._fused_down_bias = torch.stack(down_biases) if down_biases else None
+
+        # Free the unpacked per-expert weights (now in the 6D stack).
+        for e in range(layer.num_experts):
+            layer.up_projs[e].weight.data = torch.empty(0)
+            layer.down_projs[e].weight.data = torch.empty(0)
+            if layer.gate:
+                layer.gate_projs[e].weight.data = torch.empty(0)
+        if getattr(layer, "_folded_shared", False):
+            for mlp in layer.shared_mlps:
+                mlp.up_proj.linear.weight.data = torch.empty(0)
+                mlp.down_proj.weight.data = torch.empty(0)
+                if layer.gate:
+                    mlp.gate_proj.linear.weight.data = torch.empty(0)
+
+    def execute(
+        self,
+        output,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        activation,
+        num_experts,
+        wt_gate,
+        wt_up,
+        wt_down,
+        gate_bias,
+        up_bias,
+        down_bias,
+    ):
+        """Run the expert engine over the packed weights. Routing is supplied as
+        topk_ids / topk_weights; folded shared experts are already extra columns.
+        """
+        activation = _GELU_ALIASES.get(activation, activation)
+        # Void in-place op: writes into `output`; return that buffer.
+        torch.ops.pace.libxsmm_moe_engine(
+            output,
+            hidden_states.contiguous(),
+            topk_ids,
+            topk_weights,
+            wt_gate,
+            wt_up,
+            wt_down,
+            gate_bias,
+            up_bias,
+            down_bias,
+            activation,
+            num_experts,
+        )
+        return output
+
+
+@backend_registry.register(
+    OperatorType.MOEROUTER_SOFTMAX,
+    BackendType.TPP,
+    [DataType.FLOAT32, DataType.BFLOAT16],
+)
+class TPPSoftmaxRouter(BackendBase):
+    """C++ top-k softmax router. Sigmoid/grouped schemes have no TPP backend and
+    fall back to NATIVE via the registry."""
+
+    def execute(self, router_logits, topk, renormalize=True, **_):
+        return torch.ops.pace.moe_route_softmax(
+            router_logits.contiguous(), topk, renormalize
+        )

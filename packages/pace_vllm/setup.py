@@ -8,8 +8,8 @@
 
 Builds pace's C++ runtime via `python setup.py build_clib` against the pace
 root, copies the resulting `libpace_cpp.so` into the pace-vllm wheel, and
-snapshots `pace/_register_fake.py` as `_fakes_snapshot.py`. The pace Python
-package itself is never installed.
+snapshots `pace/_register_fake.py` as `_fakes_snapshot.py`.
+The pace Python package itself is never installed.
 
 The wheel is tagged `py3-none-<plat>` -- there is no CPython extension
 module to bind to a specific ABI; the bundled `libpace_cpp.so` is loaded at
@@ -76,7 +76,7 @@ def _build_pace_cpp_only() -> None:
 
 
 def _place_artifacts(build_pkg_dir: Path) -> None:
-    """Copy libpace_cpp.so + the fake-op snapshot into `build/lib/pace_vllm/`."""
+    """Copy libpace_cpp.so + fake-op snapshot into `build/lib/pace_vllm/`."""
     libpace = _find_pace_artifact()
     if libpace is None:
         raise RuntimeError(

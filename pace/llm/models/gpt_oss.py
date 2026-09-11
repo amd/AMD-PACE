@@ -16,130 +16,32 @@ from pace.llm.configs import OperatorConfig
 from pace.llm.outputs import ModelOutput
 from pace.llm.attention import KVCacheBase, KVCacheManager
 from pace.llm.models.base_model import BaseModelForCausalLM
+from pace.llm.configs import MoEConfig
 from pace.llm.ops import (
     Linear,
     FusedQKVLinear,
+    MoEExperts,
     RMSNorm,
     FusedRMSNormResidual,
     RotaryEmbedding,
-    SoftMax,
-    Sigmoid,
-    BackendType,
 )
 from pace.llm.attention import Attention
+from pace.utils.logging import PACE_LLM_ASSERT
 from pace.utils.mxfp4 import dequantize_mxfp4
 
 
-class GptOssExperts(nn.Module):
+class GptOssMLP(nn.Module):
+    """GptOss MoE MLP — router + experts in a single MoEExperts operator."""
+
     def __init__(self, config: GptOssConfig, opconfig: OperatorConfig):
         super().__init__()
-        self.intermediate_size = config.intermediate_size
-        self.num_experts = config.num_local_experts
-        self.hidden_size = config.hidden_size
-        self.expert_dim = self.intermediate_size
-        self.alpha = 1.702
-        self.limit = 7.0
-
-        self.gate_up_linears = nn.ModuleList(
-            [
-                Linear(
-                    self.hidden_size,
-                    2 * self.expert_dim,
-                    bias=True,
-                    backend_impl=opconfig.mlp,
-                )
-                for _ in range(self.num_experts)
-            ]
-        )
-        self.down_linears = nn.ModuleList(
-            [
-                Linear(
-                    self.expert_dim,
-                    self.hidden_size,
-                    bias=True,
-                    backend_impl=opconfig.mlp,
-                )
-                for _ in range(self.num_experts)
-            ]
-        )
-
-        self.sigmoid = Sigmoid()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        router_indices: Optional[torch.Tensor] = None,
-        routing_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        num_tokens = hidden_states.shape[0]
-
-        output = torch.zeros(
-            num_tokens,
-            self.hidden_size,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
-        # Only compute experts that have tokens routed to them
-        active_experts = torch.unique(router_indices)
-        for expert_id in active_experts:
-            token_mask = (router_indices == expert_id).any(dim=-1)
-            expert_input = hidden_states[token_mask]
-
-            gate_up = self.gate_up_linears[expert_id](expert_input)
-            gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-            gate = gate.clamp(max=self.limit)
-            up = up.clamp(min=-self.limit, max=self.limit)
-            glu = gate * self.sigmoid(gate * self.alpha)
-            expert_out = self.down_linears[expert_id]((up + 1) * glu)
-
-            weights = routing_weights[token_mask, expert_id].unsqueeze(-1)
-            output[token_mask] += expert_out * weights
-
-        return output.view(batch_size, -1, self.hidden_size)
-
-
-class GptOssTopKRouter(Linear):
-    def __init__(self, config: GptOssConfig, opconfig: OperatorConfig):
-        super().__init__(
-            config.hidden_size,
-            config.num_local_experts,
-            bias=True,
+        self.experts = MoEExperts(
+            MoEConfig.from_model(config, activation="gptoss_glu", bias=True),
             backend_impl=opconfig.mlp,
         )
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        self.softmax = SoftMax(
-            dim=1,
-            backend_impl=getattr(opconfig, "softmax", BackendType.NATIVE),
-        )
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = super().forward(hidden_states)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-        router_top_value = self.softmax(router_top_value)
-        router_scores = torch.zeros_like(router_logits).scatter_(
-            1, router_indices, router_top_value
-        )
-        return router_scores, router_indices
-
-
-class GptOssMLP(nn.Module):
-    def __init__(self, config: GptOssConfig, opconfig: OperatorConfig):
-        super().__init__()
-        self.router = GptOssTopKRouter(config, opconfig)
-        self.experts = GptOssExperts(config, opconfig)
-
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        router_scores, router_indices = self.router(hidden_states)
-        routed_out = self.experts(
-            hidden_states, router_indices=router_indices, routing_weights=router_scores
-        )
-        return routed_out, router_scores
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        return self.experts(hidden_states), None
 
 
 class GptOssAttention(nn.Module):
@@ -368,26 +270,18 @@ class GptOssForCausalLM(BaseModelForCausalLM):
             blocks = pending[layer_idx].pop(blocks_key)
             scales = pending[layer_idx].pop(scales_key)
             dequant = dequantize_mxfp4(blocks, scales, dtype=dtype)
-            # dequant shape after transpose:
-            #   gate_up_proj: (num_experts, hidden_size, 2*expert_dim)
-            #   down_proj:    (num_experts, expert_dim, hidden_size)
-            # PACE Linear weight shape: (out_features, in_features) = W^T of the above
             weight_batched = dequant.transpose(-1, -2).contiguous()
 
             experts = self.model.layers[layer_idx].mlp.experts
             if prefix == "gate_up_proj":
                 for e in range(weight_batched.shape[0]):
-                    # weight_batched[e] is (hidden_size, 2*expert_dim)
-                    # Linear expects (2*expert_dim, hidden_size)
-                    experts.gate_up_linears[e].weight.data.copy_(
-                        weight_batched[e].T.contiguous()
+                    experts.load_expert_weights(
+                        e, gate_up_weight=weight_batched[e].T.contiguous()
                     )
             elif prefix == "down_proj":
                 for e in range(weight_batched.shape[0]):
-                    # weight_batched[e] is (expert_dim, hidden_size)
-                    # Linear expects (hidden_size, expert_dim)
-                    experts.down_linears[e].weight.data.copy_(
-                        weight_batched[e].T.contiguous()
+                    experts.load_expert_weights(
+                        e, down_weight=weight_batched[e].T.contiguous()
                     )
 
     def _load_expert_bias(
@@ -396,16 +290,13 @@ class GptOssForCausalLM(BaseModelForCausalLM):
         prefix: str,
         weight: torch.Tensor,
     ):
-        """Load per-expert bias tensors into the individual Linear modules."""
         experts = self.model.layers[layer_idx].mlp.experts
         if prefix == "gate_up_proj_bias":
-            # weight shape: (num_experts, 2*expert_dim)
             for e in range(weight.shape[0]):
-                experts.gate_up_linears[e].bias.data.copy_(weight[e])
+                experts.load_expert_weights(e, gate_up_bias=weight[e])
         elif prefix == "down_proj_bias":
-            # weight shape: (num_experts, hidden_size)
             for e in range(weight.shape[0]):
-                experts.down_linears[e].bias.data.copy_(weight[e])
+                experts.load_expert_weights(e, down_bias=weight[e])
 
     def load_weights(self, weight_iterator: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -428,7 +319,7 @@ class GptOssForCausalLM(BaseModelForCausalLM):
                         layer_idx,
                         "gate_up_proj",
                         self.model.layers[layer_idx]
-                        .mlp.experts.gate_up_linears[0]
+                        .mlp.experts.gate_projs[0]
                         .weight.dtype,
                     )
                     continue
@@ -439,7 +330,7 @@ class GptOssForCausalLM(BaseModelForCausalLM):
                         layer_idx,
                         "gate_up_proj",
                         self.model.layers[layer_idx]
-                        .mlp.experts.gate_up_linears[0]
+                        .mlp.experts.gate_projs[0]
                         .weight.dtype,
                     )
                     continue
@@ -450,7 +341,7 @@ class GptOssForCausalLM(BaseModelForCausalLM):
                         layer_idx,
                         "down_proj",
                         self.model.layers[layer_idx]
-                        .mlp.experts.down_linears[0]
+                        .mlp.experts.down_projs[0]
                         .weight.dtype,
                     )
                     continue
@@ -461,7 +352,7 @@ class GptOssForCausalLM(BaseModelForCausalLM):
                         layer_idx,
                         "down_proj",
                         self.model.layers[layer_idx]
-                        .mlp.experts.down_linears[0]
+                        .mlp.experts.down_projs[0]
                         .weight.dtype,
                     )
                     continue
@@ -474,6 +365,18 @@ class GptOssForCausalLM(BaseModelForCausalLM):
                     self._load_expert_bias(layer_idx, "down_proj_bias", weight)
                     continue
 
+                continue
+
+            # Remap router weights: mlp.router.* → mlp.experts.router.*
+            # (router linear moved inside MoEExperts; HF checkpoint still uses old path)
+            if ".mlp.router." in name:
+                new_name = name.replace(".mlp.router.", ".mlp.experts.router.")
+                PACE_LLM_ASSERT(
+                    new_name in params_dict,
+                    f"router weight '{name}' remapped to '{new_name}' has no "
+                    f"matching parameter; the router would be silently unloaded.",
+                )
+                params_dict[new_name].data.copy_(weight)
                 continue
 
             if "rotary_emb.inv_freq" in name:

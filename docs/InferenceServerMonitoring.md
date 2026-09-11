@@ -64,13 +64,34 @@ curl -s http://localhost:8080/v1/server_metrics | jq
 
 ## Available Prometheus Metrics
 
-### TTFT (Time To First Token)
-
-Measures the time from request submission to the first generated token.
+### Gauges (Live Scheduler State)
 
 | Metric | Description |
 |--------|-------------|
-| `pace_ttft_seconds_count` | Total number of completed requests |
+| `pace_requests_running` | Number of requests currently being processed |
+| `pace_requests_waiting` | Number of requests waiting in queue |
+| `pace_prefix_cache_hits` | Cumulative prefix-cache hits, measured in cached tokens |
+| `pace_prefix_cache_queries` | Cumulative prefix-cache queries, measured in queried tokens |
+| `pace_prefix_cache_hit_rate` | Cached/query token ratio from 0 to 1 |
+| `pace_kv_cache_usage_perc` | KV-cache pool utilization from 0 to 1 |
+
+### Counters (Cumulative Totals)
+
+| Metric | Description |
+|--------|-------------|
+| `pace_prompt_tokens_total` | Total prompt tokens processed |
+| `pace_generation_tokens_total` | Total generation tokens produced |
+| `pace_requests_total{status="completed"}` | Total successfully completed requests |
+| `pace_requests_total{status="error"}` | Total errored requests |
+
+### TTFT (Time To First Token)
+
+Measures from request creation through prefill completion, including queue
+wait and first-token work.
+
+| Metric | Description |
+|--------|-------------|
+| `pace_ttft_seconds_count` | Number of recorded TTFT observations |
 | `pace_ttft_seconds_sum` | Sum of all TTFT values (seconds) |
 | `pace_ttft_seconds_bucket` | Histogram buckets for TTFT distribution |
 
@@ -78,7 +99,7 @@ Measures the time from request submission to the first generated token.
 
 ### TPOT (Time Per Output Token)
 
-Measures the average time to generate each output token across the full request.
+Each observation is total request lifetime divided by generated-token count.
 
 | Metric | Description |
 |--------|-------------|
@@ -88,9 +109,32 @@ Measures the average time to generate each output token across the full request.
 
 **Histogram buckets:** 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0 seconds.
 
+### End-to-End Request Latency
+
+| Metric | Description |
+|--------|-------------|
+| `pace_e2e_request_latency_seconds_count` | Total observations |
+| `pace_e2e_request_latency_seconds_sum` | Sum of all e2e latencies |
+| `pace_e2e_request_latency_seconds_bucket` | Histogram buckets |
+
+### Queue Wait Time
+
+| Metric | Description |
+|--------|-------------|
+| `pace_request_queue_time_seconds_count` | Total observations |
+| `pace_request_queue_time_seconds_sum` | Sum of all queue wait times |
+| `pace_request_queue_time_seconds_bucket` | Histogram buckets |
+
+**Histogram buckets (e2e, queue):** 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0, 240.0, 480.0 seconds.
+
+Note: TTFT is `prefill_finished_at - created_at`, so it is not an isolated
+prefill-kernel measurement.
+
 ## Available Scheduler Session Metrics (JSON)
 
 Accessible at `GET /v1/server_metrics` when `--scheduler_metrics_enabled True` is set.
+KV-cache pool and prefix-cache fields are included whenever the engine exposes
+them, even if scheduler session metrics are disabled.
 
 | Metric Key | Type | Description |
 |------------|------|-------------|
@@ -99,6 +143,19 @@ Accessible at `GET /v1/server_metrics` when `--scheduler_metrics_enabled True` i
 | `sched_active_ttft_time` | `float` | Cumulative wall-clock time spent in prefill (merged overlapping intervals) |
 | `sched_requests_served_per_second` | `float` | Throughput: completed requests per second of active time |
 | `sched_total_generated_tokens` | `int` | Total tokens generated across all completed requests |
+| `kv_cache_pool_total_blocks` | `int` | Total blocks across engine KV-cache pools |
+| `kv_cache_pool_free_blocks` | `int` | Free blocks across engine KV-cache pools |
+| `kv_cache_pool_allocated_blocks` | `int` | Allocated blocks across engine KV-cache pools |
+| `kv_cache_pool_utilization_pct` | `float` | Aggregate pool utilization percentage |
+| `prefix_cache_queries` | `int` | Total queried prefix tokens |
+| `prefix_cache_hits` | `int` | Total reused prefix tokens |
+| `prefix_cache_hit_rate` | `float` | Reused/query token ratio |
+| `prefix_cache_enabled` | `bool` | Whether any engine reports prefix caching enabled |
+| `prefix_cache_cached_blocks` | `int` | Cached prefix blocks across engines |
+| `prefix_cache_evictable_blocks` | `int` | Cached blocks currently eligible for eviction |
+| `prefix_cache_total_evictions` | `int` | Cumulative cache evictions |
+| `prefix_cache_total_inserts` | `int` | Cumulative cache inserts |
+| `prefix_cache_dedup_frees` | `int` | Blocks freed by deduplicating concurrent inserts |
 
 **Example response:**
 ```json
@@ -156,6 +213,28 @@ rate(pace_tpot_seconds_sum[5m]) / rate(pace_tpot_seconds_count[5m])
 
 # Token generation rate (tokens per second)
 rate(pace_tpot_seconds_count[1m])
+
+# Prompt token throughput (tokens/s)
+rate(pace_prompt_tokens_total[1m])
+
+# Generation token throughput (tokens/s)
+rate(pace_generation_tokens_total[1m])
+
+# Request success rate
+rate(pace_requests_total{status="completed"}[5m])
+
+# Request error rate
+rate(pace_requests_total{status="error"}[5m])
+
+# 95th percentile e2e latency
+histogram_quantile(0.95, rate(pace_e2e_request_latency_seconds_bucket[5m]))
+
+# 95th percentile queue wait time
+histogram_quantile(0.95, rate(pace_request_queue_time_seconds_bucket[5m]))
+
+# Current scheduler utilization
+pace_requests_running
+pace_requests_waiting
 ```
 
 ## Prometheus Configuration Details

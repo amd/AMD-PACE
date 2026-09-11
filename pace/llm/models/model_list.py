@@ -19,10 +19,16 @@ _MODELS = {
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
     "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
     "GPTJForCausalLM": ("gptj", "GPTJForCausalLM"),
-    "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    "Qwen2ForCausalLM": ("qwen", "Qwen2ForCausalLM"),
+    "Qwen3ForCausalLM": ("qwen", "Qwen3ForCausalLM"),
+    "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),
     "Gemma3ForCausalLM": ("gemma3", "Gemma3ForCausalLM"),
     "Gemma3ForConditionalGeneration": ("gemma3", "Gemma3ForConditionalGeneration"),
     "GptOssForCausalLM": ("gpt_oss", "GptOssForCausalLM"),
+    "Llama4ForCausalLM": ("llama4", "Llama4ForCausalLM"),
+    "Llama4ForConditionalGeneration": ("llama4", "Llama4ForCausalLM"),
+    "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
+    "Gemma4ForConditionalGeneration": ("gemma4", "Gemma4ForConditionalGeneration"),
 }
 
 

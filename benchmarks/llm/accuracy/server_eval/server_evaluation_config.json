@@ -1,0 +1,21 @@
+{
+    "server": {
+        "base_url": "http://localhost:8080"
+    },
+    "model_args": {
+        "model_name": "Qwen/Qwen2.5-7B-Instruct"
+    },
+    "tasks": [
+        {
+            "task_name": "gsm8k",
+            "num_fewshot": 8,
+            "limit": 1
+        }
+    ],
+    "num_concurrent": 10,
+    "max_retries": 3,
+    "tokenized_requests": true,
+    "add_bos_token": true,
+    "verbose": true,
+    "output_dir": "./server_eval_results"
+}

@@ -30,6 +30,7 @@
       CPU_ATTN_DISPATCH_CASE(192, __VA_ARGS__)                              \
       CPU_ATTN_DISPATCH_CASE(224, __VA_ARGS__)                              \
       CPU_ATTN_DISPATCH_CASE(256, __VA_ARGS__)                              \
+      CPU_ATTN_DISPATCH_CASE(512, __VA_ARGS__)                              \
       default: {                                                            \
         TORCH_CHECK(                                                        \
             false,                                                          \

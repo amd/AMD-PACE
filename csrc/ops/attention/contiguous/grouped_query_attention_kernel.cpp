@@ -5,7 +5,7 @@
 
 #include <ops/attention/contiguous/grouped_query_attention_kernel.h>
 #include <ops/kernels/kernel_primitive_utils.h>
-#include <pace_tensor/pace_aten_interface.h>
+#include <ops/onednn_utils.h>
 
 typedef long int dim_t;
 
@@ -26,11 +26,11 @@ void grouped_query_attention_kernel(
   memory input_V_mem = view_tensor_as_memory(value); // b, num_kv_heads, s, h
   memory output_mem = view_tensor_as_memory(output);
 
-  memory attn_mask_mem = memory({}, cpu_eng(), JIT_MEMORY_NONE);
+  memory attn_mask_mem = memory({}, cpu_eng(), DNNL_MEMORY_NONE);
   if (attn_mask.has_value())
     attn_mask_mem = view_tensor_as_memory(attn_mask.value());
 
-  auto dta = GET_DATA_TYPE(input_Q_mem);
+  auto dta = input_Q_mem.get_desc().get_data_type();
 
   // get memory descriptors
   auto query_md = input_Q_mem.get_desc();
@@ -38,13 +38,13 @@ void grouped_query_attention_kernel(
   auto value_md = input_V_mem.get_desc();
   auto output_md = output_mem.get_desc();
 
-  const dim_t B = GET_DIMS(query_md, 0);
-  const dim_t num_q_heads = GET_DIMS(query_md, 1);
-  const dim_t S = GET_DIMS(query_md, 2);
-  const dim_t H = GET_DIMS(query_md, 3);
+  const dim_t B = query_md.get_dims()[0];
+  const dim_t num_q_heads = query_md.get_dims()[1];
+  const dim_t S = query_md.get_dims()[2];
+  const dim_t H = query_md.get_dims()[3];
 
-  const dim_t num_kv_heads = GET_DIMS(key_md, 1);
-  const dim_t L = GET_DIMS(key_md, 2);
+  const dim_t num_kv_heads = key_md.get_dims()[1];
+  const dim_t L = key_md.get_dims()[2];
 
   int N_rep = num_q_heads / num_kv_heads;
 
@@ -78,8 +78,17 @@ void grouped_query_attention_kernel(
   // TODO: : evaluate - add mask as a post-op of matmul
   if (attn_mask_mem.get_desc().get_size() &&
       attn_mask_mem.get_data_handle() != nullptr) {
-    // Create 5D view for atten mask: [B, 1, 1, S, L]
-    memory::dims mask_5d_dims = {B, 1, 1, S, L};
+    auto mask_md = attn_mask_mem.get_desc();
+    memory::dims mask_5d_dims;
+    // When the mask is expanded to per-head (dim 1 == num_q_heads), reinterpret
+    // it as [B, num_kv_heads, N_rep, S, L] so each query head gets its own
+    // mask values (e.g. per-head attention sinks). Otherwise broadcast as
+    // [B, 1, 1, S, L] across all heads.
+    if (mask_md.get_dims()[1] == num_q_heads) {
+      mask_5d_dims = {B, num_kv_heads, N_rep, S, L};
+    } else {
+      mask_5d_dims = {B, 1, 1, S, L};
+    }
     memory::desc mask_5d_md(mask_5d_dims, dta, memory::format_tag::abcde);
     memory mask_5d(mask_5d_md, cpu_eng(), attn_mask_mem.get_data_handle());
 

@@ -18,7 +18,9 @@ import torch
 from pace_vllm.platform import (
     _PACE_WORKER_CLS,
     PacePlatform,
+    _attention_geometry,
     _cpu_supports_avx512_bf16,
+    _hf_text_config,
 )
 
 
@@ -67,9 +69,25 @@ def _make_config(world_size: int, executor, dtype: torch.dtype = torch.bfloat16)
             distributed_executor_backend=executor,
             worker_cls="auto",
         ),
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        scheduler_config=SimpleNamespace(async_scheduling=None),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=False,
+            block_size=16,
+            kv_offloading_size=None,
+            mamba_block_size=None,
+            mamba_cache_mode="none",
+        ),
         compilation_config=SimpleNamespace(custom_ops=[]),
-        model_config=SimpleNamespace(dtype=dtype),
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(
+            dtype=dtype,
+            max_model_len=4096,
+            hf_config=SimpleNamespace(
+                num_key_value_heads=8,
+                num_attention_heads=8,
+                hidden_size=1024,
+            ),
+        ),
     )
 
 
@@ -177,6 +195,208 @@ class TestCheckAndUpdateConfigBf16Guard(unittest.TestCase):
             _run_with_fake_super(cfg)
         # worker_cls still "auto" -> the fake super never ran.
         self.assertEqual(cfg.parallel_config.worker_cls, "auto")
+
+
+class TestPrefixConnectorInjection(unittest.TestCase):
+    def test_prefix_caching_injects_slab_connector(self) -> None:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        cfg = _make_config(world_size=1, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+
+        with patch(
+            "pace_vllm.platform._resolve_slab_block_size_for_connector",
+            return_value=64,
+        ):
+            _run_with_fake_super(cfg)
+
+        self.assertFalse(cfg.cache_config.enable_prefix_caching)
+        self.assertEqual(cfg.cache_config.block_size, 64)
+        self.assertEqual(
+            cfg.kv_transfer_config.kv_connector,
+            "PaceSlabConnector",
+        )
+        self.assertEqual(cfg.kv_transfer_config.kv_role, "kv_both")
+        self.assertEqual(
+            cfg.kv_transfer_config.kv_connector_module_path,
+            "pace_vllm.v1.connector",
+        )
+        self.assertEqual(
+            cfg.kv_transfer_config.kv_connector_extra_config,
+            {"slab_block_size": 64},
+        )
+        self.assertTrue(KVConnectorFactory.supports_hma_config(cfg.kv_transfer_config))
+
+    def test_existing_connector_is_rejected(self) -> None:
+        from vllm.config import KVTransferConfig
+
+        cfg = _make_config(world_size=1, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+        cfg.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"side_channel_port": 1234},
+        )
+
+        with patch(
+            "pace_vllm.platform._resolve_slab_block_size_for_connector",
+            return_value=64,
+        ):
+            with self.assertRaisesRegex(ValueError, "cannot yet be combined"):
+                _run_with_fake_super(cfg)
+
+    def test_kv_offloading_is_rejected_without_mutating_cache_config(self) -> None:
+        cfg = _make_config(world_size=1, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+        cfg.cache_config.kv_offloading_size = 4
+
+        with self.assertRaisesRegex(ValueError, "KV offloading"):
+            _run_with_fake_super(cfg)
+
+        self.assertTrue(cfg.cache_config.enable_prefix_caching)
+        self.assertEqual(cfg.cache_config.block_size, 16)
+
+    def test_hybrid_mamba_prefix_caching_is_disabled(self) -> None:
+        cfg = _make_config(world_size=1, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+        cfg.cache_config.mamba_block_size = 128
+        cfg.cache_config.mamba_cache_mode = "align"
+
+        _run_with_fake_super(cfg)
+
+        self.assertFalse(cfg.cache_config.enable_prefix_caching)
+        self.assertIsNone(cfg.kv_transfer_config)
+        self.assertEqual(cfg.cache_config.mamba_cache_mode, "none")
+        self.assertEqual(
+            cfg.cache_config.mamba_block_size, cfg.model_config.max_model_len
+        )
+
+    def test_prefix_caching_accepts_multiprocess_executor(self) -> None:
+        cfg = _make_config(world_size=1, executor="mp")
+        cfg.cache_config.enable_prefix_caching = True
+
+        with patch(
+            "pace_vllm.platform._resolve_slab_block_size_for_connector",
+            return_value=64,
+        ):
+            _run_with_fake_super(cfg)
+
+        self.assertEqual(cfg.parallel_config.distributed_executor_backend, "mp")
+        self.assertEqual(
+            cfg.kv_transfer_config.kv_connector,
+            "PaceSlabConnector",
+        )
+
+    def test_prefix_caching_accepts_tensor_parallel_workers(self) -> None:
+        cfg = _make_config(world_size=2, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+
+        with patch(
+            "pace_vllm.platform._resolve_slab_block_size_for_connector",
+            return_value=64,
+        ):
+            _run_with_fake_super(cfg)
+
+        self.assertEqual(cfg.parallel_config.distributed_executor_backend, "mp")
+        self.assertEqual(
+            cfg.kv_transfer_config.kv_connector,
+            "PaceSlabConnector",
+        )
+
+    def test_speculative_decoding_is_rejected(self) -> None:
+        # Lookahead slots allocate blocks the step never writes, which the
+        # connector would publish as if they held valid KV.
+        cfg = _make_config(world_size=1, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+        cfg.speculative_config = SimpleNamespace(method="eagle")
+
+        with self.assertRaisesRegex(ValueError, "speculative decoding"):
+            _run_with_fake_super(cfg)
+
+    def test_prefix_caching_disables_automatic_async_scheduling(self) -> None:
+        cfg = _make_config(world_size=1, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+
+        with patch(
+            "pace_vllm.platform._resolve_slab_block_size_for_connector",
+            return_value=64,
+        ):
+            _run_with_fake_super(cfg)
+
+        self.assertFalse(cfg.scheduler_config.async_scheduling)
+
+    def test_prefix_caching_rejects_explicit_async_scheduling(self) -> None:
+        cfg = _make_config(world_size=1, executor="uni")
+        cfg.cache_config.enable_prefix_caching = True
+        cfg.scheduler_config.async_scheduling = True
+
+        with self.assertRaisesRegex(ValueError, "async scheduling"):
+            _run_with_fake_super(cfg)
+
+        self.assertTrue(cfg.scheduler_config.async_scheduling)
+        self.assertTrue(cfg.cache_config.enable_prefix_caching)
+
+    def test_prefix_caching_rejects_external_launcher(self) -> None:
+        cfg = _make_config(world_size=2, executor="external_launcher")
+        cfg.cache_config.enable_prefix_caching = True
+
+        with self.assertRaisesRegex(ValueError, "'uni' or 'mp' executor"):
+            _run_with_fake_super(cfg)
+
+        self.assertTrue(cfg.cache_config.enable_prefix_caching)
+        self.assertIsNone(cfg.kv_transfer_config)
+
+
+class TestAttentionGeometry(unittest.TestCase):
+    def test_flat_llama_style_hf_config(self) -> None:
+        mc = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                num_key_value_heads=8,
+                num_attention_heads=32,
+                hidden_size=4096,
+            )
+        )
+        self.assertEqual(_attention_geometry(mc), (8, 128))
+
+    def test_nested_text_config_like_gemma4(self) -> None:
+        mc = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                text_config=SimpleNamespace(
+                    num_key_value_heads=1,
+                    num_attention_heads=8,
+                    hidden_size=1536,
+                    head_dim=256,
+                )
+            )
+        )
+        self.assertIs(_hf_text_config(mc.hf_config), mc.hf_config.text_config)
+        self.assertEqual(_attention_geometry(mc), (1, 256))
+
+    def test_text_config_without_num_attention_heads_is_ignored(self) -> None:
+        parent = SimpleNamespace(
+            num_key_value_heads=8,
+            num_attention_heads=32,
+            hidden_size=4096,
+            text_config=SimpleNamespace(head_dim=256),
+        )
+        self.assertIs(_hf_text_config(parent), parent)
+        self.assertEqual(
+            _attention_geometry(SimpleNamespace(hf_config=parent)), (8, 128)
+        )
+
+    def test_model_config_getters_preferred(self) -> None:
+        mc = SimpleNamespace(
+            get_total_num_kv_heads=lambda: 2,
+            get_head_size=lambda: 512,
+            hf_config=SimpleNamespace(
+                num_key_value_heads=99,
+                num_attention_heads=99,
+                hidden_size=99,
+            ),
+        )
+        self.assertEqual(_attention_geometry(mc), (2, 512))
 
 
 if __name__ == "__main__":

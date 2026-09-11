@@ -11,7 +11,6 @@ import httpx
 import os
 from typing import Dict, Any
 
-
 os.environ["PACE_LOG_LEVEL"] = "none"
 
 PROMPT_COLOR = "\033[94m"

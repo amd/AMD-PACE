@@ -32,8 +32,7 @@ is no Docker deployment and no requirement to run the optional REST API.
 
 ## Quick Start (PACE Agent)
 
-Install PACE Agent from this repository (editable install pulls in the vendored
-`nsjail_agent` package):
+Install PACE Agent from this repository; the package includes the vendored `nsjail_agent` package:
 
 ```bash
 pip install -e ./packages/pace_agent

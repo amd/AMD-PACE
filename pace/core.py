@@ -3,15 +3,12 @@
 # All rights reserved.
 # ******************************************************************************
 
-"""Python surface for the three native helpers previously exposed by the
-pybind module `pace._C`.
+"""Python surface for native helpers exposed via the torch dispatcher.
 
-Each helper is now a torch dispatcher op registered on the `pace` namespace
-in `csrc/core/core_ops.cpp`:
+Each helper is registered on the `pace` namespace in `csrc/core/core_ops.cpp`:
 
-- `pace.core.thread_bind`        -> `torch.ops.pace.thread_bind`
-- `pace.core.pace_logger`        -> `torch.ops.pace.log`
-- `pace.core.enable_pace_fusion` -> `torch.ops.pace.enable_fusion`
+- `pace.core.thread_bind` -> `torch.ops.pace.thread_bind`
+- `pace.core.pace_logger` -> `torch.ops.pace.log`
 
 Callers should prefer the wrappers below over `torch.ops.pace.*` directly so
 the C++ schema can evolve without breaking import sites.
@@ -37,9 +34,4 @@ def pace_logger(level: int, message: str) -> None:
     torch.ops.pace.log(level, message)
 
 
-def enable_pace_fusion(enabled: bool) -> None:
-    """Toggle PACE's JIT graph optimization pass."""
-    torch.ops.pace.enable_fusion(enabled)
-
-
-__all__ = ["thread_bind", "pace_logger", "enable_pace_fusion"]
+__all__ = ["thread_bind", "pace_logger"]

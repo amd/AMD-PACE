@@ -31,11 +31,14 @@ Unlike the models before LLMs gained popularity, which was mostly focused on mod
 | Models        | FP32/BF16 | Dynamic Quantization | Static Quantization |
 |---------------|-----------|----------------------|---------------------|
 | OPT           | ✅        | ❌                  | ❌                  |
-| LLAMA (<=3.3) | ✅        | ❌                  | ❌                  |
+| Llama 3 / Llama 4 (text) | ✅ | ❌               | ❌                  |
 | GPT-J         | ✅        | ❌                  | ❌                  |
 | Phi3/4        | ✅        | ❌                  | ❌                  |
 | QWEN2/2.5     | ✅        | ❌                  | ❌                  |
+| QWEN3         | ✅        | ❌                  | ❌                  |
+| QWEN3 MoE     | ✅        | ❌                  | ❌                  |
 | Gemma 3       | ✅        | ❌                  | ❌                  |
+| Gemma 4 (text)| ✅        | ❌                  | ❌                  |
 | GptOss        | ✅        | ❌                  | ❌                  |
 
 
@@ -144,7 +147,9 @@ All models will be adapted from the HF repo with inference only ops. One forward
 ## Features
 
 ### Streamers
-Streamers are used to stream the output to the stdout, as soon as the output is generated. The streamers are model independent and can be used to stream the output of any model. HuggingFace provides a [`TextStream`](https://huggingface.co/docs/transformers.js/en/api/generation/streamers#generationstreamerstextstreamer) class which is used to stream the output to the stdout. The `TextStream` class is used to stream the output of the model to the stdout.
+Streamers emit text as tokens are generated. PACE's generation API accepts a
+Hugging Face [`TextStreamer`](https://huggingface.co/docs/transformers/main/en/internal/generation_utils#transformers.TextStreamer)
+through the `text_streamer` argument.
 
 For an example of how to use the streamer, please refer to the example given in `examples/pace_llm_streamer.py`.
 
@@ -200,7 +205,14 @@ These ops are used in model implementations:
 | `FusedRMSNormResidual` | `pace.llm.ops` | Fused RMSNorm + residual add |
 | `RotaryEmbedding` | `pace.llm.ops` | Rotary position embeddings (RoPE) |
 | `MergedMLP` | `pace.llm.ops` | Fused gate/up + down projection MLP |
+| `MoEExperts` | `pace.llm.ops` | Routed and shared Mixture-of-Experts execution; optimized TPP expert backend for BF16 |
 | `Attention` | `pace.llm.attention` | Attention with pluggable backends (JIT, NATIVE, SLAB, PAGED) |
+
+`MoEExperts` supports `silu`, `gelu`, `gelu_tanh`, `relu`, and
+`gptoss_glu` in its reference path. The optimized TPP expert backend is BF16
+only. Shared experts are folded into the fused expert stack when their
+intermediate shape matches the routed experts; otherwise they execute
+separately.
 
 ### Patterns
 
@@ -218,6 +230,12 @@ PACE supports multiple KV cache types, defined in `KVCacheType` (`pace/llm/atten
 | `BMC` | Block-Major Contiguous cache. Splits the cache into blocks controlled by `PACE_BMC_NUM_SPLITS`. Better memory utilization for longer sequences. | JIT, NATIVE |
 | `SLAB_POOL` | Pool-based slab allocator for production serving. Pre-allocates a fixed memory pool with configurable block sizes. See [SlabAttention.md](SlabAttention.md) for details. | SLAB |
 | `PAGED` | Paged attention with block-level memory management. Pool size controlled by `PACE_MAX_CACHE_TOKENS` (default 262144). | PAGED |
+
+`SLAB_POOL` and `PAGED` enable automatic prefix-cache reuse by default. Only
+complete cache blocks are reused; set `PACE_PREFIX_CACHE=0` to disable the
+feature. The inference server's `continuous_batch` scheduler can combine decode
+work with chunked prefills in the same engine step, subject to the configured
+token budget.
 
 ### Cache-Attention Compatibility
 

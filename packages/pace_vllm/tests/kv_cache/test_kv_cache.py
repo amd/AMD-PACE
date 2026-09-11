@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import torch
 
 import pace_vllm
-from pace_vllm.v1.kv_cache import PaceKVCache, PaceKVCacheSpec
+from pace_vllm.v1.kv_cache import PaceKVCache, PaceKVCacheSpec, PaceLayerSpec
 
 # Construct PaceKVCache instantiates `torch.classes.pace.SlabPool`, so
 # libpace_cpp.so must be loaded before any of the lifecycle tests run.
@@ -153,6 +153,30 @@ class TestPaceKVCacheLifecycle(unittest.TestCase):
         self.assertIs(kv.get_owner(), marker)
         kv.set_owner(None)
         self.assertIsNone(kv.get_owner())
+
+    def test_prefix_helpers_reject_heterogeneous_block_sizes(self) -> None:
+        spec = PaceKVCacheSpec(
+            per_layer=(
+                PaceLayerSpec(2, 16, 32, torch.bfloat16, 4),
+                PaceLayerSpec(2, 16, 16, torch.bfloat16, 4),
+            )
+        )
+        kv = PaceKVCache(spec, layer_names=["layer.0", "layer.1"])
+        seq_id = kv.create_sequence("req-1", max_seq_len=64)
+
+        with self.assertRaisesRegex(ValueError, "uniform block_size"):
+            kv.get_block_indices(seq_id)
+        with self.assertRaisesRegex(ValueError, "uniform block_size"):
+            kv.assign_prefix_blocks(seq_id, [0], 16)
+        with self.assertRaisesRegex(ValueError, "uniform block_size"):
+            kv.retain_blocks([0])
+        with self.assertRaisesRegex(ValueError, "uniform block_size"):
+            kv.release_retained_blocks([0])
+
+        for layer_idx in range(kv.num_layers):
+            self.assertEqual(
+                kv.pool_for_layer(layer_idx).get_sequence_length(seq_id), 0
+            )
 
 
 class TestFromKVCacheConfigKVSharing(unittest.TestCase):

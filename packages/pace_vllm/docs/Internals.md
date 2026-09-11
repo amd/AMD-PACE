@@ -22,7 +22,10 @@ When vLLM imports this plugin at startup, [`pace_vllm.register()`](../pace_vllm/
 - Routes the CPU worker through PACE-specific subclasses (`PaceWorker`, `PaceModelRunner`).
 - Swaps the attention backend to `PaceAttentionBackend`.
 - Owns KV cache memory via `torch.classes.pace.SlabPool` (one `SlabPool` per attention layer).
-- Substitutes pace OOTs (out-of-tree custom ops) for vLLM's default Linear / RMSNorm layers so their CPU forwards run through `pace::libxsmmlinear_plain` / `pace::rmsnorm`.
+- Substitutes PACE OOTs (out-of-tree custom ops) for vLLM's default
+  Linear/RMSNorm layers and eligible gated, unquantized BF16 FusedMoE layers.
+  Non-gated or non-TPP-packable MoE layers fall back to vLLM's stock CPU
+  dispatch.
 
 Under compile mode (`enforce_eager=False`), pace-vllm also installs a post-grad pattern matcher (`FusedMLPPass`) into Inductor's `post_grad_custom_post_pass`. Once Inductor compiles the model graph, every matched MLP block — gated SwiGLU / GeGLU, or ungated `fc1->act->fc2` (with or without bias, across silu / gelu-tanh / gelu-exact / relu) — is rewritten into a single `pace::libxsmm_fused_mlp` call.
 
@@ -40,13 +43,13 @@ When the plugin loads cleanly you'll see, in order:
 
 ```
 Loading plugin pace
-pace-vllm: vllm 0.21.0 satisfies supported range '>=0.21.0,<0.22.0'.
+pace-vllm: vllm 0.28.0 satisfies supported range '>=0.25.0,<=0.28.0'.
 pace-vllm: loaded bundled libpace_cpp.so via torch.ops.load_library.
 pace-vllm: native surfaces live (torch.ops.pace.rmsnorm, torch.classes.pace.SlabPool).
 pace-vllm: plugin active, PacePlatform registered.
-pace-vllm: PacePlatform active (worker_cls=...PaceWorker, was=..., attn_backend=...PaceAttentionBackend, prefix_caching=False, auto_custom_ops=['rms_norm']).
+pace-vllm: PacePlatform active (worker_cls=...PaceWorker, was=..., attn_backend=...PaceAttentionBackend, prefix_caching=<true|false>, auto_custom_ops=['rms_norm']).
 pace-vllm: PaceWorker.init_device starting.
-pace-vllm: registered OOTs (TPP Linear + ParallelLMHead + JIT RMSNorm).
+pace-vllm: registered OOTs (TPP Linear + ParallelLMHead + JIT RMSNorm + FusedMoE).
 pace-vllm: installed FusedMLPPass into post_grad_custom_post_pass.
 pace-vllm: PaceModelRunner active.
 pace-vllm: PaceWorker active (worker=PaceWorker, model_runner=PaceModelRunner).
@@ -74,9 +77,26 @@ During model load, every eligible Linear / ParallelLMHead also logs one `pace-vl
 | `PACE_VLLM_FUSED_MLP` | pace-vllm | Set to `0` / `false` / `off` / `no` / `disable` / `disabled` to skip `FusedMLPPass` entirely (MLPs stay on three `pace::libxsmmlinear_plain` calls). Unset (default) or any other value keeps the pass enabled. Useful for A/B'ing fused vs unfused without rebuilding. |
 | `enforce_eager` (vLLM `LLM` / `--enforce-eager`) | vLLM | `False` (default) lets `FusedMLPPass` rewrite MLP blocks into `pace::libxsmm_fused_mlp`. `True` disables compile entirely; the pass early-returns and the MLP stays on three separate TPP Linears. `FusedMLPPass` is **not** gated by `PACE_VLLM_CUSTOM_OPS`. |
 
+## Prefix caching
+
+When vLLM prefix caching is enabled, pace-vllm installs `PaceSlabConnector` and
+uses PACE's SlabPool to retain and restore complete reusable prefix blocks,
+while leaving at least one prompt token for recomputation. The connector aligns
+vLLM's scheduler block size with the SlabPool block size, requires uniform slab
+block sizing, and coordinates cache lifecycle across `uni` or `mp` workers.
+
+Prefix caching is currently incompatible with speculative decoding, async
+scheduling, KV offloading, another KV connector, and hybrid Mamba/SSM cache
+models. For hybrid models, pace-vllm disables prefix caching so the SSM state
+remains correct.
+
 ## vLLM version compatibility
 
-`pace_vllm.register()` checks the installed `vllm.__version__` against a hard-coded supported range before loading any native libraries or registering the platform. The range lives in `_PACE_VLLM_SUPPORTED_VLLM_RANGE` at the top of [`pace_vllm/__init__.py`](../pace_vllm/__init__.py); the current value is `>=0.21.0,<0.22.0`.
+`pace_vllm.register()` checks the installed `vllm.__version__` against a hard-coded supported range before loading any native libraries or registering the platform. The range lives in `_PACE_VLLM_SUPPORTED_VLLM_RANGE` at the top of [`pace_vllm/__init__.py`](../pace_vllm/__init__.py); the current value is `>=0.25.0,<=0.28.0`.
+
+This range is verified end-to-end (unit suite + offline `LLM.generate` + `vllm serve`) on 0.28.0. 0.25.0, 0.25.1, and 0.26.0 remain in-range; they were not re-run this cycle. Plugin changes this cycle are shims (`select_experts` import, ModelConfig attention geometry, hybrid-Mamba prefix-cache disable) that keep those versions on the previous code paths. 0.23.x and 0.24.x are no longer supported.
+
+> **vLLM 0.25.0 + FFmpeg caveat:** on hosts without system FFmpeg libraries, vLLM 0.25.0 aborts at import time — `torchcodec` raises `OSError` loading its shared libs, which vLLM only catches as `ImportError`, so the failure propagates through `vllm.multimodal.video`. This is a vLLM-side bug fixed in 0.25.1 ([vllm-project/vllm#47888](https://github.com/vllm-project/vllm/pull/47888)), unrelated to pace-vllm. Installing FFmpeg (e.g. `conda install -c conda-forge ffmpeg`) or upgrading to 0.25.1 resolves it.
 
 There is no env-var override — changing the supported range requires a source edit and end-to-end re-verification.
 

@@ -25,6 +25,7 @@ from pace.ops import (  # noqa: F401
     RepeatedKVLinear,
     LayerNorm,
     RMSNorm,
+    L2Norm,
     FusedRMSNormResidual,
     FusedGemma3RMSNormResidual,
     FusedLayerNormResidual,
@@ -33,6 +34,7 @@ from pace.ops import (  # noqa: F401
     Sigmoid,
     Activation,
     MergedMLP,
+    MoEExperts,
     FusedQKVLinear,
 )
 

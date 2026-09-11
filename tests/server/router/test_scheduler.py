@@ -7,6 +7,7 @@
 import os
 import asyncio
 import json
+import time
 import unittest
 from unittest.mock import Mock, AsyncMock, patch
 from pace.server.router.scheduler import IterativeScheduler, PrefillFirstScheduler
@@ -415,6 +416,97 @@ class SchedulerDirectAsyncUnitTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("TPOT", mock_req.req_stats)
                 self.assertEqual(mock_req.req_stats["TTFT"], 1.0)
                 self.assertEqual(mock_req.req_stats["TPOT"], 0.4)
+
+    @patch("pace.server.router.scheduler.perform_prefill")
+    async def test_prefill_completed_request_is_cleaned_up(self, mock_perform_prefill):
+        """Prefill-only completions should leave neither active nor decode state behind."""
+        scheduler = PrefillFirstScheduler("http://localhost:3000")
+        worker_id = 0
+
+        mock_req = Mock()
+        mock_req.request_id = "prefill-completed"
+        mock_req.status = RequestStatus.QUEUED
+        mock_req.token_queue = asyncio.Queue()
+        mock_req.req_stats = {
+            "created_at": time.time(),
+            "prefill_finished_at": None,
+            "finished_at": None,
+            "generated_tokens_count": 0,
+            "input_length": 3,
+            "end_wait_time": None,
+            "TTFT": None,
+            "TPOT": None,
+        }
+
+        async def complete_during_prefill(req, *_args):
+            req.status = RequestStatus.COMPLETED
+            req.req_stats["prefill_finished_at"] = time.time()
+            req.req_stats["finished_at"] = time.time()
+            req.req_stats["generated_tokens_count"] = 1
+            await req.token_queue.put([1])
+            await req.token_queue.put(None)
+            return "COMPLETED"
+
+        mock_perform_prefill.side_effect = complete_during_prefill
+        scheduler.active_requests[mock_req.request_id] = mock_req
+        await scheduler.request_queues[worker_id].put(mock_req)
+
+        scheduler.is_running = True
+        worker_task = asyncio.create_task(scheduler._processing_loop_worker(worker_id))
+        try:
+            for _ in range(50):
+                if scheduler.get_active_requests_count() == 0:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertEqual(scheduler.get_active_requests_count(), 0)
+            self.assertNotIn(mock_req.request_id, scheduler.decode_queues[worker_id])
+        finally:
+            scheduler.is_running = False
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+    @patch(
+        "pace.server.router.scheduler.clear_concluded_request", new_callable=AsyncMock
+    )
+    async def test_cancelled_decode_request_is_cleaned_up(self, mock_clear_concluded):
+        """Cancelled decode requests should be finalized even without end_wait_time."""
+        scheduler = PrefillFirstScheduler("http://localhost:3000")
+        worker_id = 0
+
+        mock_req = Mock()
+        mock_req.request_id = "cancelled-decode"
+        mock_req.status = RequestStatus.PROCESSING
+        mock_req.assigned_engine_url = "http://localhost:3000"
+        mock_req.req_stats = {
+            "created_at": time.time(),
+            "prefill_finished_at": time.time(),
+            "finished_at": None,
+            "generated_tokens_count": 0,
+            "input_length": 3,
+            "end_wait_time": None,
+            "TTFT": None,
+            "TPOT": None,
+        }
+
+        scheduler.active_requests[mock_req.request_id] = mock_req
+        scheduler.decode_queues[worker_id][mock_req.request_id] = mock_req
+
+        await scheduler._clear_cancelled_request(
+            mock_req.request_id, AsyncMock(), worker_id
+        )
+        for _ in range(50):
+            if scheduler.get_active_requests_count() == 0:
+                break
+            await asyncio.sleep(0.01)
+
+        mock_clear_concluded.assert_awaited_once()
+        self.assertEqual(scheduler.get_active_requests_count(), 0)
+        self.assertNotIn(mock_req.request_id, scheduler.decode_queues[worker_id])
+        self.assertIsNotNone(mock_req.req_stats["finished_at"])
 
     async def test_decode_queue_management(self):
         """Test decode queue management specific to PrefillFirstScheduler (decode_queues per worker)."""

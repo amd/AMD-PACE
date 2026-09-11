@@ -8,9 +8,9 @@
 # Start vLLM or PACE server separately; benchmark only sends requests to it.
 #
 # Dependencies (used by main.py, SUT_PACE_async.py, dataset.py, evaluation.py, download_model.py):
-mlcommons-loadgen==5.1.0
-transformers==4.55.2
-numpy>=1.24
+mlcommons-loadgen==6.0.15
+transformers==5.12.1
+numpy>=2.5.0
 pandas
 aiohttp
 uvloop==0.22.1

@@ -62,7 +62,13 @@ curl -X POST "http://localhost:8000/config_server" \
     "modelConfig": {
       "modelId": "facebook/opt-6.7b",
       "dataType": "bf16",
-      "attnType": "dynamic"
+      "kvCacheType": "BMC",
+      "norm_backend": "NATIVE",
+      "qkv_projection_backend": "TPP",
+      "attention_backend": "JIT",
+      "out_projection_backend": "TPP",
+      "mlp_backend": "TPP",
+      "lm_head_backend": "NATIVE"
     }
   }'  | jq
 ```
@@ -146,6 +152,15 @@ curl -X POST "http://localhost:8000/step" \
 
 When a sequence finishes, `status` becomes `"COMPLETED"` and includes a `stop_reason` (`"stop"` or `"length"`).
 
+#### `POST /step_auto_mixed`
+**Purpose**: Execute active decodes and new or chunked prefills in one mixed
+forward pass. This is the internal endpoint used by the router's
+`continuous_batch` scheduler with `SLAB_POOL` or `PAGED` KV cache.
+
+The request contains a `prefill_batch` plus a `chunk_info_map` whose values are
+`[chunk_start, chunk_size]`. Existing decode sequences are taken from the
+engine's decode queue.
+
 ### 3. Inspection, Testing and Debugging
 
 #### `GET /get_sequences`
@@ -180,6 +195,14 @@ curl -X POST "http://localhost:8000/remove_sequence" \
 curl -X GET "http://localhost:8000/tokenizer_status"  | jq
 ```
 
+#### `GET /cache_stats`
+**Purpose**: Return KV-cache pool utilization and, when enabled, prefix-cache
+statistics.
+
+```bash
+curl -X GET "http://localhost:8000/cache_stats" | jq
+```
+
 ## Manual Testing with curl
 
 ### Complete Workflow Example
@@ -195,11 +218,13 @@ curl -X POST "http://localhost:8000/config_server" \
     "modelConfig": {
       "modelId": "facebook/opt-125m",
       "dataType": "float32",
-      "attnType": "dynamic"
-    },
-    "serveConfig": {
-      "serveType": "iterative",
-      "serveParams": {}
+      "kvCacheType": "BMC",
+      "norm_backend": "NATIVE",
+      "qkv_projection_backend": "TPP",
+      "attention_backend": "JIT",
+      "out_projection_backend": "TPP",
+      "mlp_backend": "TPP",
+      "lm_head_backend": "NATIVE"
     }
   }'  | jq
 
@@ -315,14 +340,22 @@ curl -X POST "http://localhost:8000/step" \
 
 ### Model Configuration
 - **modelId**: HuggingFace model identifier
-- **dataType**: Model precision (bf16, float32, float16)
-- **attnType**: Attention mechanism (dynamic, bmc)
+- **dataType**: Model precision (`bf16`/`bfloat16` or `fp32`/`float32`)
+- **kvCacheType**: `DYNAMIC`, `BMC`, `SLAB_POOL`, or `PAGED`
+- **norm_backend**: `NATIVE` or `JIT`
+- **qkv_projection_backend**: Linear backend for fused QKV projection
+- **attention_backend**: `JIT`, `NATIVE`, `SLAB`, or `PAGED`; finalized to match `kvCacheType`
+- **out_projection_backend**: Linear backend for attention output projection
+- **mlp_backend**: MLP or FusedMoE backend
+- **lm_head_backend**: Linear backend for the language-model head
+- **spec_config**: Optional PARD speculative-decoding configuration
+- **kv_cache_memory_gb**: Optional KV-cache memory budget
 
 ### Generation Configuration
-- **max_new_tokens**: Maximum tokens to generate (1-2048)
-- **temperature**: Sampling temperature (0.1-2.0)
-- **top_p**: Nucleus sampling parameter (0.1-1.0)
-- **top_k**: Top-k sampling parameter (1-100)
+- **max_new_tokens**: Maximum tokens to generate
+- **temperature**: Sampling temperature
+- **top_p**: Nucleus sampling parameter
+- **top_k**: Top-k sampling parameter
 - **repetition_penalty**: Multiplicative penalty on tokens in prompt+output (1.0 = disabled; >1.0 discourages repetition)
 - **frequency_penalty**: Additive penalty proportional to token count in output only (0.0 = disabled; >0.0 discourages repetition)
 - **do_sample**: Enable/disable sampling

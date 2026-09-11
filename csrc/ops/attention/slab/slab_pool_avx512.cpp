@@ -14,6 +14,7 @@
 #include <ops/attention/slab/dpbf16_kernels.h>
 #include <ops/attention/slab/slab_kernels.h>
 #include <ops/attention/slab/slab_pool.h>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
@@ -74,9 +75,32 @@ int64_t read_cpuid_cache_size(int index) {
 }
 #endif
 
+void check_pool_block_indices(
+    const std::vector<int64_t>& pool_block_indices,
+    int64_t total_blocks) {
+  for (int64_t idx : pool_block_indices) {
+    TORCH_CHECK(
+        idx >= 0 && idx < total_blocks,
+        "SlabPool: block index ",
+        idx,
+        " out of range [0, ",
+        total_blocks,
+        ")");
+  }
+}
+
 } // namespace
 
 int64_t autotune_block_size(int64_t num_kv_heads, int64_t head_dim) {
+  if (const char* env_block_size = std::getenv("SLAB_BLOCK_SIZE")) {
+    char* end = nullptr;
+    const int64_t block_size = std::strtoll(env_block_size, &end, 10);
+    TORCH_CHECK(
+        end != env_block_size && *end == '\0' && block_size > 0 &&
+            block_size <= 256 && block_size % 16 == 0,
+        "SLAB_BLOCK_SIZE must be a positive multiple of 16 no greater than 256");
+    return block_size;
+  }
   int64_t l2_size =
       read_sysfs_cache_size("/sys/devices/system/cpu/cpu0/cache/index2/size");
 #ifdef __x86_64__
@@ -104,6 +128,18 @@ SlabPool::SlabPool(
     int64_t num_kv_heads,
     int64_t head_dim,
     int64_t block_size) {
+  TORCH_CHECK(
+      total_blocks > 0,
+      "SlabPool: total_blocks=",
+      total_blocks,
+      " must be positive");
+  TORCH_CHECK(
+      num_kv_heads > 0,
+      "SlabPool: num_kv_heads=",
+      num_kv_heads,
+      " must be positive");
+  TORCH_CHECK(
+      head_dim > 0, "SlabPool: head_dim=", head_dim, " must be positive");
   TORCH_CHECK(
       block_size > 0 && block_size <= 256 && block_size % 16 == 0,
       "SlabPool: block_size=",
@@ -217,12 +253,15 @@ void SlabPool::remove_sequence(int64_t sequence_id) {
   {
     std::lock_guard<std::mutex> pool_lock(pool_mutex);
     for (int64_t block_idx : seq.block_indices) {
+      if (retained_blocks_.count(block_idx))
+        continue;
+      if (blocks[block_idx].sequence_id < 0)
+        continue; // already released while still referenced here
       blocks[block_idx].sequence_id = -1;
       blocks[block_idx].block_index = -1;
       free_list.push_back(block_idx);
+      allocated_blocks--;
     }
-
-    allocated_blocks -= static_cast<int64_t>(seq.block_indices.size());
   }
 
   sequences.erase(it);
@@ -255,14 +294,18 @@ void SlabPool::truncate_sequence(int64_t sequence_id, int64_t remove_len) {
   if (new_blocks_needed < old_blocks_needed) {
     std::lock_guard<std::mutex> pool_lock(pool_mutex);
 
+    int64_t actually_freed = 0;
     for (int64_t i = new_blocks_needed; i < old_blocks_needed; ++i) {
       int64_t block_idx = seq.block_indices[i];
+      if (retained_blocks_.count(block_idx))
+        continue;
       blocks[block_idx].sequence_id = -1;
       blocks[block_idx].block_index = -1;
       free_list.push_back(block_idx);
+      actually_freed++;
     }
 
-    allocated_blocks -= (old_blocks_needed - new_blocks_needed);
+    allocated_blocks -= actually_freed;
     seq.block_indices.resize(new_blocks_needed);
   }
 
@@ -292,6 +335,151 @@ int64_t SlabPool::allocate_block(int64_t sequence_id, int64_t block_index) {
   allocated_blocks++;
 
   return block_idx;
+}
+
+// Expose block indices for prefix caching
+std::vector<int64_t> SlabPool::get_block_indices(int64_t sequence_id) {
+  std::lock_guard<std::mutex> lock(sequence_mutex);
+  auto it = sequences.find(sequence_id);
+  TORCH_CHECK(
+      it != sequences.end(), "SlabPool: sequence ", sequence_id, " not found");
+  return it->second.block_indices;
+}
+
+// Eagerly allocate blocks without advancing seq_len; cache_update then reuses
+// the already-present block_indices instead of allocating fresh ones.
+void SlabPool::reserve_blocks(int64_t sequence_id, int64_t num_blocks) {
+  std::lock_guard<std::mutex> seq_lock(sequence_mutex);
+  auto it = sequences.find(sequence_id);
+  TORCH_CHECK(
+      it != sequences.end(), "SlabPool: sequence ", sequence_id, " not found");
+  SequenceState& seq = it->second;
+  while (static_cast<int64_t>(seq.block_indices.size()) < num_blocks) {
+    int64_t blk = static_cast<int64_t>(seq.block_indices.size());
+    seq.block_indices.push_back(allocate_block(sequence_id, blk));
+  }
+}
+
+// Zero-copy prefix assignment: reference existing pool blocks
+void SlabPool::assign_prefix_blocks(
+    int64_t dst_sequence_id,
+    const std::vector<int64_t>& pool_block_indices,
+    int64_t num_tokens) {
+  TORCH_CHECK(num_tokens > 0, "SlabPool: num_tokens must be > 0");
+  check_pool_block_indices(pool_block_indices, total_blocks);
+
+  std::lock_guard<std::mutex> seq_lock(sequence_mutex);
+  auto it = sequences.find(dst_sequence_id);
+  TORCH_CHECK(
+      it != sequences.end(),
+      "SlabPool: destination sequence ",
+      dst_sequence_id,
+      " not found");
+  SequenceState& dst = it->second;
+  TORCH_CHECK(
+      dst.seq_len == 0,
+      "SlabPool: assign_prefix_blocks requires empty destination (seq_len=0)");
+  TORCH_CHECK(
+      num_tokens <= dst.max_seq_len,
+      "SlabPool: num_tokens ",
+      num_tokens,
+      " exceeds destination max_seq_len ",
+      dst.max_seq_len);
+
+  const int64_t bsize = this->block_size;
+  const int64_t needed_blocks = (num_tokens + bsize - 1) / bsize;
+  TORCH_CHECK(
+      static_cast<int64_t>(pool_block_indices.size()) >= needed_blocks,
+      "SlabPool: not enough source blocks (",
+      pool_block_indices.size(),
+      ") to cover ",
+      num_tokens,
+      " tokens");
+
+  {
+    std::lock_guard<std::mutex> pool_lock(pool_mutex);
+    std::unordered_set<int64_t> unique_blocks;
+    for (int64_t i = 0; i < needed_blocks; ++i) {
+      const int64_t block = pool_block_indices[i];
+      TORCH_CHECK(
+          blocks[block].sequence_id >= 0,
+          "SlabPool: prefix source block ",
+          block,
+          " is not allocated");
+      TORCH_CHECK(
+          retained_blocks_.count(block) > 0,
+          "SlabPool: prefix source block ",
+          block,
+          " is not retained");
+      TORCH_CHECK(
+          unique_blocks.insert(block).second,
+          "SlabPool: duplicate prefix source block ",
+          block);
+    }
+    dst.block_indices.assign(
+        pool_block_indices.begin(), pool_block_indices.begin() + needed_blocks);
+    for (int64_t i = 0; i < needed_blocks; ++i) {
+      const int64_t block = pool_block_indices[i];
+      blocks[block].sequence_id = dst_sequence_id;
+      blocks[block].block_index = i;
+    }
+  }
+
+  dst.seq_len = num_tokens;
+}
+
+// Repoint one logical block of a sequence at another physical pool block.
+void SlabPool::reassign_block(
+    int64_t sequence_id,
+    int64_t block_pos,
+    int64_t new_pool_block) {
+  std::lock_guard<std::mutex> seq_lock(sequence_mutex);
+  auto it = sequences.find(sequence_id);
+  TORCH_CHECK(
+      it != sequences.end(), "SlabPool: sequence ", sequence_id, " not found");
+  SequenceState& seq = it->second;
+  TORCH_CHECK(
+      block_pos >= 0 &&
+          block_pos < static_cast<int64_t>(seq.block_indices.size()),
+      "SlabPool: reassign_block block_pos out of range");
+  TORCH_CHECK(
+      new_pool_block >= 0 && new_pool_block < total_blocks,
+      "SlabPool: reassign_block new_pool_block out of range");
+  seq.block_indices[block_pos] = new_pool_block;
+}
+
+// Mark blocks as retained (not freed on remove_sequence)
+int64_t SlabPool::retain_blocks(
+    const std::vector<int64_t>& pool_block_indices) {
+  check_pool_block_indices(pool_block_indices, total_blocks);
+  std::lock_guard<std::mutex> lock(pool_mutex);
+  for (int64_t idx : pool_block_indices) {
+    TORCH_CHECK(
+        blocks[idx].sequence_id >= 0,
+        "SlabPool: cannot retain unallocated block ",
+        idx);
+  }
+  int64_t newly_retained = 0;
+  for (int64_t idx : pool_block_indices) {
+    if (retained_blocks_.insert(idx).second)
+      ++newly_retained;
+  }
+  return newly_retained;
+}
+
+// Release previously retained blocks
+void SlabPool::release_retained_blocks(
+    const std::vector<int64_t>& pool_block_indices) {
+  check_pool_block_indices(pool_block_indices, total_blocks);
+  std::lock_guard<std::mutex> lock(pool_mutex);
+  for (int64_t idx : pool_block_indices) {
+    if (retained_blocks_.erase(idx)) {
+      blocks[idx].sequence_id = -1;
+      blocks[idx].block_index = -1;
+      free_list.push_back(idx);
+      allocated_blocks--;
+    }
+  }
 }
 
 // Unified Cache Update -- handles 3D [T, KV, D] and 4D [B, S, KV, D]

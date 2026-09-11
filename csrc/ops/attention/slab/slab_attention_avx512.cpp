@@ -69,7 +69,8 @@ at::Tensor SlabPool::attention(
     const std::vector<int64_t>& q_start_offsets,
     double scale,
     int64_t sliding_window,
-    const at::Tensor& sinks) {
+    const at::Tensor& sinks,
+    int64_t chunk_size) {
   // 4D [B, S, H, D] -> flat reshape with per-sequence offsets
   if (query.dim() == 4) {
     const int64_t B = query.size(0), S = query.size(1);
@@ -101,7 +102,8 @@ at::Tensor SlabPool::attention(
         offsets,
         scale,
         sliding_window,
-        sinks);
+        sinks,
+        chunk_size);
     return out.reshape({B, S, H, D});
   }
 
@@ -176,18 +178,20 @@ at::Tensor SlabPool::attention(
       } else {
         const bool prefer_gqa = gqa_items >= num_threads / 2;
 
-        if (prefer_gqa && gqa_items < num_threads &&
-            num_blocks_i >= max_splits) {
+        if (gqa_items < num_threads && num_blocks_i >= max_splits) {
           int64_t sp = std::min(
-              (num_threads + gqa_items - 1) / std::max(gqa_items, int64_t(1)),
+              num_threads / std::max(gqa_items, int64_t(1)),
               std::min(num_blocks_i, max_splits));
           if (sp >= 4) {
             si.type = SeqType::DECODE_SPLITK;
             si.num_splits = sp;
             si.n_work = num_kv * sp;
-          } else {
+          } else if (prefer_gqa) {
             si.type = SeqType::DECODE_GQA;
             si.n_work = num_kv;
+          } else {
+            si.type = SeqType::DECODE_HEAD;
+            si.n_work = num_q_heads;
           }
         } else if (prefer_gqa) {
           si.type = SeqType::DECODE_GQA;
@@ -231,6 +235,7 @@ at::Tensor SlabPool::attention(
   ctx.token_stride = num_q_heads * head_dim;
   ctx.scale_f = static_cast<float>(scale);
   ctx.sliding_window = sliding_window;
+  ctx.chunk_size = chunk_size;
   ctx.has_sinks = has_sinks;
   ctx.sinks_ptr = has_sinks ? sinks.data_ptr<float>() : nullptr;
 
@@ -438,8 +443,12 @@ at::Tensor SlabPool::attention(
       for (int64_t kv_h = 0; kv_h < num_kv; ++kv_h) {
         const int64_t first_qh = kv_h * n_rep;
         at::BFloat16* o_ptrs[SLAB_MAX_REP];
-        for (int64_t r = 0; r < n_rep; ++r)
+        float rep_sink_biases[SLAB_MAX_REP] = {};
+        for (int64_t r = 0; r < n_rep; ++r) {
           o_ptrs[r] = o_seq + (first_qh + r) * head_dim;
+          if (ctx.has_sinks)
+            rep_sink_biases[r] = ctx.sinks_ptr[first_qh + r];
+        }
 
         int64_t pbase = splitk_base[i] + kv_h * si.num_splits * n_rep;
 
@@ -448,6 +457,7 @@ at::Tensor SlabPool::attention(
             si.num_splits,
             n_rep,
             head_dim,
+            ctx.has_sinks ? rep_sink_biases : nullptr,
             o_ptrs);
       }
     }

@@ -16,7 +16,6 @@
 
 #include <core/logging.h>
 #include <core/threading.h>
-#include <graph/register.h>
 
 namespace pace {
 namespace {
@@ -30,18 +29,10 @@ void log_op(int64_t level, const std::string& message) {
   pace_logger(level, message);
 }
 
-void enable_fusion_op(bool enabled) {
-  PACEPassOptimize::enable_pace_fusion(enabled);
-}
-
 } // namespace
 } // namespace pace
 
-// `m.def(schema, fn)` registers a CompositeImplicitAutograd implementation,
-// which is the right choice for tensor-free utility ops -- the dispatcher
-// can't pick a backend by tensor argument because there are none.
 TORCH_LIBRARY_FRAGMENT(pace, m) {
   m.def("thread_bind(int[] cores) -> ()", &pace::thread_bind_op);
   m.def("log(int level, str message) -> ()", &pace::log_op);
-  m.def("enable_fusion(bool enabled) -> ()", &pace::enable_fusion_op);
 }

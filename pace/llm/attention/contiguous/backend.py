@@ -15,6 +15,7 @@ from pace.llm.attention.base import (
     AttentionBackend,
     AttentionBackendType,
 )
+from pace.utils.logging import PACE_LLM_ASSERT
 
 
 class MaskCache:
@@ -55,6 +56,7 @@ class MaskCache:
         sliding_window: int = 0,
         leading_pad: Optional[torch.Tensor] = None,
         owner: str = "",
+        chunk_size: int = 0,
     ) -> torch.Tensor:
         """Return a ``[bs, 1, q_len, kv_len]`` additive causal mask.
 
@@ -72,7 +74,7 @@ class MaskCache:
         shape = (bs, 1, q_len, kv_len)
         pool_key = (shape, dtype, owner)
         pad_tuple = tuple(leading_pad.tolist()) if leading_pad is not None else ()
-        content_key = (seq_len, sliding_window, pad_tuple)
+        content_key = (seq_len, sliding_window, chunk_size, pad_tuple)
         min_val = torch.finfo(dtype).min
 
         entry = MaskCache._pool.get(pool_key)
@@ -96,6 +98,27 @@ class MaskCache:
             dist = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
             outside = (dist < 0) | (dist >= sliding_window)
             buf.masked_fill_(outside.unsqueeze(0).unsqueeze(0), min_val)
+
+        # Chunked (local) attention: q attends only within its own chunk,
+        # floor(q / C) == floor(k / C). Chunks are defined on model positions
+        # (physical_index - leading_pad), so the pad is subtracted first.
+        if chunk_size > 0:
+            if leading_pad is not None:
+                q_phys = torch.arange(kv_len - q_len, kv_len)
+                k_phys = torch.arange(kv_len)
+                pad = leading_pad.reshape(bs, 1, 1)
+                q_chunk = (q_phys.reshape(1, q_len, 1) - pad) // chunk_size
+                k_chunk = (k_phys.reshape(1, 1, kv_len) - pad) // chunk_size
+                diff_chunk = q_chunk != k_chunk
+                buf.masked_fill_(diff_chunk.unsqueeze(1), min_val)
+            else:
+                q_phys = torch.arange(kv_len - q_len, kv_len)
+                k_phys = torch.arange(kv_len)
+                diff_chunk = (
+                    q_phys.unsqueeze(1) // chunk_size
+                    != k_phys.unsqueeze(0) // chunk_size
+                )
+                buf.masked_fill_(diff_chunk.unsqueeze(0).unsqueeze(0), min_val)
 
         # Leading pad
         if leading_pad is not None and (leading_pad > 0).any():
@@ -247,14 +270,17 @@ class ContiguousAttentionBackend(AttentionBackend):
         attn_backend: AttentionBackendType,
         sliding_window: int = 0,
         sinks: Optional[torch.Tensor] = None,
+        chunk_size: int = 0,
     ):
         super().__init__()
         use_gqa = num_heads != num_kv_heads
         self._use_jit = attn_backend == AttentionBackendType.JIT
         self._has_sliding = sliding_window is not None and sliding_window > 0
+        self._has_chunk = chunk_size is not None and chunk_size > 0
         self._has_sinks = sinks is not None
         self.sinks = sinks
         self.sliding_window = sliding_window if self._has_sliding else 0
+        self.chunk_size = chunk_size if self._has_chunk else 0
         self._mask_cache = MaskCache()
 
         if self._use_jit:
@@ -294,28 +320,45 @@ class ContiguousAttentionBackend(AttentionBackend):
         needs_mask = (
             has_pad
             or self._has_sliding
+            or self._has_chunk
             or self._has_sinks
-            or (q_len > 1 and self._use_jit)
+            or (q_len > 1 and (self._use_jit or kv_len > q_len))
         )
         if not needs_mask:
             return None
 
         lp = leading_pad if has_leading_pad else None
         return self._mask_cache.get(
-            bs, q_len, kv_len, seq_len, Q.dtype, self.sliding_window, lp, owner
+            bs,
+            q_len,
+            kv_len,
+            seq_len,
+            Q.dtype,
+            self.sliding_window,
+            lp,
+            owner,
+            chunk_size=self.chunk_size,
         )
 
     # Forward
     def forward(self, Q, K, V, kv_cache, positions, **kwargs):
         Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
+        PACE_LLM_ASSERT(
+            (K is None) == (V is None),
+            "ContiguousAttentionBackend: K and V must both be provided or both "
+            "be None (None only for a layer that reuses another layer's KV).",
+        )
+        if K is not None and V is not None:
+            K = K.transpose(1, 2)
+            V = V.transpose(1, 2)
 
         if isinstance(kv_cache, list):
             out = self._forward_list(Q, K, V, kv_cache, positions)
         else:
             K, V = kv_cache.update_cache(K, V, concat_dim=2)
-            if _can_use_brgemm_prefill(Q, K, self.sinks, self.sliding_window):
+            if not self._has_chunk and _can_use_brgemm_prefill(
+                Q, K, self.sinks, self.sliding_window
+            ):
                 real_len = kv_cache.seq_len
                 q_offsets, q_lens = _extract_seq_ranges(positions, Q.size(2))
                 out = torch.ops.pace.prefill_attention(
@@ -345,8 +388,8 @@ class ContiguousAttentionBackend(AttentionBackend):
         bsz = Q.shape[0]
         Q_list, K_list, V_list, mask_list = [], [], [], []
         for i in range(bsz):
-            seq_k = K[i : i + 1]
-            seq_v = V[i : i + 1]
+            seq_k = None if K is None else K[i : i + 1]
+            seq_v = None if V is None else V[i : i + 1]
             seq_k, seq_v = kv_cache_list[i].update_cache(seq_k, seq_v, concat_dim=2)
 
             lp = _compute_pad_lens(positions[i : i + 1], kv_cache_list[i].seq_len)

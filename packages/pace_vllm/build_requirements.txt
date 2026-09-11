@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl
-cmake==3.31.6
-ninja>=1.11
-setuptools>=77.0.3
-setuptools-scm>=8.1
+https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl
+cmake==4.4.0
+ninja>=1.13.0
+setuptools>=77.0.3,<81.0.0
+setuptools-scm>=10.2.0

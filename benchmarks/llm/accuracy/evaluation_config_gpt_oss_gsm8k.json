@@ -1,0 +1,33 @@
+{
+    "model_args": {
+        "model_name": "openai/gpt-oss-20b",
+        "tokenizer_name": "openai/gpt-oss-20b",
+        "dtype": "bf16",
+        "llm_operators": {
+            "Norm": "JIT",
+            "QKVProjection": "TPP",
+            "Attention": "SLAB",
+            "OutProjection": "TPP",
+            "MLP": "TPP",
+            "LMHead": "TPP"
+        },
+        "spec_config": null
+    },
+    "generation_args": {
+        "batch_size": 1,
+        "kv_cache_type": "SLAB_POOL",
+        "think_end_token": "<|channel|>final<|message|>",
+        "apply_chat_template": true,
+        "fewshot_as_multiturn": false,
+        "system_instruction": "After your reasoning, you must conclude your final numerical answer with exactly: #### <answer>"
+    },
+    "tasks": [
+        {
+            "task_name": "gsm8k",
+            "num_fewshot": 8,
+            "limit": 1
+        }
+    ],
+    "verbose": true,
+    "output_dir": "./evaluation_results"
+}

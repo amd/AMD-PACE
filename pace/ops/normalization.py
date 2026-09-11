@@ -137,6 +137,38 @@ class RMSNorm(OperatorBase):
         )
 
 
+class L2Norm(OperatorBase):
+    """Weightless L2 (RMS) normalization over the last dimension.
+
+    Rescales ``x`` by its root-mean-square with no learnable weight:
+
+        x * rsqrt(mean(x**2, dim=-1) + eps)
+
+    This is the query/key normalization used by Llama4 on its RoPE layers
+    (HF ``Llama4TextL2Norm``) and, unlike :class:`RMSNorm`, carries no affine
+    parameter.
+    """
+
+    @property
+    def operator_type(self):
+        return OperatorType.L2NORM
+
+    def __init__(
+        self,
+        eps: float = 1e-6,
+        dtype: Optional[DataType] = None,
+        backend_impl: BackendType = BackendType.NATIVE,
+    ):
+        self.eps = eps
+        super().__init__(backend_impl=backend_impl, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backend.execute(x, self.eps)
+
+    def extra_repr(self):
+        return f"eps={self.eps}, dtype={self.dtype}, backend_impl={self.backend}"
+
+
 class Gemma3RMSNorm(RMSNorm):
     """
     RMS Normalization variant for Gemma 3 that uses (1 + weight) scaling.

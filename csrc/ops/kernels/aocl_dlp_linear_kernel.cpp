@@ -256,6 +256,9 @@ void aocl_dlp_matmul_bf16(
   // Create metadata for post-ops and bias
   dlp_metadata_t* postop_metadata =
       create_postop_metadata(post_op, M, N, bias, mul_input);
+  dlp_metadata_t default_metadata{};
+  dlp_metadata_t* gemm_metadata =
+      postop_metadata != nullptr ? postop_metadata : &default_metadata;
 
   // Fail fast if bias/post-ops were requested but metadata allocation failed
   if (bias != nullptr || post_op != PostOpType::NONE) {
@@ -283,10 +286,15 @@ void aocl_dlp_matmul_bf16(
       beta,
       C,
       ldc,
-      postop_metadata);
+      gemm_metadata);
 
   // Cleanup
+  const auto error_code = gemm_metadata->error_hndl.error_code;
   free_postop_metadata(postop_metadata);
+  TORCH_CHECK(
+      error_code == DLP_CLSC_SUCCESS,
+      "pace::aocl_dlp_matmul_bf16: AOCL-DLP GEMM failed with error code ",
+      static_cast<int>(error_code));
 }
 
 size_t aocl_dlp_reshape_bf16_buf_size(
@@ -295,8 +303,13 @@ size_t aocl_dlp_reshape_bf16_buf_size(
     char matrix_type,
     unsigned int M,
     unsigned int N) {
+  dlp_metadata_t metadata{};
   msz_t reorder_buffer_size = aocl_get_reorder_buf_size_bf16bf16f32of32(
-      order, trans, matrix_type, M, N, NULL);
+      order, trans, matrix_type, M, N, &metadata);
+  TORCH_CHECK(
+      metadata.error_hndl.error_code == DLP_CLSC_SUCCESS,
+      "pace::aocl_dlp_reshape_bf16_buf_size: AOCL-DLP failed with error code ",
+      static_cast<int>(metadata.error_hndl.error_code));
   return static_cast<size_t>(reorder_buffer_size);
 }
 
@@ -311,6 +324,11 @@ void aocl_dlp_reshape_bf16(
     char matrix_type) {
   // Caller must allocate output with at least aocl_dlp_reshape_bf16_buf_size
   // bytes
+  dlp_metadata_t metadata{};
   aocl_reorder_bf16bf16f32of32(
-      order, trans, matrix_type, input, output, M, N, ld, NULL);
+      order, trans, matrix_type, input, output, M, N, ld, &metadata);
+  TORCH_CHECK(
+      metadata.error_hndl.error_code == DLP_CLSC_SUCCESS,
+      "pace::aocl_dlp_reshape_bf16: AOCL-DLP failed with error code ",
+      static_cast<int>(metadata.error_hndl.error_code));
 }

@@ -3,7 +3,7 @@
 # All rights reserved.
 # ******************************************************************************
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, conlist, model_validator
 from typing import List, Union, Optional
 from typing import Dict, Any
 
@@ -11,19 +11,62 @@ from uuid import UUID
 import torch
 
 
+class PrefillItem(BaseModel):
+    """A single prefill entry. Reused by ``/step`` and ``/step_auto_mixed``."""
+
+    req_id: str
+    prompt: List[int] = Field(default_factory=list)
+    generation_config: Optional[Dict[str, Any]] = None
+    is_prefill: bool = True
+
+    class Config:
+        extra = "ignore"
+
+
 class PrefillRequest(BaseModel):
-    prompt: List[int] = Field(
-        ..., min_length=1, description="Pre-tokenized prompt as a list of token IDs"
-    )
-    request_id: Union[str, UUID, int] = Field(
-        ..., description="Unique request identifier"
-    )
-    gen_config: Dict[str, Any] = Field(
-        default_factory=dict, description="Generation configuration parameters"
-    )
+    """Internal engine prefill interface (used by ``ModelExecutor.prefill``)."""
+
+    prompt: List[int] = Field(..., min_length=1)
+    request_id: Union[str, UUID]
+    gen_config: Dict[str, Any] = Field(default_factory=dict)
 
     class Config:
         extra = "forbid"
+
+
+class StepRequest(BaseModel):
+    """Schema for ``POST /step``."""
+
+    is_decode: bool = False
+    prefill_batch: Optional[List[PrefillItem]] = None
+
+    class Config:
+        extra = "ignore"
+
+
+class MixedStepRequest(BaseModel):
+    """Schema for ``POST /step_auto_mixed``."""
+
+    prefill_batch: List[PrefillItem] = Field(default_factory=list)
+    chunk_info_map: Dict[str, conlist(int, min_length=2, max_length=2)] = Field(
+        default_factory=dict
+    )
+
+    class Config:
+        extra = "ignore"
+
+    @model_validator(mode="after")
+    def _validate_chunks(self) -> "MixedStepRequest":
+        for rid, (start, size) in self.chunk_info_map.items():
+            if start < 0:
+                raise ValueError(
+                    f"chunk_info_map[{rid}]: chunk_start must be >= 0 (got {start})"
+                )
+            if size <= 0:
+                raise ValueError(
+                    f"chunk_info_map[{rid}]: chunk_size must be > 0 (got {size})"
+                )
+        return self
 
 
 class ModelConfig(BaseModel):
@@ -31,10 +74,10 @@ class ModelConfig(BaseModel):
 
     modelId: str
     dataType: str = "bf16"
-    kvCacheType: str = "BMC"
+    kvCacheType: str = "SLAB_POOL"
     norm_backend: str = "NATIVE"
     qkv_projection_backend: str = "TPP"
-    attention_backend: str = "JIT"
+    attention_backend: str = "SLAB"
     out_projection_backend: str = "TPP"
     mlp_backend: str = "TPP"
     lm_head_backend: str = "NATIVE"

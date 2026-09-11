@@ -10,15 +10,37 @@ All text <-> token-ID conversion lives here.  The engine operates
 exclusively on token IDs; the router owns encode, decode, and
 stop-string detection.
 
-Similar to vLLM's ``vllm/entrypoints/serve/tokenize/`` package, but
-kept as a single utility module since PACE does not expose separate
+Kept as a single utility module since PACE does not expose separate
 ``/tokenize`` or ``/detokenize`` HTTP endpoints.
 """
 
 from typing import List, Optional, Union
 
-
 _tokenizer = None
+
+
+class NoChatTemplateError(ValueError):
+    """Raised when the tokenizer has no chat template configured.
+
+    Distinct from generic rendering errors so callers can return a precise
+    ``no_chat_template`` response instead of conflating a missing template with
+    malformed ``messages`` input.
+    """
+
+
+# Keys that control tokenization and output shape.  Allowing a client to
+# override these via ``chat_template_kwargs`` could make ``apply_chat_template``
+# return a string or dict (or raise ``TypeError`` for a duplicate keyword),
+# instead of the flat list of token IDs the scheduler/detokenizer expect.
+_RESERVED_TEMPLATE_KWARGS = frozenset(
+    {
+        "tokenize",
+        "add_generation_prompt",
+        "return_dict",
+        "return_tensors",
+        "return_assistant_tokens_mask",
+    }
+)
 
 
 def init_tokenizer(tokenizer) -> None:
@@ -77,6 +99,74 @@ def decode_token_ids(
     if tok is None:
         raise RuntimeError("Tokenizer not initialized. Call init_tokenizer() first.")
     return tok.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+
+def decode_logprobs_step(step: dict, tokenizer=None):
+    """Detokenize a *numeric* engine logprobs step into decoded strings.
+
+    The engine emits token IDs and ``[token_id, logprob]`` top-k pairs; this
+    performs the router-native detokenization (single source of truth, same
+    tokenizer/settings as the response text) and returns parallel lists::
+
+        (tokens, token_logprobs, top_logprobs)
+
+    ``text_offset`` is intentionally left to the caller, since it depends on
+    accumulated/emitted text (non-streaming counts from 0; streaming anchors
+    to the emitted-text length).
+    """
+    token_ids = step.get("token_ids", [])
+    token_logprobs = list(step.get("token_logprobs", []))
+    raw_top = step.get("top_logprobs", [])
+
+    tokens = [decode_token_ids([tid], tokenizer=tokenizer) for tid in token_ids]
+    top_logprobs = []
+    for top in raw_top:
+        top_map = {}
+        for cand_id, logprob in top:
+            top_map[decode_token_ids([int(cand_id)], tokenizer=tokenizer)] = logprob
+        top_logprobs.append(top_map)
+    return tokens, token_logprobs, top_logprobs
+
+
+def render_chat_prompt(
+    messages: List[dict],
+    add_generation_prompt: bool = True,
+    chat_template_kwargs: Optional[dict] = None,
+    tokenizer=None,
+) -> List[int]:
+    """Render chat ``messages`` into prompt token IDs via the model's template.
+
+    ``messages`` is a list of ``{"role", "content"}`` dicts. Returns the
+    tokenized prompt, with a generation prompt appended when
+    ``add_generation_prompt`` is set so the model continues as the assistant.
+
+    Raises ``NoChatTemplateError`` if the tokenizer has no chat template;
+    callers should surface this as a 400 (the client should use
+    ``/v1/completions`` instead).  Reserved template controls (``tokenize``,
+    ``add_generation_prompt``, etc.) in ``chat_template_kwargs`` are dropped so
+    the router always receives token IDs.
+    """
+    tok = tokenizer or _tokenizer
+    if tok is None:
+        raise RuntimeError("Tokenizer not initialized. Call init_tokenizer() first.")
+    if getattr(tok, "chat_template", None) is None:
+        raise NoChatTemplateError("model has no chat template; use /v1/completions")
+    extra = {
+        k: v
+        for k, v in (chat_template_kwargs or {}).items()
+        if k not in _RESERVED_TEMPLATE_KWARGS
+    }
+    rendered = tok.apply_chat_template(
+        messages,
+        add_generation_prompt=add_generation_prompt,
+        tokenize=True,
+        return_dict=True,
+        **extra,
+    )
+    input_ids = rendered["input_ids"]
+    if input_ids and isinstance(input_ids[0], (list, tuple)):
+        input_ids = input_ids[0]
+    return [int(t) for t in input_ids]
 
 
 def check_stop_strings(

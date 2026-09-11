@@ -356,27 +356,37 @@ void libxsmmlinear_kernel(
     auto loop_scheme = PACE_GEMM_LOOP_SCHEME;
     auto igemm_loop =
         ThreadedLoop<3>({{0, Nc, Ncb, false}, {0, BS, BSb}, {Nk}}, loop_scheme);
-    igemm_loop([&](int* ind) {
-      int nc = ind[0], s1 = ind[1], nk = ind[2];
-      auto count = nc + Ncb < Nc ? Ncb : Nc - nc;
-      bool is_rem = (s1 + BSb > BS);
-      auto& brg = is_rem ? tpps.brgemm_rem : tpps.brgemm;
+    igemm_loop(
+        [&](int* ind) {
+          int nc = ind[0], s1 = ind[1], nk = ind[2];
+          auto count = nc + Ncb < Nc ? Ncb : Nc - nc;
+          bool is_rem = (s1 + BSb > BS);
+          auto& brg = is_rem ? tpps.brgemm_rem : tpps.brgemm;
 
-      if (nc == 0) {
-        if (with_bias) {
-          auto& cb = is_rem ? tpps.copy_bias_rem : tpps.copy_bias;
-          cb(bias[nk], out[s1][nk]);
-        } else {
-          auto& z = is_rem ? tpps.zero_rem : tpps.zero;
-          z(out[s1][nk]);
-        }
-      }
-      brg(in[s1][nc], wt_V[nk][nc], out[s1][nk], count, !is_rem);
-      if (!(nc + Ncb < Nc)) {
-        auto& act = impl::LinearActSelector<ActivationTPP>::get(tpps, is_rem);
-        apply_activation<ActivationTPP>(act, in1[s1][nk], out[s1][nk]);
-      }
-    });
+          if (nc == 0) {
+            if (with_bias) {
+              auto& cb = is_rem ? tpps.copy_bias_rem : tpps.copy_bias;
+              cb(bias[nk], out[s1][nk]);
+            } else {
+              auto& z = is_rem ? tpps.zero_rem : tpps.zero;
+              z(out[s1][nk]);
+            }
+          }
+          brg(in[s1][nc], wt_V[nk][nc], out[s1][nk], count, !is_rem);
+          // Remainder BRGEMM is self-contained; restore the main tile config.
+          if (is_rem) {
+            tpps.brgemm.config();
+          }
+          if (!(nc + Ncb < Nc)) {
+            auto& act =
+                impl::LinearActSelector<ActivationTPP>::get(tpps, is_rem);
+            apply_activation<ActivationTPP>(act, in1[s1][nk], out[s1][nk]);
+          }
+        },
+        // Set up the AMX tile config once per worker thread; without it the
+        // no-tile-config main-block BRGEMM SIGILLs on AMX. No-op on non-AMX.
+        [&]() { tpps.brgemm.config(); },
+        [&]() { tpps.brgemm.release(); });
   }
 }
 
@@ -485,6 +495,9 @@ at::Tensor fused_mlp_kernel(
     DataType* tile_a = tile_buf_ptr + tid * (gated ? 2L : 1L) * tile_elems;
     DataType* tile_b = gated ? tile_a + tile_elems : nullptr;
 
+    // Per-thread AMX tile config for the gate/up GEMM (see linear kernel).
+    tpps.brgemm_gu.config();
+
     // Phase 1: gate + up projections, activation, element-wise multiply
     for (int tile = tile_start; tile < tile_end; tile++) {
       int nk = tile / BS_blocks;
@@ -516,6 +529,10 @@ at::Tensor fused_mlp_kernel(
           auto& brg = is_rem ? tpps.brgemm_gu_rem : tpps.brgemm_gu;
           brg(in[s1][0], wt_nk, tile, Nc, !is_rem);
         }
+        // Remainder BRGEMM is self-contained; restore the gate/up tile config.
+        if (is_rem) {
+          tpps.brgemm_gu.config();
+        }
       };
 
       if (gated) {
@@ -543,7 +560,12 @@ at::Tensor fused_mlp_kernel(
       cp(tile_a, inter[s1][nk]);
     }
 
+    tpps.brgemm_gu.release();
+
 #pragma omp barrier
+
+    // Down GEMM has a different shape, so it needs its own tile config.
+    tpps.brgemm_down.config();
 
     // Phase 2: down projection with L2-aware sub-batching
     for (long nc_d = 0; nc_d < Nc_d; nc_d += Ncb_d) {
@@ -573,9 +595,15 @@ at::Tensor fused_mlp_kernel(
               out[s1][nk_d],
               count_d,
               !is_rem);
+          // Remainder BRGEMM is self-contained; restore the down tile config.
+          if (is_rem) {
+            tpps.brgemm_down.config();
+          }
         }
       }
     }
+
+    tpps.brgemm_down.release();
   }
 
   return t_out;

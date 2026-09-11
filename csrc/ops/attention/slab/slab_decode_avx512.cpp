@@ -36,19 +36,15 @@ void decode_one_head(
   float sum_exp = 0.0f;
 
   // Sink: prepend a virtual score before softmax
-  if (sink_bias != 0.0f) {
+  if (ctx.has_sinks) {
     max_score = sink_bias;
     sum_exp = 1.0f;
   }
 
-  // Sliding window: skip blocks entirely before the window
-  int64_t start_blk = 0;
-  if (ctx.sliding_window > 0 && seq_len > ctx.sliding_window) {
-    start_blk =
-        std::max(int64_t(0), (seq_len - ctx.sliding_window) / ctx.blk_size);
-  }
-
   const int64_t q_pos = seq_len - 1;
+  // Skip blocks entirely before the visible window (sliding + chunked).
+  const int64_t vis_start = kv_visible_start(ctx, q_pos);
+  const int64_t start_blk = vis_start / ctx.blk_size;
 
   for (int64_t blk_idx = start_blk; blk_idx < num_blocks; ++blk_idx) {
     const int64_t pool_blk = block_indices[blk_idx];
@@ -72,7 +68,7 @@ void decode_one_head(
     float block_max = -std::numeric_limits<float>::infinity();
     for (int64_t t = 0; t < tokens_in_blk; ++t) {
       const int64_t kv_pos = blk_idx * ctx.blk_size + t;
-      if (ctx.sliding_window > 0 && q_pos - kv_pos >= ctx.sliding_window) {
+      if (kv_pos < vis_start) {
         block_scores[t] = -std::numeric_limits<float>::infinity();
         continue;
       }
@@ -169,19 +165,15 @@ void decode_gqa_group(
     std::fill(output_fp32[r], output_fp32[r] + ctx.head_dim, 0.0f);
     max_score[r] = -std::numeric_limits<float>::infinity();
     sum_exp[r] = 0.0f;
-    if (sink_biases && sink_biases[r] != 0.0f) {
+    if (sink_biases) {
       max_score[r] = sink_biases[r];
       sum_exp[r] = 1.0f;
     }
   }
 
-  int64_t start_blk = 0;
-  if (ctx.sliding_window > 0 && seq_len > ctx.sliding_window) {
-    start_blk =
-        std::max(int64_t(0), (seq_len - ctx.sliding_window) / ctx.blk_size);
-  }
-
   const int64_t q_pos = seq_len - 1;
+  const int64_t vis_start = kv_visible_start(ctx, q_pos);
+  const int64_t start_blk = vis_start / ctx.blk_size;
 
   for (int64_t blk_idx = start_blk; blk_idx < num_blocks; ++blk_idx) {
     const int64_t pool_blk = block_indices[blk_idx];
@@ -207,7 +199,7 @@ void decode_gqa_group(
       float blk_max = -std::numeric_limits<float>::infinity();
       for (int64_t t = 0; t < tokens_in_blk; ++t) {
         const int64_t kv_pos = blk_idx * ctx.blk_size + t;
-        if (ctx.sliding_window > 0 && q_pos - kv_pos >= ctx.sliding_window) {
+        if (kv_pos < vis_start) {
           block_scores[r][t] = -std::numeric_limits<float>::infinity();
           continue;
         }
@@ -295,6 +287,7 @@ void decode_gqa_group_partial(
     int64_t blk_end,
     PartialSoftmax* partials) {
   const int64_t q_pos = seq_len - 1;
+  const int64_t vis_start = kv_visible_start(ctx, q_pos);
   const int64_t num_blocks = (seq_len + ctx.blk_size - 1) / ctx.blk_size;
 
   for (int64_t r = 0; r < n_rep; ++r) {
@@ -329,7 +322,7 @@ void decode_gqa_group_partial(
       float blk_max = -std::numeric_limits<float>::infinity();
       for (int64_t t = 0; t < tokens_in_blk; ++t) {
         const int64_t kv_pos = blk_idx * ctx.blk_size + t;
-        if (ctx.sliding_window > 0 && q_pos - kv_pos >= ctx.sliding_window) {
+        if (kv_pos < vis_start) {
           block_scores_buf[r][t] = -std::numeric_limits<float>::infinity();
           continue;
         }
@@ -392,11 +385,14 @@ void reduce_gqa_partials(
     int64_t num_splits,
     int64_t n_rep,
     int64_t head_dim,
+    const float* sink_biases,
     at::BFloat16* const* out_ptrs) {
   for (int64_t r = 0; r < n_rep; ++r) {
     float max_score = -std::numeric_limits<float>::infinity();
     for (int64_t s = 0; s < num_splits; ++s)
       max_score = std::max(max_score, partials[s * n_rep + r].max_score);
+    if (sink_biases)
+      max_score = std::max(max_score, sink_biases[r]);
 
     float sum_exp = 0.0f;
     float output_fp32[512];
@@ -418,6 +414,11 @@ void reduce_gqa_partials(
       }
       for (; d < head_dim; ++d)
         output_fp32[d] += corr * p.output_fp32[d];
+    }
+    if (sink_biases) {
+      float sink_exp;
+      EXP_APPROX_SCALAR(sink_biases[r] - max_score, sink_exp);
+      sum_exp += sink_exp;
     }
 
     if (sum_exp > 0.0f) {
@@ -458,17 +459,14 @@ void multi_token_decode_one_row(
   float sum_exp = 0.0f;
 
   // Sink: prepend virtual score
-  if (sink_bias != 0.0f) {
+  if (ctx.has_sinks) {
     max_score = sink_bias;
     sum_exp = 1.0f;
   }
 
-  // Sliding window: compute start block
-  int64_t start_bi = 0;
-  if (ctx.sliding_window > 0 && q_pos >= ctx.sliding_window) {
-    start_bi =
-        std::max(int64_t(0), (q_pos - ctx.sliding_window + 1) / ctx.blk_size);
-  }
+  // Skip blocks before the visible window (sliding + chunked).
+  const int64_t vis_start = kv_visible_start(ctx, q_pos);
+  const int64_t start_bi = vis_start / ctx.blk_size;
 
   for (int64_t bi = start_bi; bi < n_blks; ++bi) {
     const int64_t kv_start = bi * ctx.blk_size;
@@ -478,13 +476,10 @@ void multi_token_decode_one_row(
     const int64_t pool_blk = block_indices[bi];
     const int64_t tokens = std::min(ctx.blk_size, kv_len - kv_start);
     int64_t valid = std::min(tokens, q_pos - kv_start + 1);
-    // Sliding window: further restrict valid tokens within this block
+    // Restrict to the visible window start within this block (sliding + chunk).
     int64_t t_start = 0;
-    if (ctx.sliding_window > 0 && q_pos >= ctx.sliding_window) {
-      const int64_t window_start = q_pos - ctx.sliding_window + 1;
-      if (window_start > kv_start)
-        t_start = window_start - kv_start;
-    }
+    if (vis_start > kv_start)
+      t_start = vis_start - kv_start;
 
     const at::BFloat16* k_base =
         ctx.pool_ptr + kv_h * ctx.ph + pool_blk * ctx.pb;

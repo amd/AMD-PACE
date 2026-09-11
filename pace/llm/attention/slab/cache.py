@@ -21,42 +21,26 @@ from typing import Optional, List
 import torch
 from transformers import PretrainedConfig
 
-from pace.llm.attention.base import Cache, CacheContext
+from pace.llm.attention.base import (
+    Cache,
+    CacheContext,
+)
+from pace.llm.attention.prefix_cache import (
+    PrefixCacheContextMixin,
+    PrefixCacheMixin,
+    compute_block_hashes,
+)
 from pace.utils.logging import PACE_LLM_INFO
+
+_BF16_BYTES = 2
 
 
 def autotune_block_size(num_kv_heads: int, head_dim: int) -> int:
-    """Pick the largest block_size that fits in L2/4.
+    return int(torch.ops.pace.slab_autotune_block_size(num_kv_heads, head_dim))
 
-    Reads L2 cache size from sysfs, falls back to 64 if unavailable.
-    Respects SLAB_BLOCK_SIZE env var override.
-    """
-    import os
 
-    env_bs = os.environ.get("SLAB_BLOCK_SIZE")
-    if env_bs:
-        return int(env_bs)
-
-    l2_size = 0
-    try:
-        with open("/sys/devices/system/cpu/cpu0/cache/index2/size") as f:
-            s = f.read().strip()
-            val = int(s.rstrip("KkMm"))
-            if s[-1] in "Kk":
-                l2_size = val * 1024
-            elif s[-1] in "Mm":
-                l2_size = val * 1024 * 1024
-            else:
-                l2_size = val
-    except (OSError, ValueError):
-        return 64
-
-    bytes_per_token = 2 * num_kv_heads * head_dim * 2  # K+V, BF16
-    target = l2_size // 4
-    for bs in (256, 128, 64, 32):
-        if bs * bytes_per_token <= target:
-            return bs
-    return 32
+def kv_cache_bytes_per_token(num_kv_heads: int, head_dim: int) -> int:
+    return 2 * num_kv_heads * head_dim * _BF16_BYTES
 
 
 def create_slab_pool(
@@ -88,17 +72,19 @@ class SlabPoolLayerView:
     Delegates to the pool manager for the specific layer.
     """
 
-    __slots__ = ("pool_manager", "tokens", "layer_idx")
+    __slots__ = ("pool_manager", "tokens", "layer_idx", "query_lens")
 
     def __init__(
         self,
         pool_manager: "SlabPoolManager",
         tokens: List[str],
         layer_idx: int,
+        query_lens: Optional[List[int]] = None,
     ):
         self.pool_manager = pool_manager
         self.tokens = tokens
         self.layer_idx = layer_idx
+        self.query_lens = query_lens
 
     def update(
         self,
@@ -117,6 +103,7 @@ class SlabPoolLayerView:
         seq_lens: Optional[List[int]] = None,
         sliding_window: int = 0,
         sinks: Optional[torch.Tensor] = None,
+        chunk_size: int = 0,
     ) -> torch.Tensor:
         """Unified attention: dispatches to decode/prefill in C++ based on q_len."""
         return self.pool_manager.attention(
@@ -127,6 +114,7 @@ class SlabPoolLayerView:
             scale=scale,
             sliding_window=sliding_window,
             sinks=sinks,
+            chunk_size=chunk_size,
         )
 
     @property
@@ -143,17 +131,25 @@ class _SlabPoolLayerList:
     kv_cache.cache_objects[layer_idx] without changes.
     """
 
-    __slots__ = ("_pool_manager", "_tokens")
+    __slots__ = ("_pool_manager", "_tokens", "_query_lens")
 
-    def __init__(self, pool_manager: "SlabPoolManager", tokens: List[str]):
+    def __init__(
+        self,
+        pool_manager: "SlabPoolManager",
+        tokens: List[str],
+        query_lens: Optional[List[int]] = None,
+    ):
         self._pool_manager = pool_manager
         self._tokens = tokens
+        self._query_lens = query_lens
 
     def __getitem__(self, layer_idx: int) -> SlabPoolLayerView:
-        return SlabPoolLayerView(self._pool_manager, self._tokens, layer_idx)
+        return SlabPoolLayerView(
+            self._pool_manager, self._tokens, layer_idx, self._query_lens
+        )
 
 
-class SlabPoolContext(CacheContext):
+class SlabPoolContext(PrefixCacheContextMixin, CacheContext):
     """
     Per-sequence cache context for SlabPool. Implements CacheContext ABC.
 
@@ -170,7 +166,14 @@ class SlabPoolContext(CacheContext):
     ):
         self.pool_manager = pool_manager
         self.tokens = tokens
-        self.cache_objects = _SlabPoolLayerList(pool_manager, tokens)
+        self._cache_objects = _SlabPoolLayerList(pool_manager, tokens)
+        self.slab_query_lens: Optional[List[int]] = None
+        self._init_prefix_fields()
+
+    @property
+    def cache_objects(self):
+        self._cache_objects._query_lens = self.slab_query_lens
+        return self._cache_objects
 
     def __getitem__(self, layer_idx: int) -> SlabPoolLayerView:
         return self.cache_objects[layer_idx]
@@ -204,21 +207,18 @@ class SlabPoolManager:
     @staticmethod
     def compute_max_tokens_from_memory(
         kv_cache_memory_gb: float,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
+        bytes_per_token_all_layers: int,
     ) -> int:
         """
         Compute max_total_tokens from a memory budget.
 
-        Each token in the pool uses:
-          num_layers * 2 (K+V) * num_kv_heads * head_dim * sizeof(BF16)
-        bytes across all layers.
+        ``bytes_per_token_all_layers`` is the summed per-token cost of the
+        layers that own storage, each contributing
+          2 (K+V) * num_kv_heads * head_dim * sizeof(BF16)
+        bytes. Layers that reuse another layer's KV contribute nothing.
         """
-        bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * 2
-        bytes_per_token = num_layers * bytes_per_token_per_layer
         total_bytes = int(kv_cache_memory_gb * 1024 * 1024 * 1024)
-        return total_bytes // bytes_per_token
+        return total_bytes // bytes_per_token_all_layers
 
     def __init__(
         self,
@@ -228,26 +228,38 @@ class SlabPoolManager:
         block_size: int = 0,
         default_max_seq_len: Optional[int] = None,
     ):
-        self.num_layers = config.num_hidden_layers
-        self.num_kv_heads = getattr(
-            config, "num_key_value_heads", config.num_attention_heads
+        from pace.llm.attention.specs import (
+            compute_layer_kv_specs,
+            resolve_text_config,
         )
-        self.num_q_heads = config.num_attention_heads
+
+        text_config = resolve_text_config(config)
+        self.num_kv_heads = getattr(
+            text_config, "num_key_value_heads", text_config.num_attention_heads
+        )
+        self.num_q_heads = text_config.num_attention_heads
         self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
+            text_config,
+            "head_dim",
+            text_config.hidden_size // text_config.num_attention_heads,
         )
         if block_size <= 0:
             block_size = autotune_block_size(self.num_kv_heads, self.head_dim)
         self.block_size = block_size
 
+        self._specs = compute_layer_kv_specs(config)
+        self.num_layers = len(self._specs)
+        self._bytes_per_token_all_layers = sum(
+            kv_cache_bytes_per_token(s.num_kv_heads, s.head_dim)
+            for s in self._specs
+            if s.kv_sharing_target is None
+        )
+
         if max_total_tokens is not None:
             self.max_total_tokens = max_total_tokens
         elif kv_cache_memory_gb is not None:
             self.max_total_tokens = self.compute_max_tokens_from_memory(
-                kv_cache_memory_gb,
-                self.num_layers,
-                self.num_kv_heads,
-                self.head_dim,
+                kv_cache_memory_gb, self._bytes_per_token_all_layers
             )
         else:
             max_pos = getattr(config, "max_position_embeddings", 4096)
@@ -259,23 +271,39 @@ class SlabPoolManager:
             self.default_max_seq_len = getattr(config, "max_position_embeddings", 4096)
 
         total_blocks = (self.max_total_tokens + block_size - 1) // block_size
+        self.total_blocks = total_blocks
 
-        bytes_per_token = self.num_layers * 2 * self.num_kv_heads * self.head_dim * 2
-        pool_memory_gb = (self.max_total_tokens * bytes_per_token) / (1024**3)
+        pool_memory_gb = (self.max_total_tokens * self._bytes_per_token_all_layers) / (
+            1024**3
+        )
 
+        num_shared = sum(1 for s in self._specs if s.kv_sharing_target is not None)
         PACE_LLM_INFO(
             f"SlabPoolManager: {self.max_total_tokens} max tokens, "
             f"{total_blocks} blocks, {pool_memory_gb:.2f} GB KV cache memory "
-            f"({self.num_layers} layers, {self.num_kv_heads} KV heads, "
-            f"{self.head_dim} head_dim)"
+            f"({self.num_layers} layers, {num_shared} KV-shared, "
+            f"block_size {block_size})"
         )
 
-        self._pools = []
-        for _ in range(self.num_layers):
-            pool = create_slab_pool(
-                total_blocks, self.num_kv_heads, self.head_dim, block_size
-            )
-            self._pools.append(pool)
+        # One pool per storage-owning layer; shared layers alias their target's.
+        self._pools: List = [None] * self.num_layers
+        self._owned_pools: List = []
+        self._layer_readonly: List[bool] = [False] * self.num_layers
+        self._layer_head_dim: List[int] = [0] * self.num_layers
+        self._layer_num_kv_heads: List[int] = [0] * self.num_layers
+        for layer_idx, spec in enumerate(self._specs):
+            self._layer_head_dim[layer_idx] = spec.head_dim
+            self._layer_num_kv_heads[layer_idx] = spec.num_kv_heads
+            if spec.kv_sharing_target is None:
+                pool = create_slab_pool(
+                    total_blocks, spec.num_kv_heads, spec.head_dim, block_size
+                )
+                self._pools[layer_idx] = pool
+                self._owned_pools.append(pool)
+        for layer_idx, spec in enumerate(self._specs):
+            if spec.kv_sharing_target is not None:
+                self._pools[layer_idx] = self._pools[spec.kv_sharing_target]
+                self._layer_readonly[layer_idx] = True
 
         self._lock = threading.Lock()
         self._token_to_seq_id: dict = {}
@@ -302,7 +330,7 @@ class SlabPoolManager:
 
             created_in = []
             try:
-                for pool in self._pools:
+                for pool in self._owned_pools:
                     pool.create_sequence(seq_id, max_seq_len)
                     created_in.append(pool)
             except Exception:
@@ -323,7 +351,7 @@ class SlabPoolManager:
 
             seq_id = self._token_to_seq_id[token]
 
-            for pool in self._pools:
+            for pool in self._owned_pools:
                 pool.remove_sequence(seq_id)
 
             del self._token_to_seq_id[token]
@@ -338,7 +366,7 @@ class SlabPoolManager:
             seq_id = self._token_to_seq_id.get(token)
             if seq_id is None:
                 return
-            for pool in self._pools:
+            for pool in self._owned_pools:
                 pool.truncate_sequence(seq_id, remove_len)
 
     def get_sequence_length(self, token: str) -> int:
@@ -357,6 +385,72 @@ class SlabPoolManager:
             return self._pools[layer_idx].get_free_block_count()
         return 0
 
+    def get_stats(self) -> dict:
+        """Pool stats mirroring the paged pool so downstream metrics
+        (``pace_kv_cache_usage_perc``) work identically for slab."""
+        free = self.get_free_blocks()
+        allocated = self.total_blocks - free
+        return {
+            "total_blocks": self.total_blocks,
+            "free_blocks": free,
+            "allocated_blocks": allocated,
+            "utilization_pct": (
+                (allocated / self.total_blocks * 100) if self.total_blocks > 0 else 0
+            ),
+        }
+
+    def get_block_indices(self, token: str) -> List[int]:
+        """Return the C++ physical block indices for a sequence."""
+        with self._lock:
+            seq_id = self._token_to_seq_id.get(token)
+            if seq_id is None or not self._pools:
+                return []
+            return list(self._pools[0].get_block_indices(seq_id))
+
+    def reserve_blocks(self, token: str, num_blocks: int) -> List[int]:
+        """Eagerly allocate ``num_blocks`` blocks per layer, return their indices."""
+        with self._lock:
+            seq_id = self._token_to_seq_id.get(token)
+            if seq_id is None or not self._owned_pools:
+                return []
+            for pool in self._owned_pools:
+                pool.reserve_blocks(seq_id, num_blocks)
+            return list(self._owned_pools[0].get_block_indices(seq_id))
+
+    def assign_prefix_blocks(
+        self, dst_token: str, pool_block_indices: List[int], num_tokens: int
+    ) -> None:
+        """Zero-copy: assign existing pool blocks to a sequence (all layers)."""
+        with self._lock:
+            dst_seq_id = self._token_to_seq_id.get(dst_token)
+            if dst_seq_id is None:
+                raise ValueError(f"Destination token {dst_token} not found")
+            for pool in self._owned_pools:
+                pool.assign_prefix_blocks(dst_seq_id, pool_block_indices, num_tokens)
+
+    def reassign_block(self, token: str, block_pos: int, new_pool_block: int) -> None:
+        """Repoint one logical block of a sequence at another pool block (all layers)."""
+        with self._lock:
+            seq_id = self._token_to_seq_id.get(token)
+            if seq_id is None:
+                return
+            for pool in self._owned_pools:
+                pool.reassign_block(seq_id, block_pos, new_pool_block)
+
+    def retain_blocks(self, pool_block_indices: List[int]) -> int:
+        """Mark blocks as retained across sequence removals (all layers)."""
+        if not self._owned_pools:
+            return 0
+        count = 0
+        for pool in self._owned_pools:
+            count = pool.retain_blocks(pool_block_indices)
+        return count
+
+    def release_retained_blocks(self, pool_block_indices: List[int]) -> None:
+        """Release previously retained blocks back to the free list (all layers)."""
+        for pool in self._owned_pools:
+            pool.release_retained_blocks(pool_block_indices)
+
     def update_cache_batched(
         self,
         layer_idx: int,
@@ -365,6 +459,8 @@ class SlabPoolManager:
         values: torch.Tensor,
         seq_lens: Optional[List[int]] = None,
     ) -> None:
+        if self._layer_readonly[layer_idx]:
+            return
         seq_ids = self.get_internal_ids(tokens)
         self._pools[layer_idx].cache_update(seq_ids, keys, values, seq_lens or [])
 
@@ -377,19 +473,38 @@ class SlabPoolManager:
         scale: Optional[float] = None,
         sliding_window: int = 0,
         sinks: Optional[torch.Tensor] = None,
+        chunk_size: int = 0,
     ) -> torch.Tensor:
         """Unified attention: C++ dispatches to decode/prefill based on q_len."""
         if scale is None:
-            scale = 1.0 / (self.head_dim**0.5)
+            scale = 1.0 / (self._layer_head_dim[layer_idx] ** 0.5)
         seq_ids = self.get_internal_ids(tokens)
         sinks_tensor = sinks if sinks is not None else torch.tensor([])
         return self._pools[layer_idx].attention(
-            seq_ids, query, seq_lens or [], [], scale, sliding_window, sinks_tensor
+            seq_ids,
+            query,
+            seq_lens or [],
+            [],
+            scale,
+            sliding_window,
+            sinks_tensor,
+            chunk_size,
         )
 
 
-class SlabCache(Cache):
-    """Engine-level cache backend for SlabPool. Implements Cache ABC.
+class SlabCache(PrefixCacheMixin, Cache):
+    """Engine-level cache backend for SlabPool.
+
+    Implements the Cache ABC and mixes in PrefixCacheMixin for prefix
+    caching (enabled by default; disable via ``PACE_PREFIX_CACHE=0`` or kwarg
+    ``enable_prefix_cache=False``).
+
+    SLAB reuses cached prefix blocks zero-copy: matched blocks are referenced
+    by the new sequence via the C++ ``SlabPool.assign_prefix_blocks`` and kept
+    alive across sequence removals via ``retain_blocks``, so the engine can
+    skip recomputing the matched prefix.
+    The prefix-hash block size is derived from SLAB's autotuned block size so
+    hashing granularity matches the pool's physical blocks.
 
     When kv_cache_memory_gb is provided (server path), the SlabPoolManager
     is created eagerly so the pool is allocated before any requests.
@@ -412,21 +527,28 @@ class SlabCache(Cache):
         if "kv_cache_memory_gb" in self._kwargs:
             self._manager = SlabPoolManager(config, **self._kwargs)
 
+        self._resolved_block_size = self._init_prefix_cache_from_config(
+            config, "SlabCache", autotune_fn=autotune_block_size, **kwargs
+        )
+
     def _ensure_manager(
         self, max_seq_length: int, batch_size: int, spec_headroom: int
     ) -> None:
         pool_seq_len = max_seq_length + spec_headroom
         # Account for per-sequence block alignment: each sequence
         # rounds up to a whole number of blocks independently.
+        from pace.llm.attention.specs import resolve_text_config
+
+        text_config = resolve_text_config(self._config)
         num_kv_heads = getattr(
-            self._config,
+            text_config,
             "num_key_value_heads",
-            self._config.num_attention_heads,
+            text_config.num_attention_heads,
         )
         head_dim = getattr(
-            self._config,
+            text_config,
             "head_dim",
-            self._config.hidden_size // self._config.num_attention_heads,
+            text_config.hidden_size // text_config.num_attention_heads,
         )
         block_size = self._kwargs.get("block_size", 0)
         if block_size <= 0:
@@ -475,12 +597,109 @@ class SlabCache(Cache):
             all_tokens.extend(ctx.tokens)
         return SlabPoolContext(self._manager, all_tokens)
 
+    def merge_contexts_mixed(self, contexts_with_query_lens: list) -> SlabPoolContext:
+        """Merge contexts with per-sequence query lengths for mixed batches.
+
+        Args:
+            contexts_with_query_lens: List of ``(kv_cache_context, query_len)``
+                tuples.  The query_len per sequence is stored on the returned
+                context as ``slab_query_lens`` so the attention kernel can
+                dispatch the packed path correctly.
+        """
+        all_tokens = []
+        query_lens = []
+        for ctx, ql in contexts_with_query_lens:
+            mgr = ctx.kv_cache_manager if hasattr(ctx, "kv_cache_manager") else ctx
+            if isinstance(mgr, SlabPoolContext):
+                all_tokens.extend(mgr.tokens)
+            else:
+                all_tokens.extend(ctx.tokens)
+            query_lens.append(ql)
+        merged = SlabPoolContext(self._manager, all_tokens)
+        merged.slab_query_lens = query_lens
+        return merged
+
     def build_prefill_metadata(self, *args, **kwargs):
         """No-op for slab. Paged attention uses this for prefill metadata."""
         return None
 
+    # ---- PrefixCacheMixin hooks ----
+
+    def _get_block_indices_for_context(self, context):
+        """Return the physical C++ pool block indices for the first sequence."""
+        if not context.tokens or self._manager is None:
+            return []
+        return self._manager.get_block_indices(context.tokens[0])
+
+    def _claim_prefix_blocks_impl(
+        self, context, token_ids, matched_blocks, num_matched_tokens
+    ):
+        """Zero-copy: point the new sequence at the cached physical blocks."""
+        if not context.tokens or self._manager is None:
+            return
+        self._manager.assign_prefix_blocks(
+            context.tokens[0], matched_blocks, num_matched_tokens
+        )
+
+    def _free_duplicate_block(self, block_idx: int) -> None:
+        """Release a dedup'd block; safe because the owner was repointed off it first."""
+        if self._manager is not None:
+            self._manager.release_retained_blocks([block_idx])
+
+    def _repoint_duplicate_block(
+        self, context, block_pos: int, old_block: int, canonical_block: int
+    ) -> None:
+        """Zero-copy repoint of this sequence's logical block onto the canonical block."""
+        if self._manager is None or not context.tokens:
+            return
+        self._manager.reassign_block(context.tokens[0], block_pos, canonical_block)
+
+    def _reserve_blocks_for_context(self, context, num_full_blocks):
+        if self._manager is None or not context.tokens:
+            return []
+        deficit = num_full_blocks - self._manager.get_free_blocks()
+        if deficit > 0:
+            self.evict_prefix_blocks(deficit)
+        blocks = self._manager.reserve_blocks(context.tokens[0], num_full_blocks)
+        self._manager.retain_blocks(blocks[:num_full_blocks])
+        return blocks
+
+    def insert_prefix(self, context, token_ids: list) -> int:
+        """Register newly-computed suffix blocks and retain them in the pool.
+
+        The reused prefix (``prefix_matched_tokens``) is already shared zero-copy
+        and skipped. Retained blocks survive ``remove_sequence`` and are freed
+        only on LRU eviction.
+        """
+        if self._prefix_map is None:
+            return 0
+        blocks = self._get_block_indices_for_context(context)
+        if not blocks:
+            return 0
+        skip = getattr(context, "prefix_matched_tokens", 0) // self._prefix_block_size
+        hashes = compute_block_hashes(token_ids, self._prefix_block_size)
+        num_full = min(len(hashes), len(blocks))
+        if num_full > skip:
+            self._manager.retain_blocks(blocks[skip:num_full])
+        return self._register_blocks(context, hashes, blocks, start=skip)
+
+    def evict_prefix_blocks(self, num_blocks: int) -> list:
+        """Evict LRU cached blocks and release their retained pool blocks."""
+        if self._prefix_map is None:
+            return []
+        evicted = self._prefix_map.evict(num_blocks)
+        if evicted and self._manager is not None:
+            self._manager.release_retained_blocks(evicted)
+        return evicted
+
     def remove_context(self, context) -> None:
-        """Release pool blocks and hashmap entries for all sequences."""
+        """Release pool blocks and hashmap entries for all sequences.
+
+        Blocks inserted into the prefix cache are retained in the pool, so
+        their KV data remains available for future prefix matches; they are
+        freed only on LRU eviction.
+        """
+        self._release_prefix_refs(context)
         for token in context.tokens:
             self._manager.remove_sequence(token)
         context.tokens.clear()

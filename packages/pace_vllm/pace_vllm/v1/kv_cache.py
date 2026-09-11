@@ -19,6 +19,9 @@ under `num_blocks = budget // sum(page_size_bytes_per_layer)`, where
 (not vLLM's `AttentionSpec.block_size`, which is scheduler accounting
 only). Heterogeneous geometry across layers is supported because each
 `SlabPool` is constructed with its own scalars.
+
+Prefix caching is delegated to PaceSlabConnector (KVConnectorBase_V1)
+which manages the hash→block map and slab retain/release lifecycle.
 """
 
 from __future__ import annotations
@@ -128,6 +131,28 @@ def _pace_kvcache_budget_bytes(vllm_config: "VllmConfig") -> int | None:
     return None
 
 
+def _prefix_connector_block_size(vllm_config: "VllmConfig") -> int | None:
+    transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if transfer_config is None:
+        return None
+    if transfer_config.kv_connector == "PaceSlabConnector":
+        extra_config = transfer_config.kv_connector_extra_config or {}
+    else:
+        return None
+    raw_block_size = extra_config.get("slab_block_size")
+    if raw_block_size is None:
+        raise ValueError(
+            "pace-vllm: PaceSlabConnector requires slab_block_size in "
+            "kv_connector_extra_config."
+        )
+    block_size = int(raw_block_size)
+    if block_size <= 0:
+        raise ValueError(
+            "pace-vllm: PaceSlabConnector slab_block_size must be positive."
+        )
+    return block_size
+
+
 def _resolve_slab_block_size_override() -> int | None:
     """Read `PACE_VLLM_SLAB_BLOCK_SIZE`. Returns None when the env var is
     unset or empty (autotuner runs); raises ValueError on parse failure or
@@ -175,9 +200,6 @@ class PaceKVCache:
     ) -> None:
         for i, layer in enumerate(spec.per_layer):
             if layer.dtype != torch.bfloat16:
-                # SlabPool enforces BF16 K/V/Q on the bindings side.
-                # Surface this early so misconfigured kv_cache_dtype
-                # fails fast.
                 raise ValueError(
                     f"PaceKVCache layer {i}: requires BF16 KV cache dtype, "
                     f"got {layer.dtype}. See csrc/ops/slab_attention.cpp "
@@ -199,9 +221,8 @@ class PaceKVCache:
             )
             for layer in spec.per_layer
         ]
-        # `layer_names is None` is the unit-test path; production callers
-        # always pass names so the layer_registry can resolve pools by
-        # `layer.layer_name` from PaceAttentionImpl.forward.
+        # Production passes names so attention layers can resolve their pool;
+        # direct construction without names is retained for unit tests.
         self._layer_name_to_idx: dict[str, int] = (
             {name: idx for idx, name in enumerate(layer_names)}
             if layer_names is not None
@@ -209,10 +230,13 @@ class PaceKVCache:
         )
         self._request_to_seq: dict[str, int] = {}
         self._seq_id_counter = itertools.count(start=1)
-        # PaceAttentionImpl.forward reads `owner.input_batch.req_ids`
-        # via this handle (avoids a thread-local); set by
-        # PaceModelRunner.initialize_kv_cache.
+        # Attention resolves request IDs through the runner's persistent batch.
         self._owner: object | None = None
+        self._block_size = spec.per_layer[0].block_size
+        self._prefix_block_indices_aligned = all(
+            layer.block_size == self._block_size for layer in spec.per_layer
+        )
+
         sample = spec.per_layer[0]
         unique_geometries = len(
             {
@@ -246,8 +270,10 @@ class PaceKVCache:
         `pace::slab_autotune_block_size` (overridable via
         `PACE_VLLM_SLAB_BLOCK_SIZE`); vLLM's `AttentionSpec.block_size`
         is scheduler-accounting only and intentionally not used for
-        SlabPool sizing. Sizing: equal `num_blocks` per layer under
-        `budget // sum(page_size_bytes_per_layer)`.
+        SlabPool sizing. PaceSlabConnector supplies one shared block size
+        because its hash and physical-block mappings span every layer.
+        Sizing uses equal `num_blocks` per layer under `budget //
+        sum(page_size_bytes_per_layer)`.
 
         `shared_kv_cache_layers` (follower -> target) excludes follower
         layers from per-pool allocation; followers are aliased to the
@@ -334,19 +360,19 @@ class PaceKVCache:
                 "--kv-cache-memory-bytes or VLLM_CPU_KVCACHE_SPACE."
             )
 
-        # Resolve per-layer block_size: env override wins over autotune;
-        # autotune is called once per unique (num_kv_heads, head_dim) so
-        # repeated layer geometries don't pay the L2-detect cost N times.
-        env_override = _resolve_slab_block_size_override()
+        connector_block_size = _prefix_connector_block_size(vllm_config)
+        env_override = (
+            None
+            if connector_block_size is not None
+            else _resolve_slab_block_size_override()
+        )
         block_size_for: dict[tuple[int, int], int] = {}
         for _, s in per_layer:
             key = (int(s.num_kv_heads), int(s.head_size))
             if key in block_size_for:
                 continue
             block_size_for[key] = (
-                env_override
-                if env_override is not None
-                else _autotune_slab_block_size(*key)
+                connector_block_size or env_override or _autotune_slab_block_size(*key)
             )
 
         # Page size MUST be computed against the autotuned block_size,
@@ -401,7 +427,11 @@ class PaceKVCache:
                 num_kv_heads,
                 head_dim,
                 block_size,
-                "env override" if env_override is not None else "autotuned",
+                (
+                    "prefix connector"
+                    if connector_block_size is not None
+                    else "env override" if env_override is not None else "autotuned"
+                ),
             )
 
         return cls(
@@ -477,6 +507,49 @@ class PaceKVCache:
 
     def pool_for_layer(self, layer_idx: int):  # torch.classes.pace.SlabPool
         return self._pools[layer_idx]
+
+    def _require_aligned_prefix_blocks(self) -> None:
+        if not self._prefix_block_indices_aligned:
+            raise ValueError(
+                "pace-vllm: prefix caching requires uniform block_size across "
+                "all SlabPool layers."
+            )
+
+    def get_block_indices(self, seq_id: int) -> list[int]:
+        """Physical slab block indices for a sequence (pool 0 is representative)."""
+        self._require_aligned_prefix_blocks()
+        return list(self._pools[0].get_block_indices(seq_id))
+
+    def get_sequence_length_by_id(self, seq_id: int) -> int:
+        """Tokens written so far for a sequence (pool 0 is representative)."""
+        self._require_aligned_prefix_blocks()
+        return int(self._pools[0].get_sequence_length(seq_id))
+
+    def reserve_blocks(self, seq_id: int, num_blocks: int) -> None:
+        """Allocate blocks up front, without advancing seq_len."""
+        self._require_aligned_prefix_blocks()
+        for pool in self._pools:
+            pool.reserve_blocks(seq_id, num_blocks)
+
+    def assign_prefix_blocks(
+        self, seq_id: int, blocks: list[int], num_tokens: int
+    ) -> None:
+        """Point a sequence at shared cached prefix blocks on every layer."""
+        self._require_aligned_prefix_blocks()
+        for pool in self._pools:
+            pool.assign_prefix_blocks(seq_id, blocks, num_tokens)
+
+    def retain_blocks(self, blocks: list[int]) -> None:
+        """Retain blocks (survive remove_sequence) on every layer."""
+        self._require_aligned_prefix_blocks()
+        for pool in self._pools:
+            pool.retain_blocks(blocks)
+
+    def release_retained_blocks(self, blocks: list[int]) -> None:
+        """Release retained blocks back to the free list on every layer."""
+        self._require_aligned_prefix_blocks()
+        for pool in self._pools:
+            pool.release_retained_blocks(blocks)
 
     def num_free_blocks_per_layer(self) -> int:
         # Layers may have different pool sizes now. Report pool 0 for

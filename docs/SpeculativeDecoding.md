@@ -68,7 +68,14 @@ pard_config = PardSpecDecodeConfig(
 - `num_speculative_tokens` (int)
     - **Description**: Number of tokens to speculate ahead
     - **Default**: `12`
-    - **Range**: Positive integer (typically 1-32)
+    - **Constraint**: Positive integer
+
+- `draft_kv_cache_memory_gb` (Optional[float])
+    - **Description**: Optional memory budget for the draft model's KV cache
+    - **Default**: `None`
+    - **Server behavior**: If omitted while the target `kv_cache_memory_gb` is
+      set, the server derives a proportional draft budget from the target and
+      draft KV dimensions.
 
 ## Usage Example
 
@@ -109,5 +116,9 @@ response = model.generate(inputs, sampling_config=sampling_config)
 For a more detailed example, refer to the [PARD example](../examples/pace_llm_pard.py).
 
 ## Note
-1. AMD PACE with PARD Speculative Decoding is only enabled for Greedy Decoding .
-1. Speculative Decoding in AMD PACE is optimized for inter token latency. Multiple requests can be served concurrently with multiple instances, and you can find such an example in [Multi-Instance with AMD PACE](../examples/multi_instance_sd_pace.py).
+1. While PARD is configured, requests must use greedy decoding; non-greedy
+   requests fail instead of falling back to ordinary decoding.
+2. The inference server supports PARD with `iterative`,
+   `continuous_prefill_first`, and `continuous_batch` scheduling. With
+   `continuous_batch`, each decode reserves `num_speculative_tokens + 1` tokens
+   from the step token budget.

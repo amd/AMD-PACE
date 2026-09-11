@@ -16,6 +16,7 @@ from pace.llm.attention.paged.cache import (
     PagedKVCachePool,
     SharedPagedKVCache,
 )
+from pace.llm.attention.specs import LayerKVSpec
 
 
 class TestPagedKVCacheInit(TestCase):
@@ -169,6 +170,154 @@ class TestPagedKVCacheRemove(TestCase):
             self.cache.remove_cache(100)
 
 
+class TestPagedKVCacheRemoveInPlaceTruncate(TestCase):
+    """remove_cache truncates block_table in place (O(1) view) instead of
+    rebuilding the whole tensor, while staying bit-identical to the previous
+    full-rebuild behaviour.
+
+    This is the speculative-decode rollback path: every step appends k+1 tokens
+    and discards the rejected suffix, so rollback cost must not scale with the
+    context length already in the cache.
+    """
+
+    def setUp(self):
+        # 160 tokens at block_size 16 -> exactly 10 blocks.
+        self.cache = PagedKVCache(
+            max_seq_length=256, num_kv_heads=4, head_dim=32, block_size=16
+        )
+        self.cache._ensure_blocks_allocated(160)
+        self.cache.seq_len = 160
+
+    def test_block_table_matches_allocated_blocks(self):
+        self.cache.remove_cache(40)  # 160 -> 120 tokens, 10 -> 8 blocks
+        self.assertEqual(self.cache.seq_len, 120)
+        self.assertEqual(len(self.cache.allocated_blocks), 8)
+        expected = torch.tensor(self.cache.allocated_blocks, dtype=torch.int32)
+        self.assertTrue(torch.equal(self.cache.block_table, expected))
+
+    def test_cross_block_remove_is_view_not_rebuild(self):
+        orig = self.cache.block_table  # keep alive so its storage isn't reused
+        orig_ptr = orig.data_ptr()
+        self.cache.remove_cache(40)  # frees 2 tail blocks
+        # Slicing shares storage with the original tensor (same data_ptr); a
+        # torch.tensor() rebuild would allocate fresh storage with a different
+        # pointer (original is kept alive via `orig`).
+        self.assertEqual(self.cache.block_table.data_ptr(), orig_ptr)
+        self.assertEqual(self.cache.block_table.size(0), 8)
+
+    def test_within_block_remove_keeps_block_table_view(self):
+        orig = self.cache.block_table
+        orig_values = orig.clone()
+        self.cache.remove_cache(5)  # 160 -> 155 tokens, still 10 blocks
+        self.assertEqual(len(self.cache.allocated_blocks), 10)
+        self.assertEqual(self.cache.block_table.size(0), 10)
+        # No blocks freed, no rebuild: identical storage and values.
+        self.assertEqual(self.cache.block_table.data_ptr(), orig.data_ptr())
+        self.assertTrue(torch.equal(self.cache.block_table, orig_values))
+
+    def test_freed_blocks_returned_to_pool(self):
+        before_free = len(self.cache.free_blocks)
+        freed_expected = list(self.cache.allocated_blocks[-2:])
+        self.cache.remove_cache(40)  # 10 -> 8 blocks, frees 2
+        self.assertEqual(len(self.cache.free_blocks), before_free + 2)
+        for b in freed_expected:
+            self.assertIn(b, self.cache.free_blocks)
+        for b in freed_expected:
+            self.assertNotIn(b, self.cache.allocated_blocks)
+
+    def test_remove_to_zero_clears_block_table(self):
+        self.cache.remove_cache(160)
+        self.assertEqual(self.cache.seq_len, 0)
+        self.assertIsNone(self.cache.block_table)
+        self.assertEqual(len(self.cache.allocated_blocks), 0)
+
+    def test_exact_block_boundary_remove(self):
+        # Remove exactly 2 blocks worth (32 tokens): 160 -> 128 (8 blocks).
+        self.cache.remove_cache(32)
+        self.assertEqual(self.cache.seq_len, 128)
+        self.assertEqual(len(self.cache.allocated_blocks), 8)
+        self.assertEqual(self.cache.block_table.size(0), 8)
+        self.assertTrue(
+            torch.equal(
+                self.cache.block_table,
+                torch.tensor(self.cache.allocated_blocks, dtype=torch.int32),
+            )
+        )
+
+    def test_equivalence_with_full_rebuild_random(self):
+        """Across random start lengths and remove sizes, the in-place result is
+        identical to the old full-rebuild semantics (seq_len, allocated_blocks,
+        and block_table values)."""
+        import random
+
+        rng = random.Random(0)
+        for _ in range(200):
+            cache = PagedKVCache(
+                max_seq_length=512, num_kv_heads=2, head_dim=16, block_size=16
+            )
+            start_len = rng.randint(1, 512)
+            cache._ensure_blocks_allocated(start_len)
+            cache.seq_len = start_len
+            remove_len = rng.randint(0, start_len)
+
+            # Reference mirrors the previous implementation exactly.
+            ref_blocks = list(cache.allocated_blocks)
+            ref_new_len = start_len - remove_len
+            ref_needed = (ref_new_len + 16 - 1) // 16
+            ref_blocks = ref_blocks[:ref_needed]
+            ref_table = (
+                torch.tensor(ref_blocks, dtype=torch.int32) if ref_new_len > 0 else None
+            )
+
+            cache.remove_cache(remove_len)
+
+            self.assertEqual(cache.seq_len, ref_new_len)
+            self.assertEqual(cache.allocated_blocks, ref_blocks)
+            if ref_table is None:
+                self.assertIsNone(cache.block_table)
+            else:
+                self.assertEqual(cache.block_table.size(0), ref_table.size(0))
+                self.assertTrue(torch.equal(cache.block_table, ref_table))
+
+    def test_speculative_rollback_loop_no_block_leak(self):
+        """Simulate the PARD spec-decode loop: grow by draft_size+1, roll back
+        the rejected suffix, repeat. block_table must stay consistent and no
+        blocks may leak (allocated + free == total) across many cycles."""
+        cache = PagedKVCache(
+            max_seq_length=4096, num_kv_heads=2, head_dim=16, block_size=16
+        )
+        cache._ensure_blocks_allocated(100)  # prefill
+        cache.seq_len = 100
+
+        draft_size = 12
+        for step in range(300):
+            grown = cache.seq_len + draft_size + 1
+            cache._ensure_blocks_allocated(grown)
+            cache.seq_len = grown
+
+            accepted = step % (draft_size + 1)  # 0..draft_size accepted
+            trim = (draft_size + 1) - accepted
+            if trim > 0:
+                cache.remove_cache(trim)
+
+            expected_blocks = (cache.seq_len + 15) // 16
+            self.assertEqual(len(cache.allocated_blocks), expected_blocks)
+            if cache.seq_len > 0:
+                self.assertEqual(cache.block_table.size(0), expected_blocks)
+                self.assertTrue(
+                    torch.equal(
+                        cache.block_table,
+                        torch.tensor(cache.allocated_blocks, dtype=torch.int32),
+                    )
+                )
+
+        # No block leak: every block is either allocated or free.
+        self.assertEqual(
+            len(cache.allocated_blocks) + len(cache.free_blocks),
+            cache.num_blocks,
+        )
+
+
 class TestPagedKVCacheUpdateCache(TestCase):
     def test_update_batch_size_gt1_raises(self):
         cache = PagedKVCache(
@@ -215,6 +364,28 @@ class TestPagedKVCachePool(TestCase):
             num_layers=2,
         )
         self.assertIs(pool1, pool2)
+
+    def test_omitted_specs_do_not_reuse_a_per_layer_pool(self):
+        """A uniform caller must not inherit a grouped/shared layout."""
+        mixed = PagedKVCachePool.initialize(
+            total_blocks=8,
+            block_size=16,
+            num_kv_heads=2,
+            head_dim=64,
+            num_layers=2,
+            specs=[LayerKVSpec(2, 64), LayerKVSpec(2, 128)],
+        )
+        self.assertIsNone(mixed.key_cache)
+
+        uniform = PagedKVCachePool.initialize(
+            total_blocks=8,
+            block_size=16,
+            num_kv_heads=2,
+            head_dim=64,
+            num_layers=2,
+        )
+        self.assertIsNot(mixed, uniform)
+        self.assertIsNotNone(uniform.key_cache)
 
     def test_singleton_different_params_recreates(self):
         pool1 = PagedKVCachePool.initialize(
@@ -367,6 +538,136 @@ class TestPagedKVCachePool(TestCase):
         self.assertEqual(len(set(blocks1) & set(blocks2)), 0)
 
 
+class TestPagedKVCachePoolPerLayerSpecs(TestCase):
+    """Grouped storage and KV-sharing aliasing driven by per-layer specs."""
+
+    SPECS = [
+        LayerKVSpec(num_kv_heads=4, head_dim=64),
+        LayerKVSpec(num_kv_heads=2, head_dim=128),
+        LayerKVSpec(num_kv_heads=4, head_dim=64),
+        LayerKVSpec(num_kv_heads=2, head_dim=128),
+        LayerKVSpec(num_kv_heads=4, head_dim=64, kv_sharing_target=2),
+        LayerKVSpec(num_kv_heads=2, head_dim=128, kv_sharing_target=3),
+    ]
+
+    def setUp(self):
+        PagedKVCachePool.reset()
+
+    def tearDown(self):
+        PagedKVCachePool.reset()
+
+    def _pool(self, specs=None, total_blocks=8, block_size=16):
+        specs = self.SPECS if specs is None else specs
+        return PagedKVCachePool.initialize(
+            total_blocks=total_blocks,
+            block_size=block_size,
+            num_kv_heads=4,
+            head_dim=64,
+            num_layers=len(specs),
+            dtype=torch.float32,
+            specs=specs,
+        )
+
+    def test_mixed_specs_create_one_group_per_signature(self):
+        pool = self._pool()
+        self.assertEqual(len(pool._groups), 2)
+        self.assertEqual(pool._groups[(4, 64)]["layers"], [0, 2])
+        self.assertEqual(pool._groups[(2, 128)]["layers"], [1, 3])
+        self.assertEqual(pool._groups[(4, 64)]["key"].shape, (2, 8, 4, 16, 64))
+        self.assertEqual(pool._groups[(2, 128)]["key"].shape, (2, 8, 2, 16, 128))
+        # Grouped layout has no single unified tensor to alias.
+        self.assertIsNone(pool.key_cache)
+        self.assertIsNone(pool.value_cache)
+
+    def test_get_cache_tensors_uses_per_layer_dims(self):
+        pool = self._pool()
+        for layer_idx, spec in enumerate(self.SPECS):
+            k, v = pool.get_cache_tensors(layer_idx)
+            expected = (8, spec.num_kv_heads, 16, spec.head_dim)
+            self.assertEqual(k.shape, expected)
+            self.assertEqual(v.shape, expected)
+            self.assertNotEqual(k.data_ptr(), v.data_ptr())
+
+    def test_storage_layers_do_not_alias_each_other(self):
+        pool = self._pool()
+        ptrs = [pool.get_cache_tensors(i)[0].data_ptr() for i in range(4)]
+        self.assertEqual(len(set(ptrs)), 4)
+
+    def test_shared_layer_aliases_target_storage(self):
+        pool = self._pool()
+        for shared_idx, target_idx in ((4, 2), (5, 3)):
+            k_shared, v_shared = pool.get_cache_tensors(shared_idx)
+            k_target, v_target = pool.get_cache_tensors(target_idx)
+            self.assertEqual(k_shared.data_ptr(), k_target.data_ptr())
+            self.assertEqual(v_shared.data_ptr(), v_target.data_ptr())
+            self.assertEqual(k_shared.shape, k_target.shape)
+
+    def test_shared_layer_reads_target_writes(self):
+        pool = self._pool()
+        k_target, v_target = pool.get_cache_tensors(2)
+        k_target[3, :, 5, :] = 1.25
+        v_target[3, :, 5, :] = -2.5
+
+        k_shared, v_shared = pool.get_cache_tensors(4)
+        self.assertEqual(k_shared[3, :, 5, :].unique().tolist(), [1.25])
+        self.assertEqual(v_shared[3, :, 5, :].unique().tolist(), [-2.5])
+        self.assertEqual(pool.get_cache_tensors(1)[0].abs().sum().item(), 0.0)
+
+    def test_shared_layers_allocate_no_extra_storage(self):
+        shared = self._pool()
+        storage_only = self._pool(specs=self.SPECS[:4])
+        self.assertEqual(
+            sum(g["key"].numel() for g in shared._groups.values()),
+            sum(g["key"].numel() for g in storage_only._groups.values()),
+        )
+
+    def test_uniform_specs_preserve_legacy_unified_layout(self):
+        specs = [LayerKVSpec(num_kv_heads=4, head_dim=64) for _ in range(3)]
+        pool = self._pool(specs=specs)
+        self.assertEqual(len(pool._groups), 1)
+        self.assertEqual(pool.key_cache.shape, (3, 8, 4, 16, 64))
+        self.assertEqual(pool.value_cache.shape, (3, 8, 4, 16, 64))
+        for layer_idx in range(3):
+            k, _ = pool.get_cache_tensors(layer_idx)
+            self.assertEqual(k.data_ptr(), pool.key_cache[layer_idx].data_ptr())
+
+    def test_specs_none_defaults_to_uniform_layout(self):
+        pool = PagedKVCachePool.initialize(
+            total_blocks=8,
+            block_size=16,
+            num_kv_heads=4,
+            head_dim=64,
+            num_layers=3,
+        )
+        self.assertEqual(len(pool.specs), 3)
+        self.assertEqual(pool.key_cache.shape, (3, 8, 4, 16, 64))
+
+    def test_spec_count_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "layer KV specs"):
+            PagedKVCachePool(
+                total_blocks=8,
+                block_size=16,
+                num_kv_heads=4,
+                head_dim=64,
+                num_layers=len(self.SPECS) + 1,
+                specs=self.SPECS,
+            )
+
+    def test_shared_paged_kv_cache_reports_target_dims(self):
+        pool = self._pool()
+        shared = SharedPagedKVCache(
+            pool=pool, request_id=0, layer_idx=5, max_seq_length=32
+        )
+        self.assertEqual(shared.num_kv_heads, 2)
+        self.assertEqual(shared.head_dim, 128)
+        self.assertTrue(shared.kv_sharing_readonly)
+
+        owner = SharedPagedKVCache(
+            pool=pool, request_id=0, layer_idx=3, max_seq_length=32
+        )
+        self.assertFalse(owner.kv_sharing_readonly)
+
+
 class TestSharedPagedKVCache(TestCase):
     def setUp(self):
         PagedKVCachePool.reset()
@@ -454,6 +755,54 @@ class TestSharedPagedKVCache(TestCase):
         value = torch.randn(1, 4, 5, 64)
         with self.assertRaises(RuntimeError):
             cache.update_cache(key, value, concat_dim=2)
+
+
+class TestPagedKVCachePoolBlocksTensor(TestCase):
+    """The pool keeps a persistent int32 tensor mirror of each request's
+    allocated blocks, in sync with the Python list, so merge_contexts can copy
+    block rows without rebuilding torch.tensor(list) per step."""
+
+    def setUp(self):
+        PagedKVCachePool.reset()
+        self.pool = PagedKVCachePool.initialize(
+            total_blocks=64,
+            block_size=16,
+            num_kv_heads=4,
+            head_dim=64,
+            num_layers=2,
+        )
+
+    def tearDown(self):
+        PagedKVCachePool.reset()
+
+    def test_tensor_created_on_allocate(self):
+        self.pool.allocate_blocks(request_id=1, num_blocks=3)
+        t = self.pool.get_blocks_tensor(1)
+        self.assertIsNotNone(t)
+        self.assertEqual(t.dtype, torch.int32)
+        self.assertEqual(t.tolist(), self.pool.get_blocks_for_request(1))
+
+    def test_tensor_grows_with_incremental_allocation(self):
+        self.pool.allocate_blocks(request_id=7, num_blocks=2)
+        self.pool.ensure_blocks_for_request(7, 5)  # +3 more
+        t = self.pool.get_blocks_tensor(7)
+        self.assertEqual(t.numel(), 5)
+        self.assertEqual(t.tolist(), self.pool.get_blocks_for_request(7))
+
+    def test_tensor_removed_on_free(self):
+        self.pool.allocate_blocks(request_id=2, num_blocks=2)
+        self.assertIsNotNone(self.pool.get_blocks_tensor(2))
+        self.pool.free_blocks_for_request(2)
+        self.assertIsNone(self.pool.get_blocks_tensor(2))
+
+    def test_tensor_cleared_on_reset(self):
+        self.pool.allocate_blocks(request_id=3, num_blocks=2)
+        self.pool.reset_allocations()
+        self.assertIsNone(self.pool.get_blocks_tensor(3))
+        self.assertEqual(self.pool.allocated_blocks_tensor, {})
+
+    def test_missing_request_returns_none(self):
+        self.assertIsNone(self.pool.get_blocks_tensor(999))
 
 
 def _make_config(**overrides):
@@ -573,3 +922,44 @@ class TestPagedCacheMergeContexts(TestCase):
                 expected_slot,
                 f"Step {step}: slot mismatch",
             )
+
+    def _reference_block_table(self, contexts, max_blocks_per_seq):
+        """Build the block_table the old torch.tensor(list) path would produce."""
+        num_reqs = len(contexts)
+        ref = torch.zeros(num_reqs, max_blocks_per_seq, dtype=torch.int32)
+        for i, ctx in enumerate(contexts):
+            blocks = ctx.cache_objects[0].allocated_blocks
+            nb = min(len(blocks), max_blocks_per_seq)
+            if nb:
+                ref[i, :nb] = torch.tensor(blocks[:nb], dtype=torch.int32)
+        return ref
+
+    def test_block_table_matches_list_rebuild_reference(self):
+        """The tensor-mirror fast path must produce the same block_table the
+        torch.tensor(list) rebuild produced."""
+        cache, contexts = self._make_cache_and_contexts(3, [5, 20, 40], block_size=16)
+        merged = cache.merge_contexts(contexts, query_len=1)
+        meta = merged.paged_attn_metadata
+        ref = self._reference_block_table(contexts, meta.block_table.shape[1])
+        self.assertTrue(torch.equal(meta.block_table, ref))
+
+    def test_block_table_correct_across_boundary_crossings(self):
+        """Across many decode steps (including block-boundary allocations that
+        refresh the tensor mirror), block_table stays equal to the reference."""
+        block_size = 4
+        cache, contexts = self._make_cache_and_contexts(
+            2, [3, 7], block_size=block_size
+        )
+        for _ in range(20):
+            merged = cache.merge_contexts(contexts, query_len=1)
+            meta = merged.paged_attn_metadata
+            ref = self._reference_block_table(contexts, meta.block_table.shape[1])
+            self.assertTrue(torch.equal(meta.block_table, ref))
+
+    def test_merge_contexts_mixed_block_table_matches_reference(self):
+        """merge_contexts_mixed uses the same tensor-mirror fill path."""
+        cache, contexts = self._make_cache_and_contexts(3, [5, 20, 40], block_size=16)
+        merged = cache.merge_contexts_mixed([(ctx, 1) for ctx in contexts])
+        meta = merged.paged_attn_metadata
+        ref = self._reference_block_table(contexts, meta.block_table.shape[1])
+        self.assertTrue(torch.equal(meta.block_table, ref))

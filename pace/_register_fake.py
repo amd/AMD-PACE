@@ -140,18 +140,9 @@ def _fake_libxsmm_fused_mlp(
 # adding one would raise because CompositeImplicitAutograd ops
 # decompose rather than dispatch. This applies to:
 #   - pace::slab_autotune_block_size (csrc/ops/slab_attention.cpp)
-#   - pace::thread_bind, pace::log, pace::enable_fusion (csrc/core/core_ops.cpp)
+#   - pace::thread_bind, pace::log (csrc/core/core_ops.cpp)
 # The three core helpers are also side-effecting void ops with no tensor
 # arguments, so there is nothing for a fake to compute anyway.
-
-
-@register_fake("pace::pace_addmm")
-def _fake_pace_addmm(bias: torch.Tensor, input: torch.Tensor, weight: torch.Tensor):
-    # pace_addmm performs: bias + input @ weight
-    # output shape: [input.size(0), weight.size(1)]
-    out_shape = list(input.size())
-    out_shape[-1] = weight.size(1)
-    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
 @register_fake("pace::fused_rope_apply")
@@ -205,3 +196,34 @@ def _fake_rmsnorm(
     eps: float,
 ):
     return torch.empty_like(x)
+
+
+@register_fake("pace::moe_route_softmax")
+def _fake_moe_route_softmax(
+    router_logits: torch.Tensor, topk: int, renormalize: bool = True
+):
+    num_tokens = router_logits.size(0)
+    ids = torch.empty((num_tokens, topk), dtype=torch.long, device=router_logits.device)
+    weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=router_logits.device
+    )
+    return ids, weights
+
+
+@register_fake("pace::libxsmm_moe_engine")
+def _fake_moe_engine(
+    output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    wt_gate: Optional[torch.Tensor],
+    wt_up: torch.Tensor,
+    wt_down: torch.Tensor,
+    gate_bias: Optional[torch.Tensor],
+    up_bias: Optional[torch.Tensor],
+    down_bias: Optional[torch.Tensor],
+    activation: str,
+    num_experts: int,
+):
+    # Void in-place op (schema `-> ()`): writes into `output`, returns nothing.
+    return None

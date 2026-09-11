@@ -16,7 +16,7 @@ session-wide statistics live in metrics.py.  This module owns:
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import aiohttp
 
@@ -28,7 +28,12 @@ from pace.server.router.engine_client import (
     _make_timeout,
 )
 from pace.server.router.metrics import SchedulerMetrics
-from pace.server.router.utils import Request, RequestStatus
+from pace.server.router.utils import (
+    Request,
+    RequestStatus,
+    requests_running_gauge,
+    requests_waiting_gauge,
+)
 from pace.utils.logging import PACE_DEBUG, PACE_ERROR, PACE_INFO, PACE_WARNING
 
 
@@ -62,9 +67,10 @@ class Scheduler(ABC):
         self.active_requests: Dict[str, Request] = {}
         self.is_running = False
         self.processing_tasks: List[asyncio.Task] = []
-        self.cancelled_requests: List[str] = []
+        self.cancelled_requests: Set[str] = set()
         self.session: aiohttp.ClientSession | None = None
         self._metric_tracking_task: Optional[asyncio.Task] = None
+        self._cache_metrics_task: Optional[asyncio.Task] = None
 
     async def start(self):
         """Start the scheduler processing loops (one per engine instance)."""
@@ -82,6 +88,12 @@ class Scheduler(ABC):
                     self.get_queue_size,
                 )
             )
+        self._cache_metrics_task = asyncio.create_task(
+            self.metrics.cache_metrics_loop(
+                lambda: self.is_running,
+                self.engine_urls,
+            )
+        )
         PACE_INFO(
             f"{self.__class__.__name__} started with {self.num_engines} parallel workers"
         )
@@ -95,15 +107,34 @@ class Scheduler(ABC):
                 await task
             except asyncio.CancelledError:
                 pass
-        if self._metric_tracking_task:
-            self._metric_tracking_task.cancel()
-            try:
-                await self._metric_tracking_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._metric_tracking_task, self._cache_metrics_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self.session:
             await self.session.close()
         PACE_INFO(f"{self.__class__.__name__} stopped")
+
+    def _update_gauges(self):
+        """Refresh Prometheus running/waiting gauges from current state."""
+        queue_size = self.get_queue_size()
+        requests_waiting_gauge.set(queue_size)
+        requests_running_gauge.set(
+            max(0, self.get_active_requests_count() - queue_size)
+        )
+
+    def _finalize_cancelled_queued(self, req: Request, cancelled: Set[str]):
+        """Finalize a request cancelled while still queued (never sent to engine)."""
+        cancelled.discard(req.request_id)
+        if req.req_stats.get("finished_at") is None:
+            req.req_stats["finished_at"] = time.time()
+        PACE_INFO(
+            f"Discarding cancelled queued request {req.request_id} before prefill"
+        )
+        asyncio.create_task(self._cleanup_request(req))
 
     async def submit_request(self, req: Request):
         """Submit a request: assign an engine via round-robin, enqueue for its worker."""
@@ -113,6 +144,7 @@ class Scheduler(ABC):
 
         self.active_requests[req.request_id] = req
         await self.request_queues[req.assigned_engine_index].put(req)
+        self._update_gauges()
         PACE_INFO(
             f"Request {req.request_id} submitted to queue and assigned to engine: {assigned_engine_url} (index: {req.assigned_engine_index})"
         )
@@ -120,6 +152,7 @@ class Scheduler(ABC):
     async def _cleanup_request(self, req: Request):
         """Delegate cleanup and metrics to SchedulerMetrics."""
         await self.metrics.cleanup_request(req, self.active_requests)
+        self._update_gauges()
 
     async def get_request_status(self, request_id: str) -> Optional[Dict]:
         """Get the status of a specific request."""
@@ -186,6 +219,10 @@ class IterativeScheduler(Scheduler):
         while self.is_running:
             try:
                 req = await worker_queue.get()
+                self._update_gauges()
+                if req.request_id in self.cancelled_requests:
+                    self._finalize_cancelled_queued(req, self.cancelled_requests)
+                    continue
                 PACE_INFO(
                     f"Worker {worker_id} picked up request {req.request_id} from dedicated queue"
                 )
@@ -206,7 +243,7 @@ class IterativeScheduler(Scheduler):
 
         try:
             async for token_data in iterative_generate_tokens(
-                req, self.active_requests, self.engine_url
+                req, self.cancelled_requests, self.engine_url
             ):
                 if token_data is not None:
                     await req.token_queue.put(token_data)
@@ -222,8 +259,10 @@ class IterativeScheduler(Scheduler):
             PACE_ERROR(f"Error processing request {req.request_id}: {str(e)}")
             req.status = RequestStatus.ERROR
             req.req_stats["finished_at"] = time.time()
+            await req.token_queue.put("ERROR")
             await req.token_queue.put(None)
 
+        self.cancelled_requests.discard(req.request_id)
         asyncio.create_task(self._cleanup_request(req))
 
 
@@ -299,10 +338,14 @@ class PrefillFirstScheduler(Scheduler):
                         pending.append(worker_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                self._update_gauges()
 
                 PACE_DEBUG(f"Worker {worker_id} draining {len(pending)} prefill(s)")
 
                 for r in pending:
+                    if r.request_id in self.cancelled_requests:
+                        self._finalize_cancelled_queued(r, self.cancelled_requests)
+                        continue
                     r.status = RequestStatus.PROCESSING
                     r.req_stats["end_wait_time"] = time.time()
                     result = await perform_prefill(r, worker_id, self.engine_url)
@@ -314,8 +357,11 @@ class PrefillFirstScheduler(Scheduler):
                         asyncio.create_task(self._cleanup_request(r))
                         continue
 
-                    if result != "COMPLETED":
-                        self.decode_queues[worker_id][r.request_id] = r
+                    if result == "COMPLETED":
+                        asyncio.create_task(self._cleanup_request(r))
+                        continue
+
+                    self.decode_queues[worker_id][r.request_id] = r
 
                 if self.decode_queues[worker_id]:
                     self._stop_events[worker_id].clear()
@@ -344,6 +390,8 @@ class PrefillFirstScheduler(Scheduler):
             RequestStatus.COMPLETED if status == "COMPLETED" else RequestStatus.ERROR
         )
         req.req_stats["finished_at"] = time.time()
+        if status != "COMPLETED" and final_token is None:
+            final_token = "ERROR"
         await req.token_queue.put(final_token)
         await clear_concluded_request(req_id, session, req.assigned_engine_url)
         asyncio.create_task(self._cleanup_request(req))
@@ -373,8 +421,7 @@ class PrefillFirstScheduler(Scheduler):
                             await self._clear_cancelled_request(
                                 req_id, session, worker_id
                             )
-                            if req_id in self.cancelled_requests:
-                                self.cancelled_requests.remove(req_id)
+                            self.cancelled_requests.discard(req_id)
                     PACE_DEBUG(
                         f"Worker {worker_id} decode loop active with {len(self.decode_queues[worker_id])} requests"
                     )
@@ -410,9 +457,13 @@ class PrefillFirstScheduler(Scheduler):
     ):
         """Remove a cancelled request from decode queue and notify engine."""
         if req_id in self.decode_queues[worker_id]:
-            engine_url = self.decode_queues[worker_id][req_id].assigned_engine_url
+            req = self.decode_queues[worker_id][req_id]
+            engine_url = req.assigned_engine_url
             del self.decode_queues[worker_id][req_id]
             PACE_INFO(
                 f"Worker {worker_id} cleared cancelled request {req_id} from decode queue"
             )
             await clear_concluded_request(req_id, session, engine_url)
+            if req.req_stats.get("finished_at") is None:
+                req.req_stats["finished_at"] = time.time()
+            asyncio.create_task(self._cleanup_request(req))

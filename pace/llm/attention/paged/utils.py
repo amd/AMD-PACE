@@ -16,6 +16,7 @@ These helpers are used by both the online server path
 
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from pace.llm.attention.base import KVCacheType, KVCacheManager
@@ -24,6 +25,109 @@ from pace.llm.attention.paged.ops import (
     PagedAttentionMetadata,
     get_optimal_attention_isa,
 )
+from pace.llm.attention.specs import compute_layer_kv_specs, resolve_text_config
+
+
+def make_local_attention_virtual_batches(
+    attn_chunk_size: int,
+    metadata: PagedAttentionMetadata,
+    block_size: int,
+) -> PagedAttentionMetadata:
+    """Rewrite paged metadata so a standard causal kernel produces chunked
+    (local) attention (Llama4 iRoPE local layers).
+
+    Chunked attention restricts every query at absolute position ``q`` to keys
+    within its own fixed-size chunk ``[floor(q/C)*C, q]``. Rather than teach the
+    C++ kernel a per-query window, we split each request into one *virtual*
+    request per local chunk it spans — each with a chunk-local ``seq_len`` and a
+    ``block_table`` sliced to that chunk's pages — and run the ordinary causal
+    kernel over the virtual batch. This is vLLM's ``make_local_attention_
+    virtual_batches`` approach; the query token order is preserved, so the
+    flattened output maps back 1:1.
+
+    Requires ``attn_chunk_size % block_size == 0``. Returns a new
+    ``PagedAttentionMetadata``; ``slot_mapping`` is shared unchanged (KV is
+    written with the real per-token slots before this transform is applied).
+    """
+    if attn_chunk_size % block_size != 0:
+        raise ValueError(
+            f"attn_chunk_size ({attn_chunk_size}) must be divisible by "
+            f"block_size ({block_size}) for chunked paged attention."
+        )
+
+    def cdiv(a, b):
+        return -(-a // b)
+
+    query_start_loc_np = metadata.query_start_loc.cpu().numpy()
+    seq_lens_np = metadata.seq_lens.cpu().numpy()
+    block_table = metadata.block_table
+
+    q_seqlens = query_start_loc_np[1:] - query_start_loc_np[:-1]
+    actual_batch_size = seq_lens_np.shape[0]
+
+    # Tokens of each request that fall in its first (possibly partial) chunk.
+    q_tokens_in_first_block = np.minimum(
+        attn_chunk_size - ((seq_lens_np - q_seqlens) % attn_chunk_size), q_seqlens
+    ).astype(np.int32)
+    tokens_in_last_block = attn_chunk_size + (seq_lens_np % -attn_chunk_size)
+    local_blocks = 1 + cdiv(q_seqlens - q_tokens_in_first_block, attn_chunk_size)
+
+    # Per-virtual-batch query lengths (first/last chunk may be partial).
+    cu_num_blocks = np.cumsum(local_blocks)
+    virtual_batches = int(cu_num_blocks[-1])
+    block_offsets = np.repeat(cu_num_blocks - local_blocks, local_blocks)
+    arange = np.arange(virtual_batches, dtype=np.int32) - block_offsets
+    rarange = np.repeat(local_blocks, local_blocks) - arange - 1
+    seqlens_q_local = np.repeat(q_seqlens - q_tokens_in_first_block, local_blocks)
+    seqlens_q_local[arange == 0] = q_tokens_in_first_block
+    seqlens_q_local[arange > 0] = np.minimum(
+        seqlens_q_local - attn_chunk_size * (arange - 1), attn_chunk_size
+    )[arange > 0]
+
+    cu_seqlens_q_local = np.empty(virtual_batches + 1, dtype=np.int32)
+    np.cumsum(seqlens_q_local, out=cu_seqlens_q_local[1:])
+    cu_seqlens_q_local[0] = 0
+
+    # Per-virtual-batch key lengths: a full chunk except the final one.
+    seqlens_k_local = np.full(virtual_batches, attn_chunk_size, dtype=np.int32)
+    seqlens_k_local[cu_num_blocks - 1] = tokens_in_last_block
+
+    k_seqstarts_absolute = np.repeat(seq_lens_np, local_blocks) - (
+        rarange * attn_chunk_size + np.repeat(tokens_in_last_block, local_blocks)
+    )
+    block_starts = k_seqstarts_absolute // block_size
+    pages_per_local_batch = attn_chunk_size // block_size
+
+    # Slice each virtual batch's block_table rows to its chunk's pages.
+    block_indices = block_starts[:, None] + np.arange(
+        pages_per_local_batch, dtype=np.int32
+    )
+    block_indices = block_indices.reshape(-1).clip(max=block_table.shape[1] - 1)
+    batch_indices = np.repeat(
+        np.arange(actual_batch_size, dtype=np.int32),
+        local_blocks * pages_per_local_batch,
+    )
+    block_table_local = block_table[
+        torch.from_numpy(batch_indices).long(),
+        torch.from_numpy(block_indices).long(),
+    ].view(virtual_batches, -1)
+
+    query_start_loc_local = torch.from_numpy(cu_seqlens_q_local).to(
+        metadata.query_start_loc.device
+    )
+    seq_lens_local = torch.from_numpy(seqlens_k_local).to(metadata.seq_lens.device)
+
+    return PagedAttentionMetadata(
+        isa=metadata.isa,
+        num_actual_tokens=metadata.num_actual_tokens,
+        max_query_len=int(seqlens_q_local.max()),
+        query_start_loc=query_start_loc_local,
+        max_seq_len=int(seqlens_k_local.max()),
+        seq_lens=seq_lens_local,
+        block_table=block_table_local,
+        slot_mapping=metadata.slot_mapping,
+        causal=True,
+    )
 
 
 def create_paged_kv_cache_manager(
@@ -47,29 +151,37 @@ def create_paged_kv_cache_manager(
     Returns:
         A KVCacheManager configured with PagedKVCache for each layer.
     """
-    num_heads = model_config.num_attention_heads
-    num_kv_heads = getattr(model_config, "num_key_value_heads", num_heads)
-    head_dim = getattr(model_config, "head_dim", model_config.hidden_size // num_heads)
-    num_layers = model_config.num_hidden_layers
+    from pace.llm.attention.paged.cache import _PagedKVSharingView
+
+    specs = compute_layer_kv_specs(model_config)
+    num_layers = len(specs)
 
     blocks_per_seq = (max_seq_length + block_size - 1) // block_size
     total_blocks = blocks_per_seq * batch_size
     total_cache_length = total_blocks * block_size
 
+    cache_objects = [None] * num_layers
+    for layer_idx, spec in enumerate(specs):
+        if spec.is_shared:
+            continue
+        cache_objects[layer_idx] = PagedKVCache(
+            max_seq_length=total_cache_length,
+            num_kv_heads=spec.num_kv_heads,
+            head_dim=spec.head_dim,
+            block_size=block_size,
+            dtype=dtype,
+        )
+    for layer_idx, spec in enumerate(specs):
+        if spec.is_shared:
+            cache_objects[layer_idx] = _PagedKVSharingView(
+                cache_objects[spec.kv_sharing_target]
+            )
+
     manager = KVCacheManager.__new__(KVCacheManager)
     manager.num_layers = num_layers
     manager.cache_type = KVCacheType.PAGED
     manager.kv_cache_class = PagedKVCache
-    manager.cache_objects = [
-        PagedKVCache(
-            max_seq_length=total_cache_length,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            block_size=block_size,
-            dtype=dtype,
-        )
-        for _ in range(num_layers)
-    ]
+    manager.cache_objects = cache_objects
     manager._blocks_per_seq = blocks_per_seq
     manager._batch_size = batch_size
     return manager
@@ -159,8 +271,9 @@ def build_paged_attention_metadata(
     blocks_per_seq = getattr(kv_cache_manager, "_blocks_per_seq", 0)
     batch_size = len(actual_lengths)
 
-    num_heads = model_config.num_attention_heads
-    head_dim = getattr(model_config, "head_dim", model_config.hidden_size // num_heads)
+    text_config = resolve_text_config(model_config)
+    num_heads = text_config.num_attention_heads
+    head_dim = getattr(text_config, "head_dim", text_config.hidden_size // num_heads)
 
     if past_lengths is None:
         past_lengths = torch.zeros(batch_size, dtype=torch.long)
@@ -296,8 +409,9 @@ def build_batched_paged_attention_metadata(
     """
     num_reqs = len(layer_caches)
 
-    num_heads = model_config.num_attention_heads
-    head_dim = getattr(model_config, "head_dim", model_config.hidden_size // num_heads)
+    text_config = resolve_text_config(model_config)
+    num_heads = text_config.num_attention_heads
+    head_dim = getattr(text_config, "head_dim", text_config.hidden_size // num_heads)
 
     if isa is None:
         isa = get_cached_isa(dtype, block_size, head_dim)

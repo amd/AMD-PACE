@@ -25,11 +25,9 @@ except Exception:  # pragma: no cover
     __version_tuple__ = (0, 0, 0)
 
 
-# pace-vllm tracks vLLM's plugin / attention / KV-cache / compile APIs, all of
-# which churn between minor releases. Bump this range whenever a new vLLM
-# release is verified end-to-end. Hard-coded by design -- there is no env-var
-# override; the supported range is a developer decision under source review.
-_PACE_VLLM_SUPPORTED_VLLM_RANGE = ">=0.21.0,<0.22.0"
+# Extend this hard-coded range only after end-to-end verification because
+# pace-vllm integrates with vLLM's internal APIs.
+_PACE_VLLM_SUPPORTED_VLLM_RANGE = ">=0.25.0,<=0.28.0"
 
 
 # Module-level logger. Re-initialised by `_init_logging()` on first

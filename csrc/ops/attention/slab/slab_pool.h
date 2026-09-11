@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pace {
@@ -103,6 +104,7 @@ struct SlabPool : torch::CustomClassHolder {
   // Per-sequence 4-way dispatch: decode_gqa, decode_head, mtd, BRGeMM prefill.
   // sliding_window: 0 = full causal, >0 = window size
   // sinks: empty tensor = no sinks, [num_heads] = sink biases
+  // chunk_size: 0 = disabled, >0 = chunked (local) attention window
   at::Tensor attention(
       const std::vector<int64_t>& sequence_ids,
       const at::Tensor& query,
@@ -110,10 +112,41 @@ struct SlabPool : torch::CustomClassHolder {
       const std::vector<int64_t>& q_start_offsets,
       double scale,
       int64_t sliding_window = 0,
-      const at::Tensor& sinks = {});
+      const at::Tensor& sinks = {},
+      int64_t chunk_size = 0);
+
+  // Expose physical block indices for a sequence (for prefix caching).
+  std::vector<int64_t> get_block_indices(int64_t sequence_id);
+
+  // Eagerly allocate blocks (without advancing seq_len) for prefix preinsert.
+  void reserve_blocks(int64_t sequence_id, int64_t num_blocks);
+
+  // Assign existing pool blocks to a sequence and advance seq_len.
+  // Zero-copy: the destination simply references the same physical
+  // blocks — no data is moved.  Used by prefix caching so a new
+  // sequence can reuse cached KV data without re-computing it.
+  void assign_prefix_blocks(
+      int64_t dst_sequence_id,
+      const std::vector<int64_t>& pool_block_indices,
+      int64_t num_tokens);
+
+  // Repoint one logical block of a sequence at another pool block (prefix
+  // dedup).
+  void reassign_block(
+      int64_t sequence_id,
+      int64_t block_pos,
+      int64_t new_pool_block);
+
+  // Mark blocks as "cached" so remove_sequence skips freeing them.
+  // Returns how many blocks were newly marked.
+  int64_t retain_blocks(const std::vector<int64_t>& pool_block_indices);
+
+  // Release previously retained blocks back to the free list.
+  void release_retained_blocks(const std::vector<int64_t>& pool_block_indices);
 
  private:
   int64_t allocate_block(int64_t sequence_id, int64_t block_index);
+  std::unordered_set<int64_t> retained_blocks_;
 };
 
 int64_t autotune_block_size(int64_t num_kv_heads, int64_t head_dim);

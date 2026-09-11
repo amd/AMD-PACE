@@ -140,7 +140,7 @@ class HfRunner:
 
             # output.logits: tuple of max_steps tensors, each [batch, vocab_size]
             hf_logits = torch.stack(output.logits, dim=1)
-            hf_logprobs = torch.log_softmax(hf_logits.float(), dim=-1)
+            hf_logprobs = torch.log_softmax(hf_logits, dim=-1, dtype=torch.float32)
 
             eos_ids = self.tokenizer.eos_token_id
             if not isinstance(eos_ids, list):

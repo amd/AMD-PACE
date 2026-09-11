@@ -77,7 +77,7 @@ const at::BFloat16* v_base = k_base + pvo;
 
 ### Block Size Auto-Tuning
 
-When `block_size` is not explicitly set via `SLAB_BLOCK_SIZE`, the Python integration auto-tunes it by reading the L2 cache size from sysfs and selecting the largest block size from {256, 128, 64, 32} such that one block's KV data fits within L2/4. This ensures that a single block's K and V data remain L2-resident during the attention computation.
+When `block_size` is not explicitly set via `SLAB_BLOCK_SIZE`, the integration reads the L2 cache size and selects the largest block size from {256, 128, 64, 32} whose calculated KV bytes do not exceed one quarter of L2.
 
 Block size must be a multiple of 16 (required by BRGeMM sub-blocking) and at most 256 (limited by fixed-size score arrays in decode kernels).
 
@@ -130,6 +130,7 @@ output = layer_view.attend(
     seq_lens=None,
     sliding_window=0,
     sinks=torch.tensor([]),
+    chunk_size=0,
 )
 ```
 
@@ -153,7 +154,7 @@ pool.cache_update([0], keys, values, [])
 # Decode loop: append one token per step
 for step in range(decode_steps):
     pool.cache_update([0], k_new, v_new, [])
-    output = pool.attention([0], query, [], [], scale, 0, torch.tensor([]))
+    output = pool.attention([0], query, [], [], scale, 0, torch.tensor([]), 0)
 
 # Cleanup: return all blocks to the free list
 pool.remove_sequence(0)
@@ -163,7 +164,7 @@ pool.remove_sequence(0)
 
 - **`create_sequence(seq_id, max_seq_len)`** — registers a sequence and pre-reserves vector capacity for block indices.
 - **`cache_update(seq_ids, keys, values, token_counts)`** — writes KV data into pool blocks. Allocates new blocks as needed.
-- **`attention(seq_ids, query, query_lens, q_start_offsets, scale, sliding_window, sinks)`** — computes attention for all sequences in one call. Supports 3D ragged and 4D batched query input. Pass `[]` for `q_start_offsets` (computed internally for 4D input).
+- **`attention(seq_ids, query, query_lens, q_start_offsets, scale, sliding_window, sinks, chunk_size=0)`** — computes attention for all sequences in one call. Supports 3D ragged and 4D batched query input. Pass `[]` for `q_start_offsets` (computed internally for 4D input).
 - **`remove_sequence(seq_id)`** — returns all blocks to the free list and erases the sequence.
 - **`truncate_sequence(seq_id, remove_len)`** — removes tokens from the end of a sequence, freeing blocks that are no longer needed.
 

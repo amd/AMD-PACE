@@ -3,12 +3,9 @@
 
 -r build_requirements.txt
 -r runtime_requirements.txt
-torchvision==0.27.0+cpu
-matplotlib>=3.9.4
-datasets>=3.3.2
-lm_eval==0.4.12
-langdetect==1.0.9
-black==25.1.0
-flake8>=7.1.1
-hypothesis>=6.113.0
-expecttest>=0.2.1
+datasets>=5.0.0
+httpx==0.28.1
+black==26.5.1
+flake8>=7.3.0
+hypothesis>=6.155.7
+expecttest>=0.3.0

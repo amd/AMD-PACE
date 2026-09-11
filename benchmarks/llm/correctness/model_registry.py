@@ -30,8 +30,13 @@ MODELS = {
     "GPTJForCausalLM": ModelInfo("GPTJForCausalLM", "EleutherAI/gpt-j-6b"),
     "LlamaForCausalLM": ModelInfo("LlamaForCausalLM", "NousResearch/Llama-3.2-1B"),
     "Qwen2ForCausalLM": ModelInfo("Qwen2ForCausalLM", "Qwen/Qwen2.5-0.5B"),
+    "Qwen3ForCausalLM": ModelInfo("Qwen3ForCausalLM", "Qwen/Qwen3-0.6B"),
+    "Qwen3MoeForCausalLM": ModelInfo("Qwen3MoeForCausalLM", "Qwen/Qwen3-30B-A3B"),
     "Phi3ForCausalLM": ModelInfo("Phi3ForCausalLM", "microsoft/Phi-4-mini-instruct"),
     "Gemma3ForCausalLM": ModelInfo("Gemma3ForCausalLM", "unsloth/gemma-3-270m"),
+    "Gemma4ForConditionalGeneration": ModelInfo(
+        "Gemma4ForConditionalGeneration", "google/gemma-4-E2B"
+    ),
     "GptOssForCausalLM": ModelInfo("GptOssForCausalLM", "openai/gpt-oss-20b"),
 }
 

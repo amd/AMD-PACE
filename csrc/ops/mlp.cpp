@@ -5,12 +5,10 @@
  ******************************************************************************/
 
 #include <core/logging.h>
-#include <ops/cpu.h>
-#include <ops/jit_helper.h>
 #include <ops/kernels/mlp_kernel.h>
 #include <ops/mlp.h>
-#include <pace_tensor/pace_aten_interface.h>
-#include <pace_tensor/pace_tensor_impl.h>
+#include <ops/onednn.h>
+#include <ops/onednn_utils.h>
 #include <torch/library.h>
 #include <utils/utils.h>
 

@@ -10,6 +10,9 @@ SUPPORTED_MODEL_LIST: List[dict] = [
     {"id": "meta-llama/Llama-3.2-3B", "dtypes": ["bfloat16", "float32"]},
     {"id": "EleutherAI/gpt-j-6b", "dtypes": ["bfloat16", "float32"]},
     {"id": "Qwen/Qwen2-7B-Instruct", "dtypes": ["bfloat16", "float32"]},
+    {"id": "Qwen/Qwen3-0.6B", "dtypes": ["bfloat16", "float32"]},
+    {"id": "Qwen/Qwen3-8B", "dtypes": ["bfloat16", "float32"]},
+    {"id": "Qwen/Qwen3-30B-A3B", "dtypes": ["bfloat16", "float32"]},
     {"id": "facebook/opt-6.7b", "dtypes": ["bfloat16", "float32"]},
     {"id": "microsoft/phi-4", "dtypes": ["bfloat16", "float32"]},
 ]

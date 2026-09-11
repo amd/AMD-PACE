@@ -6,10 +6,10 @@
 
 """PacePlatform: vLLM CPU platform for PACE.
 
-Subclass of `CpuPlatform` that swaps the vLLM worker class to `PaceWorker`,
-routes attention to `PaceAttentionBackend`, and force-disables vLLM prefix
-caching (`PaceAttentionImpl` does not honor `num_computed_tokens` cache
-hits). All other CPU defaults are inherited.
+Subclass of `CpuPlatform` that swaps the vLLM worker class to `PaceWorker`
+and routes attention to `PaceAttentionBackend`. Prefix caching is supported
+via `PaceSlabConnector` (a KVConnectorBase_V1 implementation that manages
+prefix cache lifecycle in SlabPool). All other CPU defaults are inherited.
 """
 
 from __future__ import annotations
@@ -106,6 +106,119 @@ def _resolve_pace_custom_op_names() -> list[str]:
     ]
 
 
+def _is_hybrid_mamba(cache_config) -> bool:
+    if getattr(cache_config, "mamba_block_size", None) is not None:
+        return True
+    mode = getattr(cache_config, "mamba_cache_mode", None)
+    return mode not in (None, "none")
+
+
+def _hf_text_config(hf_config):
+    """Prefer the nested text tower on multimodal wrappers (Gemma4, Qwen3.5)."""
+    text = getattr(hf_config, "text_config", None)
+    if text is not None and hasattr(text, "num_attention_heads"):
+        return text
+    return hf_config
+
+
+def _attention_geometry(model_config) -> tuple[int, int]:
+    """(num_kv_heads, head_dim) for slab autotune.
+
+    vLLM ModelConfig getters already unwrap `text_config` and pick a
+    representative head_dim on heterogeneous models. Flat HF configs
+    (and unit-test stubs) fall back to the Llama-style attributes.
+    """
+    if hasattr(model_config, "get_head_size") and hasattr(
+        model_config, "get_total_num_kv_heads"
+    ):
+        return model_config.get_total_num_kv_heads(), model_config.get_head_size()
+
+    hf_config = _hf_text_config(getattr(model_config, "hf_config", model_config))
+    num_attn = hf_config.num_attention_heads
+    num_kv_heads = getattr(hf_config, "num_key_value_heads", num_attn)
+    head_dim = getattr(hf_config, "head_dim", None)
+    if not head_dim:
+        head_dim = hf_config.hidden_size // num_attn
+    return int(num_kv_heads), int(head_dim)
+
+
+def _resolve_slab_block_size_for_connector(vllm_config: "VllmConfig") -> int:
+    """Pre-compute slab block size for the connector's extra_config.
+
+    Reads the env override first, otherwise uses the C++ L2 autotuner.
+    """
+    from pace_vllm.v1.kv_cache import (
+        _autotune_slab_block_size,
+        _resolve_slab_block_size_override,
+    )
+
+    env_override = _resolve_slab_block_size_override()
+    if env_override is not None:
+        return env_override
+
+    num_kv_heads, head_dim = _attention_geometry(vllm_config.model_config)
+    return _autotune_slab_block_size(num_kv_heads, head_dim)
+
+
+def _inject_slab_connector(vllm_config: "VllmConfig") -> None:
+    """Install the connector with scheduler and slab block sizes aligned."""
+    from vllm.config import KVTransferConfig
+
+    cache_config = vllm_config.cache_config
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        raise ValueError(
+            "pace-vllm: prefix caching cannot yet be combined with speculative "
+            "decoding: lookahead slots allocate blocks the step never writes."
+        )
+    executor = vllm_config.parallel_config.distributed_executor_backend
+    if executor not in ("uni", "mp"):
+        raise ValueError(
+            "pace-vllm: multiprocessing prefix caching requires the 'uni' or "
+            f"'mp' executor, got {executor!r}."
+        )
+    async_scheduling = vllm_config.scheduler_config.async_scheduling
+    if async_scheduling is True:
+        raise ValueError(
+            "pace-vllm: prefix caching does not yet support async scheduling."
+        )
+    if async_scheduling is None:
+        vllm_config.scheduler_config.async_scheduling = False
+    existing = vllm_config.kv_transfer_config
+    if getattr(cache_config, "kv_offloading_size", None) is not None:
+        raise ValueError(
+            "pace-vllm: prefix caching cannot yet be combined with KV offloading."
+        )
+    if existing is not None and existing.kv_connector != "PaceSlabConnector":
+        raise ValueError(
+            "pace-vllm: prefix caching cannot yet be combined with "
+            f"KV connector {existing.kv_connector!r}."
+        )
+    slab_block_size = _resolve_slab_block_size_for_connector(vllm_config)
+    cache_config.enable_prefix_caching = False
+
+    # vLLM derives single-group hash granularity from block_size rather than
+    # hash_block_size, so scheduler and slab physical blocks must share it.
+    prev_block_size = cache_config.block_size
+    cache_config.block_size = slab_block_size
+
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="PaceSlabConnector",
+        kv_role="kv_both",
+        kv_connector_module_path="pace_vllm.v1.connector",
+        kv_connector_extra_config={
+            **(existing.kv_connector_extra_config if existing is not None else {}),
+            "slab_block_size": slab_block_size,
+        },
+    )
+
+    logger.info(
+        "pace-vllm: injected PaceSlabConnector for prefix caching "
+        "(slab_block_size=%d, prev_block_size=%d).",
+        slab_block_size,
+        prev_block_size,
+    )
+
+
 def _enable_pace_custom_ops(vllm_config: "VllmConfig") -> list[str]:
     """Append pace OOT opt-ins to `compilation_config.custom_ops`.
 
@@ -200,17 +313,29 @@ class PacePlatform(CpuPlatform):
         prev = parallel_config.worker_cls
         parallel_config.worker_cls = _PACE_WORKER_CLS
 
-        # PaceAttentionImpl does not honor num_computed_tokens cache hits, so
-        # a cache hit would attend over a partial K/V tail (wrong output).
         cache_config = vllm_config.cache_config
-        if cache_config.enable_prefix_caching:
-            logger.warning(
-                "pace-vllm: disabling vLLM prefix caching (PaceAttentionImpl "
-                "does not yet honor num_computed_tokens cache hits)."
-            )
-            cache_config.enable_prefix_caching = False
 
         auto_enabled = _enable_pace_custom_ops(vllm_config)
+
+        pace_prefix_caching = cache_config.enable_prefix_caching
+        if pace_prefix_caching and _is_hybrid_mamba(cache_config):
+            # vLLM 0.28+ auto-enables prefix cache and mamba_cache_mode='align'
+            # for hybrid models such as Qwen3.5. Slab prefix restore does not
+            # yet cover SSM state, so drop prefix caching rather than abort.
+            logger.warning(
+                "pace-vllm: disabling prefix caching for hybrid Mamba/SSM "
+                "models (mamba_block_size=%s, mamba_cache_mode=%s).",
+                getattr(cache_config, "mamba_block_size", None),
+                getattr(cache_config, "mamba_cache_mode", None),
+            )
+            cache_config.enable_prefix_caching = False
+            # Match vLLM's MambaModelConfig path when prefix caching is off:
+            # mode 'none' and mamba_block_size = max_model_len.
+            cache_config.mamba_cache_mode = "none"
+            cache_config.mamba_block_size = vllm_config.model_config.max_model_len
+            pace_prefix_caching = False
+        elif pace_prefix_caching:
+            _inject_slab_connector(vllm_config)
 
         logger.info(
             "pace-vllm: PacePlatform active (worker_cls=%s, was=%s, "
@@ -218,6 +343,6 @@ class PacePlatform(CpuPlatform):
             parallel_config.worker_cls,
             prev,
             _PACE_BACKEND_CLS,
-            cache_config.enable_prefix_caching,
+            pace_prefix_caching,
             auto_enabled,
         )

@@ -9,6 +9,7 @@ Drop-in: install it next to vLLM, and `vllm serve` automatically routes through 
 - **Drop-in** — `vllm.platform_plugins` entry point is auto-discovered at startup; nothing to wire up.
 - **PACE kernels for free** — vLLM's CPU attention backend, KV cache, and Linear / RMSNorm layers are transparently replaced with their PACE equivalents (`pace::rmsnorm`, `pace::libxsmmlinear_plain`, `SlabPool`-backed KV).
 - **Fused MLP under compile mode** — gated SwiGLU / GeGLU and ungated `fc1->act->fc2` MLPs are rewritten into a single `pace::libxsmm_fused_mlp` call.
+- **FusedMoE** — vLLM's unquantized CPU MoE path can use PACE's optimized routed-expert implementation.
 - **Self-contained** — bundles its own `libpace_cpp.so`, so you don't need `amd-pace` installed alongside.
 
 ## Contents
@@ -25,8 +26,8 @@ Drop-in: install it next to vLLM, and `vllm serve` automatically routes through 
 ## Requirements
 
 - Linux x86_64 with AVX512F + AVX512_BF16 (AMD Zen4 / EPYC 5th Gen or newer)
-- Python 3.10 – 3.13
-- vLLM 0.21.x (CPU build) — see [docs/Internals.md](docs/Internals.md#vllm-version-compatibility) for the exact range and how it's enforced.
+- Python 3.10 – 3.14
+- vLLM 0.25.x – 0.28.0 (CPU build) — see [docs/Internals.md](docs/Internals.md#vllm-version-compatibility) for the exact range and how it's enforced.
 
 ## Install
 
@@ -46,13 +47,13 @@ Drop-in: install it next to vLLM, and `vllm serve` automatically routes through 
    conda activate pace-vllm-env
    ```
 
-   > pace-vllm supports Python 3.10 – 3.13; 3.12 is the most thoroughly exercised version.
+   > pace-vllm supports Python 3.10 – 3.14; 3.12 is the most thoroughly exercised version.
 
 2. **Install vLLM (CPU build).** The `+cpu` wheel isn't on PyPI, so pull it from vLLM's GitHub release directly:
 
    ```bash
    pip install --extra-index-url https://download.pytorch.org/whl/cpu \
-     https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl
+     https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl
    ```
 
 3. **Install pace-vllm:**
@@ -129,19 +130,21 @@ VLLM_PLUGINS="" vllm serve <model>
 
 ## What works
 
-- **Models** — Llama 3.x family (primary target; e.g. `meta-llama/Llama-3.1-8B`, `meta-llama/Llama-3.2-1B`), Gemma 3 (sliding window + full attention mix), GPT-OSS (attention sinks) etc with [Slab Attention](../../docs/SlabAttention.md) backend.
+- **Models** — decoder-only model paths with standard, sliding-window, or sink attention use PACE's CPU attention and operator integrations. Exact architecture availability is determined by the installed supported vLLM version.
 - **MLP fusion** (compile mode only) — gated SwiGLU / GeGLU and ungated `fc1->act->fc2`, across silu / gelu-tanh / gelu-exact / relu.
 - **KV sharing across layers**.
+- **Prefix caching** — PACE's SlabPool connector retains and restores reusable prefix blocks.
 - **vLLM preemption** — slab K/V resets when vLLM frees blocks; the sequence re-prefills from token 0 on resume.
+- **FusedMoE** — PACE's routed-expert path is registered as a vLLM out-of-tree implementation.
 - **Decoder-only attention**.
 
 ## What doesn't (yet)
 
 - Encoder / cross / encoder-only attention.
-- vLLM prefix caching (force-disabled at startup).
-- MLA, FP8 KV, BNBA quantization.
-- Multi-process tensor / pipeline parallel (one worker per instance).
-- AMX instruction path — PACE's libXSMM kernels fail on AMX. On AMX-enabled CPUs, set `LIBXSMM_TARGET=cpx` to force the AVX-512 (CPX) path and disable AMX.
+- MLA and FP8 KV cache.
+- Prefix caching with speculative decoding, async scheduling, KV offloading,
+  another KV connector, or hybrid Mamba/SSM cache models. Prefix caching
+  requires the `uni` or `mp` executor and uniform slab block sizing.
 
 ## Tests
 

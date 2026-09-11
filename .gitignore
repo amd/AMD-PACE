@@ -191,3 +191,6 @@ cython_debug/
 
 # Do not include pace/_version.py since it is generated
 pace/_version.py
+
+# PACE Agent experiment outputs (rundirs, traces, trajectories) are generated, not source
+pace_agent_results/

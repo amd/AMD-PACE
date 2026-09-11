@@ -9,6 +9,7 @@ from .linear import Linear, RepeatedKVLinear, FusedQKVLinear
 from .normalization import (
     LayerNorm,
     RMSNorm,
+    L2Norm,
     Gemma3RMSNorm,
     FusedRMSNormResidual,
     FusedGemma3RMSNormResidual,
@@ -23,6 +24,7 @@ from .fused_linear import (
     FusedLinearSiLU,
 )
 from .mlp import MergedMLP
+from .moe import MoEExperts
 from pace.llm.attention.paged.ops import (
     PagedAttentionMetadata,
     paged_attention_reshape_and_cache,
@@ -43,6 +45,7 @@ __all__ = [
     "RepeatedKVLinear",
     "LayerNorm",
     "RMSNorm",
+    "L2Norm",
     "Gemma3RMSNorm",
     "FusedRMSNormResidual",
     "FusedGemma3RMSNormResidual",
@@ -56,6 +59,7 @@ __all__ = [
     "FusedLinearRelu",
     "FusedLinearSiLU",
     "MergedMLP",
+    "MoEExperts",
     "FusedQKVLinear",
     "PagedAttentionMetadata",
     "paged_attention_reshape_and_cache",

@@ -313,3 +313,85 @@ class TestContiguousAttention(TestCase):
         )
 
         MaskCache.reset()
+
+    def test_chunked_mask_uses_model_positions_with_leading_pad(self):
+        """Chunk boundaries follow model positions, not physical cache indices:
+        with two left pads and chunk_size=4, physical indices 2-5 are positions
+        0-3 and must stay in one chunk rather than being split at physical 4.
+        """
+        from pace.llm.attention.contiguous.backend import MaskCache
+
+        MaskCache.reset()
+        cache = MaskCache()
+        dtype = torch.float32
+        min_val = torch.finfo(dtype).min
+        chunk_size = 4
+
+        # 2 left pads + 4 real tokens (positions 0..3) -> a single chunk.
+        mask = cache.get(
+            1,
+            6,
+            6,
+            6,
+            dtype,
+            leading_pad=torch.tensor([2]),
+            chunk_size=chunk_size,
+        )
+        allowed = mask[0, 0] > (min_val / 2)
+
+        got = [j for j in range(6) if bool(allowed[5, j])]
+        self.assertEqual(
+            got,
+            [2, 3, 4, 5],
+            "Left pad must not split real positions 0-3 across chunk boundary",
+        )
+
+        # The real-token block must match an unpadded prefill.
+        unpadded = cache.get(
+            1,
+            4,
+            4,
+            4,
+            dtype,
+            leading_pad=None,
+            chunk_size=chunk_size,
+        )[0, 0] > (min_val / 2)
+        self.assertTrue(
+            torch.equal(allowed[2:, 2:], unpadded),
+            "Padded real-token attention pattern must equal the unpadded one",
+        )
+
+        # Per-sequence differing pads in one batch must be handled independently.
+        batched = cache.get(
+            2,
+            7,
+            7,
+            7,
+            dtype,
+            leading_pad=torch.tensor([0, 3]),
+            chunk_size=chunk_size,
+        )
+        ref_a = cache.get(
+            1,
+            7,
+            7,
+            7,
+            dtype,
+            leading_pad=torch.tensor([0]),
+            owner="a",
+            chunk_size=chunk_size,
+        )
+        ref_b = cache.get(
+            1,
+            7,
+            7,
+            7,
+            dtype,
+            leading_pad=torch.tensor([3]),
+            owner="b",
+            chunk_size=chunk_size,
+        )
+        self.assertTrue(torch.equal(batched[0], ref_a[0]))
+        self.assertTrue(torch.equal(batched[1], ref_b[0]))
+
+        MaskCache.reset()

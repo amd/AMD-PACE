@@ -763,7 +763,9 @@ class Generator(object):
                 full_logits = getattr(self, "_prefill_full_logits", None)
                 if full_logits is None:
                     full_logits = model_out.logits
-                input_logprobs = torch.log_softmax(full_logits, dim=-1)
+                input_logprobs = torch.log_softmax(
+                    full_logits, dim=-1, dtype=torch.float32
+                )
                 self._prefill_full_logits = None
 
             all_tokens, next_tokens, unfinished_sequences, _, probs, logprobs = (

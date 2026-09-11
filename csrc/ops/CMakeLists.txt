@@ -14,12 +14,12 @@ file(GLOB OPS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/*.h)
 file(GLOB OPS_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 
 # KERNELS_CPP_FILES will contain all the files which will not end with avx512.cpp
-file(GLOB KERNELS_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.cpp)
+file(GLOB_RECURSE KERNELS_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.cpp)
 FILE(GLOB LIBXSMM_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/libxsmm_dependency/*.cpp)
 list(FILTER KERNELS_CPP_FILES EXCLUDE REGEX ".*avx512.cpp$")
 
 # KERNELS_AVX512_CPP_FILES will contain all the files which end with avx512.cpp
-file(GLOB KERNELS_AVX512_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/*avx512.cpp)
+file(GLOB_RECURSE KERNELS_AVX512_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/*avx512.cpp)
 
 # Attention backend kernels (organized under attention/ subdirectories)
 file(GLOB_RECURSE ATTN_CPP_FILES ${CMAKE_CURRENT_SOURCE_DIR}/attention/*.cpp)

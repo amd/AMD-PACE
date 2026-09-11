@@ -177,21 +177,6 @@ def get_args() -> argparse.Namespace:
     #     },
     #     "tasks": [
     #         {
-    #             "task_name": "mmlu",
-    #             "num_fewshot": 5,
-    #             "limit": 1
-    #         },
-    #         {
-    #             "task_name": "arc_easy",
-    #             "num_fewshot": 25,
-    #             "limit": 1
-    #         },
-    #         {
-    #             "task_name": "bbh_cot_fewshot ",
-    #             "num_fewshot": 3,
-    #             "limit": 1
-    #         },
-    #         {
     #             "task_name": "gsm8k",
     #             "num_fewshot": 8,
     #             "limit": 1

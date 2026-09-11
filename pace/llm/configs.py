@@ -17,10 +17,11 @@ from typing import Union, Optional, List
 
 import torch
 from transformers import PreTrainedTokenizerBase
+from pace.ops.moe import MoEConfig  # noqa: F401 — re-exported for model files
 
 from pace.llm.ops import LLMOperatorType, BackendType
 from pace.llm.attention import AttentionBackendType, KVCacheType
-from pace.utils.logging import PACE_LLM_ASSERT, PACE_LLM_WARNING, PACE_LLM_DEBUG
+from pace.utils.logging import PACE_LLM_ASSERT, PACE_LLM_WARNING
 
 CACHE_COMPATIBLE_ATTENTION = {
     KVCacheType.DYNAMIC: {AttentionBackendType.JIT, AttentionBackendType.NATIVE},
@@ -543,39 +544,25 @@ class OperatorConfig(UserDict):
                     f"Valid values are: {list(BackendType)}",
                 )
 
-        for key in LLMOperatorType:
-            if key not in self.keys():
-                if key == LLMOperatorType.Attention:
-                    self[key] = AttentionBackendType.JIT
-                else:
-                    self[key] = BackendType.NATIVE
-                PACE_LLM_DEBUG(
-                    f"{key} is not set in the OperatorConfig. "
-                    f"Defaulting to {self[key]}."
-                )
-
         if cache_type is not None:
             user_attn = self.get(LLMOperatorType.Attention)
             compatible = CACHE_COMPATIBLE_ATTENTION.get(cache_type, set())
             if compatible and user_attn not in compatible:
                 forced = CACHE_DEFAULT_ATTENTION[cache_type]
-                PACE_LLM_WARNING(
-                    f"Attention backend '{user_attn}' is incompatible with "
-                    f"cache type '{cache_type.value}'. Overriding to '{forced}'."
-                )
+                if user_attn is not None:
+                    PACE_LLM_WARNING(
+                        f"Attention backend '{user_attn}' is incompatible with "
+                        f"cache type '{cache_type.value}'. Overriding to '{forced}'."
+                    )
                 self[LLMOperatorType.Attention] = forced
 
-        self.qkv_projection = self.pop(
-            LLMOperatorType.QKVProjection, BackendType.NATIVE
-        )
+        self.qkv_projection = self.pop(LLMOperatorType.QKVProjection, BackendType.TPP)
         self.rope = self.pop(LLMOperatorType.RoPE, BackendType.NATIVE)
-        self.attention = self.pop(LLMOperatorType.Attention, AttentionBackendType.JIT)
-        self.out_projection = self.pop(
-            LLMOperatorType.OutProjection, BackendType.NATIVE
-        )
-        self.mlp = self.pop(LLMOperatorType.MLP, BackendType.NATIVE)
-        self.norm = self.pop(LLMOperatorType.Norm, BackendType.NATIVE)
-        self.lm_head = self.pop(LLMOperatorType.LMHead, BackendType.NATIVE)
+        self.attention = self.pop(LLMOperatorType.Attention, AttentionBackendType.SLAB)
+        self.out_projection = self.pop(LLMOperatorType.OutProjection, BackendType.TPP)
+        self.mlp = self.pop(LLMOperatorType.MLP, BackendType.TPP)
+        self.norm = self.pop(LLMOperatorType.Norm, BackendType.JIT)
+        self.lm_head = self.pop(LLMOperatorType.LMHead, BackendType.TPP)
 
         # These are the extra keys that might not be in the LLMOperatorType
         # but are still valid keys, so make sure they are valid

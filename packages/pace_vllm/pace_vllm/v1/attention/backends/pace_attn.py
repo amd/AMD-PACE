@@ -102,6 +102,15 @@ class PaceAttentionBackend(AttentionBackend):
         return (0,)
 
     @staticmethod
+    def get_kv_cache_block_dim(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        return 0
+
+    @staticmethod
     def use_cascade_attention(*args, **kwargs) -> bool:
         return False
 

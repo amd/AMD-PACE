@@ -1,8 +1,8 @@
 # pace-vllm
 
-vLLM platform plugin for AMD PACE. Once installed, vLLM auto-discovers it and routes its CPU worker through PACE's kernels and KV cache, with no changes to your vLLM scripts. Check out the [GitHub repository](https://github.com/amd/amd-pace) for more information.
+vLLM platform plugin for AMD PACE. Once installed, vLLM auto-discovers it and routes its CPU worker through PACE's attention, SlabPool KV cache, Linear/RMSNorm, and eligible unquantized MoE implementations, with no changes to your vLLM scripts. Check out the [GitHub repository](https://github.com/amd/amd-pace) for more information.
 
-The PACE vLLM plugin brings PACE's CPU optimizations to vLLM with no application code changes, retaining **~95% of standalone PACE efficiency** and delivering **~1.3x the performance of native vLLM 0.21** on 5th Gen AMD EPYC processors. [More details and technical results here.](https://www.amd.com/en/developer/resources/technical-articles/2026/amd-pace-integrates-with-vllm.html)
+The PACE vLLM plugin brings PACE's CPU optimizations to vLLM with no application code changes. It supports PACE's fused MLP and FusedMoE paths, plus SlabPool prefix-cache integration.
 
 ## What it does
 
@@ -13,18 +13,20 @@ The PACE vLLM plugin brings PACE's CPU optimizations to vLLM with no application
 - **Drop-in plugin** - no changes to your vLLM serve script; the `vllm.platform_plugins` entry point is discovered automatically.
 - **SlabPool KV cache** - one slab per attention layer, owned by PACE, with sliding-window and sink-attention support.
 - **Fused MLP pass** - gated SwiGLU/GeGLU and ungated fc1->act->fc2 MLPs (silu / gelu-tanh / gelu-exact / relu) are rewritten into a single `pace::libxsmm_fused_mlp` call under compile mode.
+- **FusedMoE** - eligible gated, unquantized BF16 layers use PACE's TPP expert engine; unsupported shapes and non-gated layers fall back to vLLM's CPU path.
+- **Prefix caching** - complete prefix blocks are retained through PACE's SlabPool connector while at least one prompt token is recomputed, subject to the compatibility limits in the [internals guide](https://github.com/amd/amd-pace/blob/main/packages/pace_vllm/docs/Internals.md#prefix-caching).
 
 ## Requirements
 
 - Linux x86_64 with AVX512F + AVX512_BF16 (AMD Zen4 / EPYC 5th Gen or newer)
-- Python 3.10 – 3.13
-- vLLM 0.21.x (CPU build)
+- Python 3.10 – 3.14
+- vLLM 0.25.x – 0.28.0 (CPU build)
 
 ## Install
 
 ```bash
 # 1. vLLM CPU build (pace-vllm is a plugin; it no-ops without vllm).
-pip install https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cpu
+pip install https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cpu
 
 # 2. pace-vllm
 pip install pace-vllm

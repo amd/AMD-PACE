@@ -12,11 +12,14 @@ Run: python -m unittest -v tests.attention.test_slab_attention
 """
 
 import math
+import os
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch.testing._internal.common_utils import TestCase
 
 import pace  # noqa: F401
+from pace.llm.attention import Attention, AttentionBackendType
 
 # BF16 attention tolerance: 2 ULPs absolute, PyTorch's bf16 default relative
 BF16_ATOL = 0.016
@@ -53,6 +56,33 @@ def _reference_causal_attention(q, k, v, scale):
     return out.transpose(1, 2).to(torch.bfloat16)
 
 
+def _reference_chunked_attention(q, k, v, scale, chunk_size):
+    """FP32 reference for chunked (local) causal attention.
+
+    A query at absolute position q attends only to keys in its own chunk,
+    i.e. floor(q / C) == floor(k / C), on top of the causal mask.
+    """
+    bs, q_len, h, d = q.shape
+    kv_len = k.shape[1]
+
+    q_f = q.transpose(1, 2).float()
+    k_f = k.transpose(1, 2).float()
+    v_f = v.transpose(1, 2).float()
+
+    scores = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
+
+    q_positions = torch.arange(kv_len - q_len, kv_len).unsqueeze(1)
+    kv_positions = torch.arange(kv_len).unsqueeze(0)
+    causal = kv_positions > q_positions
+    diff_chunk = (q_positions // chunk_size) != (kv_positions // chunk_size)
+    mask = causal | diff_chunk
+    scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v_f)
+    return out.transpose(1, 2).to(torch.bfloat16)
+
+
 def _setup_pool_with_kv(bs, seq_len, h_kv, d, blk_size=16, max_seq=None):
     """Create pool, sequences, and fill with random KV data."""
     if max_seq is None:
@@ -77,7 +107,7 @@ class TestSlabCausalAttention(TestCase):
 
         pool, seq_ids, k, v = _setup_pool_with_kv(BS, S, H_kv, D)
         q = torch.randn(BS, S, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
+        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
 
         k_exp = k.repeat_interleave(H_q // H_kv, dim=2)
         v_exp = v.repeat_interleave(H_q // H_kv, dim=2)
@@ -92,11 +122,27 @@ class TestSlabCausalAttention(TestCase):
 
         pool, seq_ids, k, v = _setup_pool_with_kv(BS, S, H_kv, D, blk_size=64)
         q = torch.randn(BS, S, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q, [S], [], scale, 0, torch.tensor([]))
+        slab_out = pool.attention(seq_ids, q, [S], [], scale, 0, torch.tensor([]), 0)
 
         k_exp = k.repeat_interleave(H_q // H_kv, dim=2)
         v_exp = v.repeat_interleave(H_q // H_kv, dim=2)
         ref_out = _reference_causal_attention(q, k_exp, v_exp, scale)
+
+        self.assertEqual(slab_out, ref_out, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+    def test_prefill_chunked_attention(self):
+        """Chunked (local) prefill: q attends only within its own chunk."""
+        BS, S, H_q, H_kv, D = 1, 48, 8, 4, 64
+        CHUNK = 16
+        scale = 1.0 / math.sqrt(D)
+
+        pool, seq_ids, k, v = _setup_pool_with_kv(BS, S, H_kv, D)
+        q = torch.randn(BS, S, H_q, D, dtype=torch.bfloat16)
+        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), CHUNK)
+
+        k_exp = k.repeat_interleave(H_q // H_kv, dim=2)
+        v_exp = v.repeat_interleave(H_q // H_kv, dim=2)
+        ref_out = _reference_chunked_attention(q, k_exp, v_exp, scale, CHUNK)
 
         self.assertEqual(slab_out, ref_out, atol=BF16_ATOL, rtol=BF16_RTOL)
 
@@ -112,7 +158,7 @@ class TestSlabCausalAttention(TestCase):
         pool.cache_update(seq_ids, k_dec, v_dec, [])
 
         q_dec = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]))
+        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]), 0)
 
         k_full = torch.cat([k_pf, k_dec], dim=1).repeat_interleave(H_q // H_kv, dim=2)
         v_full = torch.cat([v_pf, v_dec], dim=1).repeat_interleave(H_q // H_kv, dim=2)
@@ -132,7 +178,7 @@ class TestSlabCausalAttention(TestCase):
         pool.cache_update(seq_ids, k_dec, v_dec, [])
 
         q_dec = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]))
+        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]), 0)
 
         k_full = torch.cat([k_pf, k_dec], dim=1).repeat_interleave(H_q // H_kv, dim=2)
         v_full = torch.cat([v_pf, v_dec], dim=1).repeat_interleave(H_q // H_kv, dim=2)
@@ -152,7 +198,7 @@ class TestSlabCausalAttention(TestCase):
         pool.cache_update(seq_ids, k_dec, v_dec, [])
 
         q_dec = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]))
+        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]), 0)
 
         k_full = torch.cat([k_pf, k_dec], dim=1)
         v_full = torch.cat([v_pf, v_dec], dim=1)
@@ -172,7 +218,7 @@ class TestSlabCausalAttention(TestCase):
         pool.cache_update(seq_ids, k_dec, v_dec, [])
 
         q_dec = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]))
+        slab_out = pool.attention(seq_ids, q_dec, [], [], scale, 0, torch.tensor([]), 0)
 
         k_full = torch.cat([k_pf, k_dec], dim=1)
         v_full = torch.cat([v_pf, v_dec], dim=1)
@@ -194,7 +240,7 @@ class TestSlabCausalAttention(TestCase):
 
         q_mtd = torch.randn(BS, MTD_LEN, H_q, D, dtype=torch.bfloat16)
         slab_out = pool.attention(
-            seq_ids, q_mtd, [MTD_LEN], [], scale, 0, torch.tensor([])
+            seq_ids, q_mtd, [MTD_LEN], [], scale, 0, torch.tensor([]), 0
         )
 
         k_full = torch.cat([k_pf, k_mtd], dim=1).repeat_interleave(H_q // H_kv, dim=2)
@@ -220,7 +266,7 @@ class TestSlabCausalAttention(TestCase):
             )
 
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        out = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
+        out = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
         self.assertEqual(out.shape, (BS, 1, H_q, D))
         self.assertFalse(torch.isnan(out).any())
 
@@ -244,7 +290,7 @@ class TestSlabCausalAttention(TestCase):
             all_v.append(v_new)
 
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
+        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
 
         k_full = torch.cat(all_k, dim=1)
         v_full = torch.cat(all_v, dim=1)
@@ -268,9 +314,9 @@ class TestSlabSlidingWindowAttention(TestCase):
         )
 
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        out_full = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
+        out_full = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
         out_windowed = pool.attention(
-            seq_ids, q, [], [], scale, window, torch.tensor([])
+            seq_ids, q, [], [], scale, window, torch.tensor([]), 0
         )
 
         self.assertEqual(out_full.shape, out_windowed.shape)
@@ -286,9 +332,9 @@ class TestSlabSlidingWindowAttention(TestCase):
         pool, seq_ids, _, _ = _setup_pool_with_kv(BS, S, H_kv, D, blk_size=16)
 
         q = torch.randn(BS, S, H_q, D, dtype=torch.bfloat16)
-        out_full = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
+        out_full = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
         out_windowed = pool.attention(
-            seq_ids, q, [], [], scale, window, torch.tensor([])
+            seq_ids, q, [], [], scale, window, torch.tensor([]), 0
         )
 
         self.assertFalse(
@@ -309,7 +355,7 @@ class TestSlabSlidingWindowAttention(TestCase):
         )
 
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        out = pool.attention(seq_ids, q, [], [], scale, window, torch.tensor([]))
+        out = pool.attention(seq_ids, q, [], [], scale, window, torch.tensor([]), 0)
         self.assertFalse(torch.isnan(out).any())
 
 
@@ -329,8 +375,8 @@ class TestSlabSinksAttention(TestCase):
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
         sinks = torch.ones(H_q, dtype=torch.float32) * 5.0
 
-        out_no_sinks = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
-        out_with_sinks = pool.attention(seq_ids, q, [], [], scale, 0, sinks)
+        out_no_sinks = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
+        out_with_sinks = pool.attention(seq_ids, q, [], [], scale, 0, sinks, 0)
 
         self.assertFalse(
             torch.allclose(out_no_sinks.float(), out_with_sinks.float(), atol=1e-3)
@@ -345,8 +391,8 @@ class TestSlabSinksAttention(TestCase):
         q = torch.randn(BS, S, H_q, D, dtype=torch.bfloat16)
         sinks = torch.ones(H_q, dtype=torch.float32) * 5.0
 
-        out_no_sinks = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
-        out_with_sinks = pool.attention(seq_ids, q, [], [], scale, 0, sinks)
+        out_no_sinks = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
+        out_with_sinks = pool.attention(seq_ids, q, [], [], scale, 0, sinks, 0)
 
         self.assertFalse(
             torch.allclose(out_no_sinks.float(), out_with_sinks.float(), atol=1e-3)
@@ -369,7 +415,7 @@ class TestSlabCombinedSlidingAndSinks(TestCase):
 
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
         sinks = torch.ones(H_q, dtype=torch.float32) * 3.0
-        out = pool.attention(seq_ids, q, [], [], scale, window, sinks)
+        out = pool.attention(seq_ids, q, [], [], scale, window, sinks, 0)
         self.assertEqual(out.shape, (BS, 1, H_q, D))
         self.assertFalse(torch.isnan(out).any())
 
@@ -388,12 +434,36 @@ class TestSlabCombinedSlidingAndSinks(TestCase):
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
         sinks = torch.ones(H_q, dtype=torch.float32) * 3.0
 
-        out_plain = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]))
-        out_sinks = pool.attention(seq_ids, q, [], [], scale, 0, sinks)
+        out_plain = pool.attention(seq_ids, q, [], [], scale, 0, torch.tensor([]), 0)
+        out_sinks = pool.attention(seq_ids, q, [], [], scale, 0, sinks, 0)
 
         self.assertFalse(
             torch.allclose(out_plain.float(), out_sinks.float(), atol=1e-3)
         )
+
+
+class TestSlabAttentionScale(TestCase):
+    def test_custom_scale_forwarded_to_pool(self):
+        opconfig = MagicMock()
+        opconfig.attention = AttentionBackendType.SLAB
+        scale = 0.125
+        attention = Attention(
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=64,
+            opconfig=opconfig,
+            scale=scale,
+        )
+        layer_view = MagicMock()
+        layer_view.query_lens = None
+        layer_view.attend.return_value = torch.empty(1, 1, 4, 64)
+        Q = torch.randn(1, 1, 4, 64)
+        K = torch.randn(1, 1, 2, 64)
+        V = torch.randn(1, 1, 2, 64)
+
+        attention(Q, K, V, layer_view, torch.zeros(1, 1, dtype=torch.long))
+
+        self.assertEqual(layer_view.attend.call_args.args[1], scale)
 
 
 class TestSlabRaggedPadding(TestCase):
@@ -426,7 +496,9 @@ class TestSlabRaggedPadding(TestCase):
                 v_i = torch.randn(1, S, H_kv, D, dtype=torch.bfloat16)
                 q_i = torch.randn(1, S, H_q, D, dtype=torch.bfloat16)
                 pool_i.cache_update([0], k_i, v_i, [S])
-                out_i = pool_i.attention([0], q_i, [S], [], scale, 0, torch.tensor([]))
+                out_i = pool_i.attention(
+                    [0], q_i, [S], [], scale, 0, torch.tensor([]), 0
+                )
                 ref_outputs.append((q_i, k_i, v_i, out_i))
 
             # Batched padded: left-pad all sequences to max_len
@@ -448,7 +520,7 @@ class TestSlabRaggedPadding(TestCase):
                 pool.create_sequence(sid, max_len + 256)
             pool.cache_update(seq_ids, K_padded, V_padded, seq_lens)
             batched_out = pool.attention(
-                seq_ids, Q_padded, seq_lens, [], scale, 0, torch.tensor([])
+                seq_ids, Q_padded, seq_lens, [], scale, 0, torch.tensor([]), 0
             )
 
             # Verify each sequence matches its standalone reference
@@ -499,7 +571,7 @@ class TestSlabRaggedPadding(TestCase):
             v_i = torch.randn(1, S, H_kv, D, dtype=torch.bfloat16)
             q_i = torch.randn(1, S, H_q, D, dtype=torch.bfloat16)
             pool_i.cache_update([0], k_i, v_i, [S])
-            out_i = pool_i.attention([0], q_i, [S], [], scale, 0, torch.tensor([]))
+            out_i = pool_i.attention([0], q_i, [S], [], scale, 0, torch.tensor([]), 0)
             ref_outputs.append((q_i, k_i, v_i, out_i))
 
         # Batched padded
@@ -520,7 +592,7 @@ class TestSlabRaggedPadding(TestCase):
             pool.create_sequence(sid, max_len + 256)
         pool.cache_update(seq_ids, K_padded, V_padded, seq_lens)
         batched_out = pool.attention(
-            seq_ids, Q_padded, seq_lens, [], scale, 0, torch.tensor([])
+            seq_ids, Q_padded, seq_lens, [], scale, 0, torch.tensor([]), 0
         )
 
         for i in range(BS):
@@ -576,7 +648,9 @@ class TestSlabSlidingWindowCorrectness(TestCase):
             [],
         )
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q, [], [], scale, window, torch.tensor([]))
+        slab_out = pool.attention(
+            seq_ids, q, [], [], scale, window, torch.tensor([]), 0
+        )
 
         # Re-seed and regenerate to match pool data
         torch.manual_seed(42)
@@ -602,7 +676,9 @@ class TestSlabSlidingWindowCorrectness(TestCase):
 
         pool, seq_ids, k, v = _setup_pool_with_kv(BS, S, H_kv, D)
         q = torch.randn(BS, S, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q, [], [], scale, window, torch.tensor([]))
+        slab_out = pool.attention(
+            seq_ids, q, [], [], scale, window, torch.tensor([]), 0
+        )
 
         k_exp = k.repeat_interleave(H_q // H_kv, dim=2)
         v_exp = v.repeat_interleave(H_q // H_kv, dim=2)
@@ -661,7 +737,7 @@ class TestSlabSinksCorrectness(TestCase):
             [],
         )
         q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
-        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, sinks)
+        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, sinks, 0)
 
         torch.manual_seed(42)
         _, _, k2, v2 = _setup_pool_with_kv(BS, S, H_kv, D)
@@ -676,6 +752,70 @@ class TestSlabSinksCorrectness(TestCase):
         ref = _reference_sink_attention(q2, k_exp, v_exp, scale, sinks)
 
         self.assertEqual(slab_out, ref, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+        zero_sinks = torch.zeros_like(sinks)
+        zero_out = pool.attention(seq_ids, q, [], [], scale, 0, zero_sinks, 0)
+        zero_ref = _reference_sink_attention(q2, k_exp, v_exp, scale, zero_sinks)
+        self.assertEqual(zero_out, zero_ref, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+    def test_sinks_splitk_decode_correctness(self):
+        if torch.get_num_threads() < 4:
+            self.skipTest("Split-K requires at least four OpenMP threads")
+
+        BS, S, H_q, H_kv, D = 1, 64, 4, 1, 64
+        scale = 1.0 / math.sqrt(D)
+        sinks = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+        torch.manual_seed(42)
+
+        with patch.dict(os.environ, {"SLAB_MAX_SPLITS": "4"}):
+            pool, seq_ids, k, v = _setup_pool_with_kv(BS, S, H_kv, D)
+
+        k_dec = torch.randn(BS, 1, H_kv, D, dtype=torch.bfloat16)
+        v_dec = torch.randn(BS, 1, H_kv, D, dtype=torch.bfloat16)
+        pool.cache_update(seq_ids, k_dec, v_dec, [])
+        q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
+        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, sinks, 0)
+
+        full_k = torch.cat([k, k_dec], dim=1).repeat_interleave(H_q // H_kv, dim=2)
+        full_v = torch.cat([v, v_dec], dim=1).repeat_interleave(H_q // H_kv, dim=2)
+        ref = _reference_sink_attention(q, full_k, full_v, scale, sinks)
+
+        self.assertEqual(slab_out, ref, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+        zero_sinks = torch.zeros_like(sinks)
+        zero_out = pool.attention(seq_ids, q, [], [], scale, 0, zero_sinks, 0)
+        zero_ref = _reference_sink_attention(q, full_k, full_v, scale, zero_sinks)
+        self.assertEqual(zero_out, zero_ref, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+    def test_zero_sinks_prefill_correctness(self):
+        BS, S, H_q, H_kv, D = 1, 128, 8, 2, 64
+        scale = 1.0 / math.sqrt(D)
+        sinks = torch.zeros(H_q, dtype=torch.float32)
+        torch.manual_seed(43)
+        pool, seq_ids, k, v = _setup_pool_with_kv(BS, S, H_kv, D)
+        q = torch.randn(BS, S, H_q, D, dtype=torch.bfloat16)
+
+        slab_out = pool.attention(seq_ids, q, [], [], scale, 0, sinks, 0)
+        k_exp = k.repeat_interleave(H_q // H_kv, dim=2)
+        v_exp = v.repeat_interleave(H_q // H_kv, dim=2)
+        ref = _reference_sink_attention(q, k_exp, v_exp, scale, sinks)
+
+        self.assertEqual(slab_out, ref, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+    def test_splitk_capacity_boundary(self):
+        num_threads = torch.get_num_threads()
+        if num_threads < 16:
+            self.skipTest("Split-K capacity boundary requires 16 OpenMP threads")
+
+        BS = num_threads // 4 + 1
+        S, H_q, H_kv, D = 64, 16, 1, 64
+        with patch.dict(os.environ, {"SLAB_MAX_SPLITS": "4"}):
+            pool, seq_ids, _, _ = _setup_pool_with_kv(BS, S, H_kv, D)
+        q = torch.randn(BS, 1, H_q, D, dtype=torch.bfloat16)
+
+        out = pool.attention(seq_ids, q, [], [], D**-0.5, 0, torch.tensor([]), 0)
+
+        self.assertEqual(out.shape, q.shape)
 
 
 class TestSlabQStartOffsets(TestCase):
@@ -704,7 +844,7 @@ class TestSlabQStartOffsets(TestCase):
             v_i = torch.randn(1, S, H_kv, D, dtype=torch.bfloat16)
             q_i = torch.randn(1, S, H_q, D, dtype=torch.bfloat16)
             pool_i.cache_update([0], k_i, v_i, [S])
-            out_i = pool_i.attention([0], q_i, [S], [], scale, 0, torch.tensor([]))
+            out_i = pool_i.attention([0], q_i, [S], [], scale, 0, torch.tensor([]), 0)
             ref_outputs.append((q_i, k_i, v_i, out_i))
 
         # Batched with explicit q_start_offsets
@@ -735,6 +875,7 @@ class TestSlabQStartOffsets(TestCase):
             scale,
             0,
             torch.tensor([]),
+            0,
         )
         batched_out = batched_out.reshape(BS, max_len, H_q, D)
 

@@ -2,6 +2,10 @@
 
 Validates that PACE produces the same tokens as HuggingFace Transformers under greedy decoding. For each model, the test generates tokens from both PACE and HF on a fixed set of prompts, then compares output tokens and top-k logprobs. Inspired by [vLLM's model correctness testing](https://docs.vllm.ai/en/latest/contributing/model/tests.html).
 
+## Setup
+
+Install the suite-only extras into your `pace` environment: `pip install -r requirements.txt`.
+
 ## Usage
 
 ```bash
@@ -42,7 +46,8 @@ All settings are specified in a JSON config file:
 
 ### Parameters
 
-- `model_args.model_name`: HuggingFace model name, local path, or `"all"` to test every registered architecture.
+- `model_args.model_name`: HuggingFace model name, local path, or `"all"` to
+  test every entry in this benchmark's local `MODELS` registry.
 - `model_args.dtype`: `"bf16"` or `"fp32"`.
 - `model_args.llm_operators`: Operator-to-backend mapping. Valid backends: `NATIVE`, `TPP`, `JIT`, etc.
 - `model_args.spec_config`: Speculative decoding config (`model_name` + `num_speculated_tokens`), or `null`.
@@ -75,6 +80,9 @@ When `model_name` is set to `"all"`, the following architectures are tested:
 | GPTJForCausalLM | EleutherAI/gpt-j-6b |
 | LlamaForCausalLM | NousResearch/Llama-3.2-1B |
 | Qwen2ForCausalLM | Qwen/Qwen2.5-0.5B |
+| Qwen3ForCausalLM | Qwen/Qwen3-0.6B |
+| Qwen3MoeForCausalLM | Qwen/Qwen3-30B-A3B |
 | Phi3ForCausalLM | microsoft/Phi-4-mini-instruct |
 | Gemma3ForCausalLM | unsloth/gemma-3-270m |
+| Gemma4ForConditionalGeneration | google/gemma-4-E2B |
 | GptOssForCausalLM | openai/gpt-oss-20b |

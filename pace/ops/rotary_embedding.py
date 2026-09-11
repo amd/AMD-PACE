@@ -116,6 +116,46 @@ def _compute_default_cos_sin_cache(
     )
 
 
+def _compute_proportional_cos_sin_cache(
+    base: Union[int, float],
+    head_dim: int,
+    max_position_embeddings: int,
+    partial_rotary_factor: float,
+    factor: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes the cos/sin cache for proportional RoPE (p-RoPE), used by Gemma 4
+    global (full-attention) layers.
+
+    Unlike standard partial rotary embeddings (which shrink ``rotary_dim`` and
+    leave a pass-through tail), proportional RoPE keeps the full ``head_dim`` but
+    rotates only the first ``2 * rope_angles`` dimensions, where
+    ``rope_angles = int(partial_rotary_factor * head_dim // 2)``. The remaining
+    ``head_dim // 2 - rope_angles`` frequency slots are set to zero so those
+    dimensions receive an identity rotation (cos=1, sin=0). Crucially the
+    rotated frequencies are scaled by the FULL ``head_dim`` (not the rotated
+    subset), so this is not equivalent to ``partial_rotary_factor`` reduction.
+    Mirrors ``_compute_proportional_rope_parameters`` in HF transformers.
+    """
+    rope_angles = int(partial_rotary_factor * head_dim // 2)
+    inv_freq_rotated = 1.0 / (
+        base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float) / head_dim)
+    )
+    nope_angles = head_dim // 2 - rope_angles
+    if nope_angles > 0:
+        inv_freq = torch.cat(
+            (inv_freq_rotated, torch.zeros(nope_angles, dtype=torch.float32)),
+            dim=0,
+        )
+    else:
+        inv_freq = inv_freq_rotated
+    inv_freq = inv_freq / factor
+    return _compute_cos_sin_cache_from_inv_freq(
+        inv_freq=inv_freq,
+        max_position_embeddings=max_position_embeddings,
+    )
+
+
 def _compute_linear_cos_sin_cache(
     base: Union[int, float],
     rotary_dim: int,
@@ -349,22 +389,33 @@ class RotaryEmbedding(OperatorBase):
             backend_impl=backend_impl, dtype=dtype
         )  # Do not use backend_impl
 
-        if partial_rotary_factor < 1.0:
+        self.rope_scaling = rope_scaling
+        if rope_scaling is not None:  # Compatibility with old configs
+            self.rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+
+        # Proportional RoPE keeps the full head_dim (zeroing the non-rotated
+        # frequency slots) so it must NOT shrink rotary_dim via partial factor.
+        if partial_rotary_factor < 1.0 and self.rope_type != "proportional":
             rotary_dim = int(rotary_dim * partial_rotary_factor)
 
         self.rotary_dim = rotary_dim
         self.partial_rotary_factor = partial_rotary_factor
         self.rope_kwargs = rope_kwargs
 
-        self.rope_scaling = rope_scaling
-        if rope_scaling is not None:  # Compatibility with old configs
-            self.rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
-        else:
-            self.rope_type = "default"
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
 
-        if self.rope_type == "default":
+        if self.rope_type == "proportional":
+            cache = _compute_proportional_cos_sin_cache(
+                base=self.rope_theta,
+                head_dim=rotary_dim,
+                max_position_embeddings=max_position_embeddings,
+                partial_rotary_factor=partial_rotary_factor,
+                factor=rope_scaling.get("factor", 1.0),
+            )
+        elif self.rope_type == "default":
             cache = _compute_default_cos_sin_cache(
                 base=self.rope_theta,
                 rotary_dim=rotary_dim,

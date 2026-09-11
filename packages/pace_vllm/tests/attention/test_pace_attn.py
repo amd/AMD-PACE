@@ -33,6 +33,12 @@ class TestPaceAttentionBackend(unittest.TestCase):
         # in the SlabPool owned by PaceKVCache.
         self.assertEqual(PaceAttentionBackend.get_kv_cache_shape(0, 0, 0, 0), (0,))
 
+    def test_placeholder_block_dimension_is_zero(self) -> None:
+        self.assertEqual(
+            PaceAttentionBackend.get_kv_cache_block_dim(16, 8, 128),
+            0,
+        )
+
     def test_does_not_accept_output_buffer(self) -> None:
         self.assertFalse(PaceAttentionBackend.accept_output_buffer)
 

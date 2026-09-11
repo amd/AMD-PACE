@@ -79,11 +79,16 @@ AMD PACE provides a set of optimized operators that can significantly improve pe
 PACE employs a modular operator framework that separates an operator's interface (Frontend) from its computational logic (Backend). This design allows for multiple, interchangeable backend implementations for a single operator. For example, a `Linear` operation can be executed by a `NATIVE` backend (using standard PyTorch), a `JIT` backend (using a just-in-time compiled kernel from oneDNN), or a `TPP` backend (using Tensor Processing Primitives). For a detailed explanation of the operator framework, see the [Python Operators documentation](./PythonOps.md).
 
 ### How to Use AMD PACE Operators
-To leverage PACE operators with fine-grained control, they can be instantiated directly along with a preferred backend during instantiation of LLMModel. By default, all the operators will use the `NATIVE` backend (except Attention, which will use `JIT`), which is the standard PyTorch implementation.
+PACE operators can be selected through `OperatorConfig` when constructing
+`LLMModel`. Offline defaults are QKV/output/MLP/LM-head → `TPP`, norm → `JIT`,
+RoPE → `NATIVE`, and attention → the backend required by the selected KV cache.
+The server has separate defaults documented in
+[InferenceServer.md](InferenceServer.md#operator-backend-configuration).
 
-For LLM models, there are six main operator types that can be configured:
+The Python API exposes seven LLM operator types:
 * `Norm`: Normalization operator
 * `QKVProjection`: Query-Key-Value projection operator
+* `RoPE`: Rotary position embedding
 * `Attention`: Attention mechanism operator
 * `OutProjection`: Output projection operator
 * `MLP`: Multi-Layer Perceptron operator
@@ -135,13 +140,13 @@ For a more detailed example, please see the [PACE LLM Basic Example](../examples
 
 | Backend | Description |
 |---------|-------------|
-| **NATIVE** | Standard PyTorch ops. Default for all operator types except Attention. |
-| **JIT** | Uses oneDNN JIT-compiled kernels. Effective for dynamic shapes. |
+| **NATIVE** | Standard PyTorch implementation. |
+| **JIT** | Uses oneDNN-backed implementations where registered. |
 | **TPP** | Uses libXSMM Tensor Processing Primitives. Blocks weight matrices at model load time. Default block size is 32 (`LIBXSMM_BLOCK_SIZE`). |
-| **IMBPS** | Iterative MLP with parameter splits. Improves TTFT by splitting MLP parameters. Control splits via `IMBPS_BLOCK_SIZE`. |
+| **IMBPS** | Iterative MLP backend with a split count controlled by `IMBPS_BLOCK_SIZE`. |
 | **AOCLDLP** | AOCL Deep Learning Primitives backend. |
 
-**Recommended configuration for best performance:** Norm → JIT, Attention → SLAB (server) or JIT (offline), everything else → TPP.
+Backend choice is workload-, dtype-, model-, and machine-dependent. Use the benchmarking guidance below to compare configurations on the target system.
 
 
 ## KV Cache Selection
@@ -151,16 +156,17 @@ PACE supports multiple KV cache types. The choice affects memory management, att
 | Cache Type | When to Use |
 |------------|-------------|
 | `DYNAMIC` | Simple offline inference, small batches, quick experiments |
-| `BMC` | Offline inference with longer sequences. Pre-allocates in parts for better memory management. Control splits with `PACE_BMC_NUM_SPLITS`. For serving with BMC, always use multi-instance if you have enough cores and RAM. |
-| `SLAB_POOL` | **Production serving.** Pre-allocates a fixed memory pool. Requires `--kv_cache_memory_gb`. Best for throughput. See [SlabAttention.md](SlabAttention.md). |
-| `PAGED` | Paged attention with block-level memory management. |
+| `BMC` | Contiguous cache allocated in parts. Control splits with `PACE_BMC_NUM_SPLITS`. |
+| `SLAB_POOL` | Non-contiguous pool used with the `SLAB` attention backend. An optional per-engine `--kv_cache_memory_gb` budget allocates it eagerly. See [SlabAttention.md](SlabAttention.md). |
+| `PAGED` | Non-contiguous block-managed cache used with the `PAGED` attention backend. Capacity is controlled by `PACE_MAX_CACHE_TOKENS`. |
 
-For the inference server, `SLAB_POOL` is the recommended cache type:
+The `continuous_batch` server scheduler requires `SLAB_POOL` or `PAGED`:
 
 ```bash
 pace-server \
     --server_model your_model_name \
     --kv_cache_type SLAB_POOL \
+    --serve_type continuous_batch \
     --kv_cache_memory_gb 350 \
     --op_config '{"attention_backend": "SLAB"}'
 ```
@@ -168,7 +174,9 @@ pace-server \
 
 ## Multi-Instance Serving
 
-The inference server supports multiple engine instances for higher throughput. The launcher automatically partitions CPU cores across instances and sets NUMA bindings.
+The inference server supports multiple parallel engine instances. The launcher
+partitions physical cores from socket 0 across instances unless explicit NUMA
+bindings are supplied.
 
 ```bash
 pace-server \
@@ -248,8 +256,8 @@ The config JSON controls the framework, model, dtype, operator backends, KV cach
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OMP_NUM_THREADS` | all cores | Number of OpenMP threads. Set automatically by the launcher for server instances. |
-| `OMP_WAIT_POLICY` | (system) | Set to `active` for best latency. Set automatically by the launcher. |
-| `LD_PRELOAD` | (unset) | Set to `libtcmalloc.so` path for better memory allocator performance. |
+| `OMP_WAIT_POLICY` | (system) | Set to `active` by the server launcher. |
+| `LD_PRELOAD` | (unset) | Can point to an alternate allocator such as `libtcmalloc.so`; benchmark allocator choices on the target workload. |
 
 ### PACE Core
 
@@ -266,6 +274,8 @@ The config JSON controls the framework, model, dtype, operator backends, KV cach
 | `PACE_BMC_NUM_SPLITS` | auto | Number of pre-allocation splits for BMC KV cache. Higher = more incremental allocation. Auto-defaults to `sqrt(max_seq_length)`. |
 | `PACE_MAX_CACHE_TOKENS` | `262144` | Maximum total tokens for the paged KV cache pool. Determines the pool size (`total_blocks = max_tokens / block_size`). Increase for workloads with many concurrent long sequences; decrease to save memory. |
 | `PACE_MASK_CACHE_MAX_ENTRIES` | `1000` | Maximum LRU entries in the shared causal-mask buffer pool. Caps memory from many distinct mask shapes. |
+| `PACE_PREFIX_CACHE` | `1` | Enables server-managed prefix reuse for `SLAB_POOL` and `PAGED`. Offline `LLMModel.generate` does not orchestrate cross-call reuse. Set to `0` to disable. |
+| `PACE_PREFIX_HASH` | `xxhash` | Prefix-cache block hash: `xxhash` or `sha256`. |
 | `SLAB_BLOCK_SIZE` | auto (from L2) | SlabPool block size. Auto-tuned from L2 cache. Must be multiple of 16, max 256. |
 | `SLAB_LAYOUT` | `head_major` | SlabPool memory layout: `head_major` or `block_major`. |
 | `SLAB_SCHEDULE` | auto | OMP scheduling for slab attention: `static` or `dynamic`. |
@@ -275,7 +285,7 @@ The config JSON controls the framework, model, dtype, operator backends, KV cach
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LIBXSMM_BLOCK_SIZE` | `32` | Weight blocking size for TPP backend. Try `64` for prompt-heavy workloads. |
+| `LIBXSMM_BLOCK_SIZE` | `32` | Weight blocking size for the TPP backend. |
 | `PACE_NCB_BLOCK_SIZE` | `64` | libXSMM NCB (N-dimension column block) size for GEMM. |
 | `PACE_DOWN_NCB` | `32` | libXSMM NCB size for MLP down-projection GEMM. |
 | `PACE_MLP_BSB` | `0` (auto) | Batch-size block override for fused MLP GEMM. `0` = auto-select based on batch size. |

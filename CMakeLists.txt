@@ -18,7 +18,6 @@ find_package(Torch REQUIRED)
 # Clone and build external dependencies
 include(cmake/BuildLIBXSMM.cmake)
 include(cmake/BuildJITBackend.cmake)
-include(cmake/BuildFBGEMM.cmake)
 include(cmake/ClangFormat.cmake)
 include(cmake/BuildAOCLDLP.cmake)
 

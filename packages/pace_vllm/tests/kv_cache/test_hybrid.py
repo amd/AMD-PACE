@@ -4,19 +4,18 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 
-"""Tests for hybrid-model and MLA support gaps.
+"""Tests for hybrid-model and MLA support.
 
-Two related concerns:
+Hybrid models (Qwen3.5-MoE, Qwen3-Next, Jamba) ship Mamba groups alongside
+attention groups in `KVCacheConfig`. SlabPool only services attention, so
+`PaceKVCache.from_kv_cache_config` filters non-AttentionSpec layers and
+`PaceModelRunner._allocate_kv_cache_tensors` leaves their storage to vLLM --
+shipping a zero-sized placeholder for a Mamba layer crashes the first forward.
 
-- Hybrid models (Qwen3-Next, Jamba) ship Mamba groups alongside attention
-  groups in `KVCacheConfig`. `PaceKVCache.from_kv_cache_config` already
-  filters non-AttentionSpec; `PaceModelRunner.initialize_kv_cache_tensors`
-  must do the same so `_layer_dtype` never sees a `MambaSpec`.
-
-- MLA (`MLAAttentionSpec`) is a subclass of `FullAttentionSpec`, so the
-  existing `isinstance(layer_spec, AttentionSpec)` filter accepts it
-  silently. SlabPool's K/V geometry can't service MLA's projection
-  layout; we want a loud `NotImplementedError` instead of wrong outputs.
+MLA (`MLAAttentionSpec`) is a subclass of `FullAttentionSpec`, so the existing
+`isinstance(layer_spec, AttentionSpec)` filter accepts it silently. SlabPool's
+K/V geometry can't service MLA's projection layout; we want a loud
+`NotImplementedError` instead of wrong outputs.
 """
 
 from __future__ import annotations
@@ -27,9 +26,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 import pace_vllm
 from pace_vllm.v1 import kv_cache as kv_cache_module
+from pace_vllm.v1.connector import PaceSlabConnector
 from pace_vllm.v1.kv_cache import PaceKVCache, _pace_kvcache_budget_bytes
 from pace_vllm.v1.worker.cpu_model_runner import PaceModelRunner
 
@@ -41,9 +42,16 @@ pace_vllm._load_pace_native()
 _BUDGET_BYTES = 2 * 1024**3
 
 
-def _vllm_config() -> SimpleNamespace:
+def _vllm_config(connector_block_size: int | None = None) -> SimpleNamespace:
+    kv_transfer_config = None
+    if connector_block_size is not None:
+        kv_transfer_config = SimpleNamespace(
+            kv_connector="PaceSlabConnector",
+            kv_connector_extra_config={"slab_block_size": connector_block_size},
+        )
     return SimpleNamespace(
-        cache_config=SimpleNamespace(kv_cache_memory_bytes=_BUDGET_BYTES)
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=_BUDGET_BYTES),
+        kv_transfer_config=kv_transfer_config,
     )
 
 
@@ -89,12 +97,20 @@ def _mamba_spec():
     )
 
 
-def _kv_cache_config(*groups):
+def _kv_cache_config(*groups, tensors=None, num_blocks=0):
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     return KVCacheConfig(
-        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=list(groups)
+        num_blocks=num_blocks,
+        kv_cache_tensors=list(tensors or []),
+        kv_cache_groups=list(groups),
     )
+
+
+def _kv_tensor(size, shared_by):
+    from vllm.v1.kv_cache_interface import KVCacheTensor
+
+    return KVCacheTensor(size=size, shared_by=list(shared_by))
 
 
 def _group(layer_names, spec):
@@ -120,44 +136,27 @@ def _uniform_group(name_to_spec):
     )
 
 
-class TestMambaHybridSkipped(unittest.TestCase):
-    """Item 1: PaceModelRunner / PaceKVCache must not crash on
-    KVCacheConfig that mixes attention + Mamba groups."""
+class TestMambaHybridAllocation(unittest.TestCase):
+    """PaceModelRunner leaves Mamba storage to vLLM while slab attention uses
+    zero-sized placeholders."""
 
-    def test_initialize_kv_cache_tensors_skips_mamba_group(self) -> None:
+    def test_allocate_raw_tensors_only_materializes_mamba_storage(self) -> None:
+        spec = _mamba_spec()
+        size = 2 * spec.page_size_bytes
         cfg = _kv_cache_config(
-            _group(["attn.0", "attn.1"], _attention_spec()),
-            _group(["ssm.0", "ssm.1"], _mamba_spec()),
+            _group(["attn.0"], _attention_spec()),
+            _group(["ssm.0"], spec),
+            tensors=[_kv_tensor(size, ["attn.0", "ssm.0"])],
+            num_blocks=2,
         )
-        # Stand in for `PaceModelRunner`-the-instance: only the bound
-        # method needs `self` with `shared_kv_cache_layers` and the few
-        # attrs `bind_kv_cache` reaches for. We bypass the real ctor
-        # (which calls super().__init__ -> CPUModelRunner.__init__,
-        # which loads weights) by using a MagicMock and binding the
-        # method explicitly.
         runner = MagicMock(spec=PaceModelRunner)
-        runner.shared_kv_cache_layers = {}
-        runner.model_config = MagicMock()
-        runner.model_config.hf_config = MagicMock()
-        runner.model_config.hf_config.model_type = "llama"
-        runner.compilation_config = MagicMock()
-        runner.compilation_config.static_forward_context = {}
-        runner.kv_caches = {}
+        runner.device = torch.device("cpu")
+        runner.runner_only_attn_layers = set()
 
-        # Patch out vLLM's bind_kv_cache call -- not exercising that
-        # path here.
-        import pace_vllm.v1.worker.cpu_model_runner as cmr
+        raw_tensors = PaceModelRunner._allocate_kv_cache_tensors(runner, cfg)
 
-        original_bind = cmr.bind_kv_cache
-        cmr.bind_kv_cache = lambda *a, **kw: None
-        try:
-            kv_caches = PaceModelRunner.initialize_kv_cache_tensors(
-                runner, cfg, kernel_block_sizes=[16]
-            )
-        finally:
-            cmr.bind_kv_cache = original_bind
-
-        self.assertEqual(set(kv_caches.keys()), {"attn.0", "attn.1"})
+        self.assertEqual(raw_tensors["attn.0"].numel(), 0)
+        self.assertEqual(raw_tensors["ssm.0"].numel(), size)
 
     def test_from_kv_cache_config_skips_mamba_group(self) -> None:
         cfg = _kv_cache_config(
@@ -166,6 +165,22 @@ class TestMambaHybridSkipped(unittest.TestCase):
         )
         kv = PaceKVCache.from_kv_cache_config(cfg, _vllm_config())
         self.assertEqual(kv.layer_names, ["attn.0", "attn.1"])
+
+    def test_hybrid_connector_fails_before_partial_state_restoration(self) -> None:
+        cfg = _kv_cache_config(
+            _group(["attn.0"], _attention_spec()),
+            _group(["ssm.0"], _mamba_spec()),
+        )
+        with self.assertRaisesRegex(ValueError, "hybrid Mamba/SSM"):
+            PaceSlabConnector(
+                SimpleNamespace(
+                    kv_transfer_config=SimpleNamespace(
+                        kv_connector_extra_config={"slab_block_size": 16}
+                    )
+                ),
+                KVConnectorRole.SCHEDULER,
+                cfg,
+            )
 
 
 class TestMLARejected(unittest.TestCase):
@@ -228,6 +243,22 @@ class TestHeterogeneousGeometry(unittest.TestCase):
         self.assertEqual(kv.spec.per_layer[0].num_blocks, expected_num_blocks)
         self.assertEqual(kv.spec.per_layer[1].num_blocks, expected_num_blocks)
         self.assertLessEqual(kv.spec.total_bytes, _BUDGET_BYTES)
+
+    def test_prefix_connector_uses_uniform_block_size(self) -> None:
+        cfg = _kv_cache_config(
+            _group(["attn.wide"], _attention_spec(num_kv_heads=8, head_size=128)),
+            _group(["attn.narrow"], _attention_spec(num_kv_heads=4, head_size=128)),
+        )
+        with patch.object(
+            kv_cache_module, "_autotune_slab_block_size"
+        ) as mock_autotune:
+            kv = PaceKVCache.from_kv_cache_config(cfg, _vllm_config(64))
+
+        mock_autotune.assert_not_called()
+        self.assertEqual(
+            [layer.block_size for layer in kv.spec.per_layer],
+            [64, 64],
+        )
 
 
 class TestSlabBlockSizeAutotune(unittest.TestCase):

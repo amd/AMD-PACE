@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+from typing import Dict, List
 
 import torch
 
@@ -190,25 +191,44 @@ def _backend_desc(llm_operators: dict) -> str:
     return "default"
 
 
+def _generate_per_bs(runner, prompts, max_tokens, num_logprobs, batch_sizes):
+    """Generate per batch size, isolating failures so one bad batch size does
+    not discard the others. Returns {bs: outputs_or_None}."""
+    outputs = {}
+    for bs in batch_sizes:
+        try:
+            outputs[bs] = runner.generate_greedy_logprobs(
+                prompts, max_tokens, num_logprobs, bs
+            )
+        except Exception as e:
+            PACE_LLM_ERROR(f"Generation failed for BS={bs}: {e}")
+            outputs[bs] = None
+    return outputs
+
+
 def run_correctness_test(
     model_id: str,
     max_tokens: int,
     num_logprobs: int,
-    batch_size: int,
+    batch_sizes: List[int],
     llm_operators: dict,
     kv_cache_type: str,
     dtype: torch.dtype,
-) -> bool:
+) -> Dict[int, bool]:
     """Compare PACE vs HuggingFace using logprob cross-check.
 
-    Returns True if the test passes, False otherwise.
+    Each model's weights are loaded once and reused across all batch sizes
+    (batch size only affects generation, not the weights), so the expensive
+    load happens once per model rather than once per batch size.
+
+    Returns a dict mapping each batch size to its pass/fail result.
     """
     prompts = EXAMPLE_PROMPTS
 
     PACE_LLM_INFO("Running HuggingFace model")
     with HfRunner(model_id, dtype=dtype) as hf:
-        hf_outputs = hf.generate_greedy_logprobs(
-            prompts, max_tokens, num_logprobs, batch_size
+        hf_outputs = _generate_per_bs(
+            hf, prompts, max_tokens, num_logprobs, batch_sizes
         )
 
     desc = _backend_desc(llm_operators)
@@ -219,29 +239,36 @@ def run_correctness_test(
         llm_operators=llm_operators,
         kv_cache_type=kv_cache_type,
     ) as pace:
-        pace_outputs = pace.generate_greedy_logprobs(
-            prompts, max_tokens, num_logprobs, batch_size
+        pace_outputs = _generate_per_bs(
+            pace, prompts, max_tokens, num_logprobs, batch_sizes
         )
 
     PACE_LLM_INFO("Comparing outputs (logprob cross-check)")
-    return check_logprobs_close(
-        ref_outputs=hf_outputs,
-        test_outputs=pace_outputs,
-        ref_name="hf",
-        test_name="pace",
-    )
+    return {
+        bs: bool(
+            hf_outputs[bs] is not None
+            and pace_outputs[bs] is not None
+            and check_logprobs_close(
+                ref_outputs=hf_outputs[bs],
+                test_outputs=pace_outputs[bs],
+                ref_name="hf",
+                test_name="pace",
+            )
+        )
+        for bs in batch_sizes
+    }
 
 
 def run_spec_decode_test(
     model_id: str,
     max_tokens: int,
     num_logprobs: int,
-    batch_size: int,
+    batch_sizes: List[int],
     llm_operators: dict,
     kv_cache_type: str,
     spec_config: dict,
     dtype: torch.dtype,
-) -> bool:
+) -> Dict[int, bool]:
     """Compare PACE+spec-decode vs PACE-no-spec using logprob cross-check.
 
     Speculative decoding is mathematically equivalent to standard greedy
@@ -251,7 +278,11 @@ def run_spec_decode_test(
     for the HF-vs-PACE comparison: a token mismatch is tolerated when
     each side's chosen token appears in the other's top-k logprobs.
 
-    Returns True if the test passes, False otherwise.
+    Each model's weights are loaded once and reused across all batch sizes,
+    so the expensive load happens once per model rather than once per batch
+    size.
+
+    Returns a dict mapping each batch size to its pass/fail result.
     """
     prompts = EXAMPLE_PROMPTS
     desc = _backend_desc(llm_operators)
@@ -266,8 +297,8 @@ def run_spec_decode_test(
         llm_operators=llm_operators,
         kv_cache_type=kv_cache_type,
     ) as pace_base:
-        base_outputs = pace_base.generate_greedy_logprobs(
-            prompts, max_tokens, num_logprobs, batch_size
+        base_outputs = _generate_per_bs(
+            pace_base, prompts, max_tokens, num_logprobs, batch_sizes
         )
 
     PACE_LLM_INFO(
@@ -281,17 +312,24 @@ def run_spec_decode_test(
         kv_cache_type=kv_cache_type,
         spec_config=spec_config,
     ) as pace_spec:
-        spec_outputs = pace_spec.generate_greedy_logprobs(
-            prompts, max_tokens, num_logprobs, batch_size
+        spec_outputs = _generate_per_bs(
+            pace_spec, prompts, max_tokens, num_logprobs, batch_sizes
         )
 
     PACE_LLM_INFO("Comparing outputs (logprob cross-check)")
-    return check_logprobs_close(
-        ref_outputs=base_outputs,
-        test_outputs=spec_outputs,
-        ref_name="pace",
-        test_name="pace+spec",
-    )
+    return {
+        bs: bool(
+            base_outputs[bs] is not None
+            and spec_outputs[bs] is not None
+            and check_logprobs_close(
+                ref_outputs=base_outputs[bs],
+                test_outputs=spec_outputs[bs],
+                ref_name="pace",
+                test_name="pace+spec",
+            )
+        )
+        for bs in batch_sizes
+    }
 
 
 def main():
@@ -319,45 +357,46 @@ def main():
     results = []
     num_prompts = len(EXAMPLE_PROMPTS)
 
-    for model_id in models:
-        for bs in cfg["batch_size"]:
-            test_label = f"{model_id} (BS={bs})"
-            PACE_LLM_INFO(f"{'=' * 60}")
-            PACE_LLM_INFO(f"Testing: {test_label}")
-            PACE_LLM_INFO(f"{'=' * 60}")
+    batch_sizes = cfg["batch_size"]
 
-            try:
-                test_fn = (
-                    run_spec_decode_test if cfg["spec_config"] else run_correctness_test
-                )
-                passed = test_fn(
-                    model_id,
-                    max_tokens=cfg["max_tokens"],
-                    num_logprobs=cfg["num_logprobs"],
-                    batch_size=bs,
-                    llm_operators=cfg["llm_operators"],
-                    kv_cache_type=cfg["kv_cache_type"],
-                    dtype=cfg["dtype"],
-                    **(
-                        {"spec_config": cfg["spec_config"]}
-                        if cfg["spec_config"]
-                        else {}
-                    ),
-                )
-                status = "PASS" if passed else "FAIL"
-                detail = (
-                    f"{num_prompts}/{num_prompts} prompts, "
-                    f"{cfg['max_tokens']} tokens"
-                )
+    for model_id in models:
+        PACE_LLM_INFO(f"{'=' * 60}")
+        PACE_LLM_INFO(
+            f"Testing: {model_id} (BS={', '.join(str(b) for b in batch_sizes)})"
+        )
+        PACE_LLM_INFO(f"{'=' * 60}")
+
+        detail = f"{num_prompts}/{num_prompts} prompts, {cfg['max_tokens']} tokens"
+
+        # The model is loaded once and reused across all batch sizes.
+        try:
+            test_fn = (
+                run_spec_decode_test if cfg["spec_config"] else run_correctness_test
+            )
+            passed_map = test_fn(
+                model_id,
+                max_tokens=cfg["max_tokens"],
+                num_logprobs=cfg["num_logprobs"],
+                batch_sizes=batch_sizes,
+                llm_operators=cfg["llm_operators"],
+                kv_cache_type=cfg["kv_cache_type"],
+                dtype=cfg["dtype"],
+                **({"spec_config": cfg["spec_config"]} if cfg["spec_config"] else {}),
+            )
+            for bs in batch_sizes:
+                test_label = f"{model_id} (BS={bs})"
+                status = "PASS" if passed_map[bs] else "FAIL"
                 results.append((test_label, status, detail))
 
-            except (OSError, ValueError, ImportError) as e:
-                results.append((test_label, "SKIP", str(e)))
-            except Exception as e:
-                import traceback
+        except (OSError, ValueError, ImportError) as e:
+            for bs in batch_sizes:
+                results.append((f"{model_id} (BS={bs})", "SKIP", str(e)))
+        except Exception as e:
+            import traceback
 
-                results.append((test_label, "ERROR", str(e)))
-                traceback.print_exc()
+            traceback.print_exc()
+            for bs in batch_sizes:
+                results.append((f"{model_id} (BS={bs})", "ERROR", str(e)))
 
     PACE_LLM_INFO(f"{'=' * 60}")
     PACE_LLM_INFO("SUMMARY")

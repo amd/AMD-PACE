@@ -16,10 +16,9 @@ import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from pace.utils.logging import PACE_WARNING
-
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -37,7 +36,7 @@ class CompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = Field(default=None, ge=0, le=5)
-    max_tokens: Optional[int] = Field(default=16, ge=1)
+    max_tokens: Optional[int] = Field(default=16, ge=0)
     n: Optional[int] = Field(default=1, ge=1)
     presence_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
     seed: Optional[int] = None
@@ -48,6 +47,9 @@ class CompletionRequest(BaseModel):
     top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     user: Optional[str] = None
 
+    # --- Standard OpenAI streaming option ---
+    stream_options: Optional[Dict[str, Any]] = None
+
     # --- PACE extensions (not in OpenAI spec) ---
     top_k: Optional[int] = None
     min_p: Optional[float] = None
@@ -56,6 +58,12 @@ class CompletionRequest(BaseModel):
     ignore_eos: Optional[bool] = None
     do_sample: Optional[bool] = None
     mlperf_mode: bool = False
+    skip_special_tokens: bool = True
+
+    @property
+    def include_usage(self) -> bool:
+        """Whether the client requested a usage chunk in the stream."""
+        return bool(self.stream_options and self.stream_options.get("include_usage"))
 
     @model_validator(mode="before")
     @classmethod
@@ -91,14 +99,17 @@ class CompletionRequest(BaseModel):
             - temperature == 0 or temperature is None  ->  do_sample=False (greedy)
             - temperature > 0                          ->  do_sample=True  (random)
           This ensures that ``openai.completions.create(temperature=0)``
-          produces the same greedy behavior as vLLM bench defaults.
+          produces greedy behavior.
         """
         cfg: Dict[str, Any] = {}
 
         if self.max_tokens is not None:
-            cfg["max_new_tokens"] = self.max_tokens
+            cfg["max_new_tokens"] = max(self.max_tokens, 1)
         if self.min_tokens is not None:
-            cfg["min_new_tokens"] = self.min_tokens
+            min_new_tokens = self.min_tokens
+            if "max_new_tokens" in cfg:
+                min_new_tokens = min(min_new_tokens, cfg["max_new_tokens"])
+            cfg["min_new_tokens"] = min_new_tokens
         if self.temperature is not None:
             cfg["temperature"] = self.temperature
         if self.top_p is not None:
@@ -118,7 +129,7 @@ class CompletionRequest(BaseModel):
             cfg["ignore_eos"] = self.ignore_eos
 
         # Infer do_sample from OpenAI semantics when not explicitly set.
-        # PACE defaults do_sample=False (greedy), but OpenAI/vLLM treat
+        # PACE defaults do_sample=False (greedy), but OpenAI treats
         # temperature > 0 as random sampling.  We bridge the gap here.
         if self.do_sample is not None:
             cfg["do_sample"] = self.do_sample
@@ -130,6 +141,16 @@ class CompletionRequest(BaseModel):
                 # temperature=0, temperature=None, or omitted -> greedy
                 cfg["do_sample"] = False
 
+        if self.logprobs is not None:
+            cfg["return_logprobs"] = True
+            cfg["logprobs_n"] = self.logprobs
+            # Prompt/input logprobs are only meaningful (and only returned)
+            # when logprobs are requested. Plain echo (no logprobs) just
+            # prepends prompt text in the router and must not trigger the
+            # expensive input-logprob computation in the engine/generator.
+            if self.echo:
+                cfg["return_input_logprobs"] = True
+
         if self.presence_penalty is not None and self.presence_penalty != 0.0:
             PACE_WARNING(
                 "presence_penalty is accepted but has no effect on the PACE engine."
@@ -140,9 +161,75 @@ class CompletionRequest(BaseModel):
         return cfg if cfg else None
 
 
+class ChatMessage(BaseModel):
+    """A single message in a chat conversation.
+
+    Per the OpenAI spec, ``content`` may be either a plain string or an array
+    of content parts (e.g. ``[{"type": "text", "text": "..."}]``).  The array
+    form is normalized to a string by concatenating the text parts; non-text
+    parts (images, audio) are rejected since PACE is text-only.
+    """
+
+    role: Literal["system", "user", "assistant", "developer"]
+    content: Union[str, List[Dict[str, Any]], None] = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _normalize_content(cls, v):
+        if v is None or isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            texts: List[str] = []
+            for part in v:
+                if not isinstance(part, dict):
+                    raise ValueError("Each content part must be an object")
+                ptype = part.get("type")
+                if ptype == "text":
+                    text = part.get("text")
+                    if not isinstance(text, str):
+                        raise ValueError("Text content part requires a 'text' string")
+                    texts.append(text)
+                else:
+                    raise ValueError(
+                        f"Unsupported content part type {ptype!r}; "
+                        "PACE supports text content only"
+                    )
+            return "".join(texts)
+        raise ValueError("content must be a string or an array of content parts")
+
+
+class ChatCompletionRequest(CompletionRequest):
+    """OpenAI v1/chat/completions request body.
+
+    Reuses the sampling fields and ``to_engine_config()`` of
+    ``CompletionRequest``.  The prompt is derived from ``messages`` via the
+    tokenizer's chat template, so ``prompt`` is optional here and is populated
+    internally by the router before scheduling.
+    """
+
+    prompt: Optional[Union[str, List[str], List[int], List[List[int]]]] = None
+    messages: List[ChatMessage]
+
+    # OpenAI chat-only field that supersedes ``max_tokens``.
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
+
+    # Chat-template controls (forwarded to tokenizer.apply_chat_template).
+    add_generation_prompt: bool = True
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _apply_max_completion_tokens(self) -> "ChatCompletionRequest":
+        if self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
+
+COMPLETION_ID_PREFIX = "cmpl-"
+CHAT_ID_PREFIX = "chatcmpl-"
 
 
 class UsageInfo(BaseModel):
@@ -161,7 +248,7 @@ class CompletionResponseChoice(BaseModel):
 class CompletionResponse(BaseModel):
     """Non-streaming response matching the OpenAI text_completion object."""
 
-    id: str = Field(default_factory=lambda: f"cmpl-{uuid.uuid4()}")
+    id: str = Field(default_factory=lambda: f"{COMPLETION_ID_PREFIX}{uuid.uuid4()}")
     object: Literal["text_completion"] = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
@@ -169,7 +256,33 @@ class CompletionResponse(BaseModel):
     usage: UsageInfo = Field(default_factory=UsageInfo)
 
 
-class CompletionStreamChoice(BaseModel):
+class ChatCompletionResponseChoice(BaseModel):
+    index: int
+    message: ChatMessage
+    logprobs: Optional[Any] = None
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionResponse(BaseModel):
+    """Non-streaming response matching the OpenAI chat.completion object."""
+
+    id: str = Field(default_factory=lambda: f"{CHAT_ID_PREFIX}{uuid.uuid4()}")
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionResponseChoice]
+    usage: UsageInfo = Field(default_factory=UsageInfo)
+
+
+# ---------------------------------------------------------------------------
+# Streaming response models (one SSE chunk each).  Serialized with
+# ``model_dump_json(exclude_none=True)`` so unset fields are omitted: per-token
+# chunks carry no ``usage`` and the trailing usage-only chunk carries an empty
+# ``choices`` list, matching the OpenAI streaming schema.
+# ---------------------------------------------------------------------------
+
+
+class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[Any] = None
@@ -177,13 +290,39 @@ class CompletionStreamChoice(BaseModel):
 
 
 class CompletionStreamResponse(BaseModel):
-    """Single SSE chunk matching the OpenAI streaming text_completion object."""
+    """A single SSE chunk of the OpenAI streaming text_completion object."""
 
-    id: str = Field(default_factory=lambda: f"cmpl-{uuid.uuid4()}")
+    id: str = Field(default_factory=lambda: f"{COMPLETION_ID_PREFIX}{uuid.uuid4()}")
     object: Literal["text_completion"] = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[CompletionStreamChoice]
+    choices: List[CompletionResponseStreamChoice]
+    usage: Optional[UsageInfo] = None
+
+
+class DeltaMessage(BaseModel):
+    """Incremental chat delta; only the fields present in a chunk are set."""
+
+    role: Optional[str] = None
+    content: Optional[str] = None
+
+
+class ChatCompletionResponseStreamChoice(BaseModel):
+    index: int
+    delta: DeltaMessage
+    logprobs: Optional[Any] = None
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    """A single SSE chunk of the OpenAI streaming chat.completion.chunk object."""
+
+    id: str = Field(default_factory=lambda: f"{CHAT_ID_PREFIX}{uuid.uuid4()}")
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionResponseStreamChoice]
+    usage: Optional[UsageInfo] = None
 
 
 # ---------------------------------------------------------------------------

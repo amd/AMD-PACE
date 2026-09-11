@@ -83,9 +83,16 @@ class Attention(nn.Module):
         sliding_window: int = 0,
         sinks: Optional[torch.Tensor] = None,
         scale: Optional[float] = None,
+        chunk_size: int = 0,
     ):
         super().__init__()
         attn_backend = opconfig.attention
+
+        if chunk_size and sliding_window:
+            raise ValueError(
+                "Attention: chunk_size and sliding_window are mutually exclusive "
+                f"(got chunk_size={chunk_size}, sliding_window={sliding_window})."
+            )
 
         if attn_backend in (AttentionBackendType.JIT, AttentionBackendType.NATIVE):
             self._backend = ContiguousAttentionBackend(
@@ -95,6 +102,7 @@ class Attention(nn.Module):
                 attn_backend,
                 sliding_window=sliding_window,
                 sinks=sinks,
+                chunk_size=chunk_size,
             )
         elif attn_backend == AttentionBackendType.SLAB:
             self._backend = SlabAttentionBackend(
@@ -104,6 +112,8 @@ class Attention(nn.Module):
                 attn_backend,
                 sliding_window=sliding_window,
                 sinks=sinks,
+                scale=scale,
+                chunk_size=chunk_size,
             )
         elif attn_backend == AttentionBackendType.PAGED:
             self._backend = PagedAttentionBackend(
@@ -113,6 +123,7 @@ class Attention(nn.Module):
                 sliding_window=sliding_window,
                 sinks=sinks,
                 scale=scale,
+                chunk_size=chunk_size,
             )
         else:
             raise ValueError(f"Unknown attention backend: {attn_backend}")

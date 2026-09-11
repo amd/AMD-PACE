@@ -22,9 +22,14 @@ class PydanticConfig:
     arbitrary_types_allowed = True
 
 
-from pace.utils.logging import PACE_INFO, PACE_DEBUG
-from pace.server.engine.utils import ServerConfig, PrefillRequest
-from pace.server.engine.server import model_executor
+from pace.utils.logging import PACE_INFO, PACE_DEBUG, PACE_WARNING
+from pace.server.engine.utils import (
+    ServerConfig,
+    StepRequest,
+    MixedStepRequest,
+    PrefillRequest,
+)
+from pace.server.engine.server import model_executor, Sequence
 
 from pace.server.model_list import SUPPORTED_MODEL_LIST
 
@@ -49,103 +54,141 @@ def config_server(config: ServerConfig):
 
 
 @app.post("/step")
-def step(req: Dict[str, Any]):
-
+def step(req: StepRequest):
+    """Iterative scheduler step: either a decode or a batch of prefills."""
     try:
-        # Handle two types of requests:
-        # 1. Batch of prefill requests (list of prefill operations)
-        # 2. Single decode request
-        PACE_DEBUG(f"[ENGINE/FRONTEND] Entering the step endpoint with request: {req}")
-        if req.get("is_decode", False):
-            # Handle single decode request
+        if req.is_decode:
             result = model_executor.decode()
             return {"status": "success", "step_type": "decode", "result": result}
 
-        elif "prefill_batch" in req:
-            # Handle batch of prefill requests
-            prefill_requests = req["prefill_batch"]
-            results = []
-
-            for prefill_req in prefill_requests:
-                if not prefill_req.get("is_prefill", False):
-                    results.append(
-                        {
-                            "req_id": prefill_req.get("req_id", "unknown"),
-                            "error": "Request must have is_prefill=true",
-                        }
-                    )
-                    continue
-
-                # Validate required fields
-                if "prompt" not in prefill_req or "req_id" not in prefill_req:
-                    results.append(
-                        {
-                            "req_id": prefill_req.get("req_id", "unknown"),
-                            "error": "Prefill request must include 'prompt' and 'req_id'",
-                        }
-                    )
-                    continue
-
-                prompt = prefill_req["prompt"]
-                req_id = prefill_req["req_id"]
-                generation_config = prefill_req.get("generation_config", {})
-
-                gen_config_dict = (
-                    {k: v for k, v in generation_config.items() if v is not None}
-                    if generation_config
-                    else {}
-                )
-
-                try:
-                    if not req_id or not isinstance(req_id, str) or len(req_id) != 36:
-                        error_msg = (
-                            "req_id must be a non-empty string and "
-                            "req_id must be a valid UUID string (36 characters)"
-                        )
-                        results.append(
-                            {
-                                "req_id": req_id if req_id else "missing",
-                                "error": error_msg,
-                            }
-                        )
-                        continue
-
-                    req_uuid = uuid.UUID(req_id)
-                except ValueError:
-                    results.append(
-                        {
-                            "req_id": req_id,
-                            "error": "req_id must be a valid UUID format",
-                        }
-                    )
-                    continue
-
-                try:
-                    result = model_executor.prefill(
-                        PrefillRequest(
-                            request_id=req_uuid,
-                            prompt=prompt,
-                            gen_config=gen_config_dict,
-                        )
-                    )
-                    results.append({"req_id": req_id, "result": result})
-                except Exception as e:
-                    results.append({"req_id": req_id, "error": str(e)})
-            PACE_DEBUG(f"[ENGINE/FRONTEND] Prefill batch completed. Results: {results}")
-            PACE_INFO(f"[ENGINE/FRONTEND] Status: Processed {len(results)} requests")
-
-            return {
-                "status": "success",
-                "step_type": "prefill_batch",
-                "results": results,
-            }
-
-        else:
+        if not req.prefill_batch:
             raise HTTPException(
                 status_code=400,
                 detail="Request must specify either 'is_decode=true' or contain 'prefill_batch'",
             )
 
+        results = []
+        for pr in req.prefill_batch:
+            rid = pr.req_id
+            generation_config = pr.generation_config or {}
+            gen_config_dict = (
+                {k: v for k, v in generation_config.items() if v is not None}
+                if generation_config
+                else {}
+            )
+            try:
+                req_uuid = uuid.UUID(rid)
+                result = model_executor.prefill(
+                    PrefillRequest(
+                        request_id=req_uuid,
+                        prompt=pr.prompt,
+                        gen_config=gen_config_dict,
+                    )
+                )
+                results.append({"req_id": rid, "result": result})
+            except Exception as e:
+                results.append({"req_id": rid, "error": str(e)})
+
+        return {
+            "status": "success",
+            "step_type": "prefill_batch",
+            "results": results,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/step_auto_mixed")
+def step_auto_mixed(req: MixedStepRequest):
+    """Continuous batching: prefill new requests + decode existing ones in one forward."""
+    try:
+        prefill_requests = req.prefill_batch
+        PACE_DEBUG(
+            f"[step_auto_mixed] prefill_count={len(prefill_requests)}, "
+            f"decode_queue_size={len(model_executor.decode_queue)}"
+        )
+        chunk_info_map = (
+            {k: tuple(v) for k, v in req.chunk_info_map.items()}
+            if req.chunk_info_map
+            else None
+        )
+
+        decode_sequences = list(model_executor.decode_queue.values())
+
+        prefill_sequences: List = []
+        prefill_errors: Dict[str, Any] = {}
+        for pr in prefill_requests:
+            rid = pr.req_id
+            prompt_token_ids = pr.prompt
+            generation_config = pr.generation_config or {}
+            gen_config_dict = (
+                {k: v for k, v in generation_config.items() if v is not None}
+                if generation_config
+                else {}
+            )
+            try:
+                req_uuid = uuid.UUID(rid)
+
+                existing_seq = model_executor.prefill_queue.get(req_uuid)
+                if existing_seq is not None:
+                    prefill_sequences.append(existing_seq)
+                    continue
+
+                spec_headroom = 0
+                if model_executor._spec_decoder is not None:
+                    spec_headroom = (
+                        model_executor._spec_decoder.num_speculative_tokens + 1
+                    )
+                seq = Sequence(
+                    req_id=req_uuid,
+                    input_token_ids=prompt_token_ids,
+                    model_config=model_executor.model_config,
+                    cache_backend=model_executor._cache_backend,
+                    _prepare_sampling_config=model_executor._model.generator._prepare_sampling_config,
+                    genConfig=gen_config_dict if gen_config_dict else None,
+                    spec_headroom=spec_headroom,
+                    tokenizer=model_executor._tokenizer,
+                )
+                model_executor.prefill_queue[seq.id] = seq
+                prefill_sequences.append(seq)
+            except Exception as e:
+                PACE_WARNING(f"Failed to create sequence for {rid}: {e}")
+                prefill_errors[str(rid)] = {
+                    "status": "ERROR",
+                    "error": str(e),
+                }
+
+        if not prefill_sequences and not decode_sequences:
+            return {
+                "status": "success",
+                "step_type": "auto_mixed",
+                "prefill_result": prefill_errors,
+                "decode_result": {},
+                "stats": {"num_prefill": 0, "num_decode": 0, "total_in_batch": 0},
+            }
+
+        prefill_result, decode_result = model_executor.prefill_decode_mixed_batch(
+            prefill_sequences, decode_sequences, chunk_info_map
+        )
+        prefill_result.update(prefill_errors)
+
+        return {
+            "status": "success",
+            "step_type": "auto_mixed",
+            "prefill_result": prefill_result,
+            "decode_result": decode_result,
+            "stats": {
+                "num_prefill": len(prefill_result),
+                "num_decode": len(decode_result),
+                "total_in_batch": len(prefill_result) + len(decode_result),
+            },
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -195,6 +238,26 @@ def list_models():
             }
         )
     return {"data": models, "object": "list"}
+
+
+@app.get("/cache_stats")
+def get_cache_stats():
+    """Return KV cache pool and prefix cache statistics.
+
+    Internal engine endpoint (no OpenAI equivalent). The router consumes it for
+    ``/v1/server_metrics`` and to feed the standard Prometheus ``/metrics``
+    gauges (``pace_prefix_cache_*``, ``pace_kv_cache_usage_perc``).
+    """
+    stats = {}
+    backend = getattr(model_executor, "_cache_backend", None)
+    if backend is not None:
+        # Paged exposes the pool as ``_pool``; slab as ``_manager``.
+        pool = getattr(backend, "_pool", None) or getattr(backend, "_manager", None)
+        if pool is not None and hasattr(pool, "get_stats"):
+            stats["pool"] = pool.get_stats()
+        if hasattr(backend, "get_prefix_cache_stats"):
+            stats["prefix_cache"] = backend.get_prefix_cache_stats()
+    return {"status": "success", "cache_stats": stats}
 
 
 @app.get("/get_sequences")

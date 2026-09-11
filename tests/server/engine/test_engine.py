@@ -91,7 +91,9 @@ class InferenceServerTests(unittest.IsolatedAsyncioTestCase):
             "modelConfig": {
                 "modelId": self.MODEL_ID,
                 "dataType": "bf16",
-                "attnType": "dynamic",
+                "kvCacheType": "SLAB_POOL",
+                "attention_backend": "SLAB",
+                "kv_cache_memory_gb": 10,
             },
         }
         resp = requests.post(

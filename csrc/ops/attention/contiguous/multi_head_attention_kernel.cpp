@@ -5,12 +5,9 @@
  ******************************************************************************/
 
 #include <ops/attention/contiguous/multi_head_attention_kernel.h>
-#include <ops/cpu.h>
 #include <ops/kernels/kernel_primitive_utils.h>
-#include <pace_tensor/pace_aten_interface.h>
-
-// extension includes
-#include <utils/kernel_utils.h>
+#include <ops/onednn.h>
+#include <ops/onednn_utils.h>
 #include <utils/utils.h>
 
 typedef long int dim_t;
@@ -23,15 +20,10 @@ memory pace_transpose(const memory& src_mem, std::vector<int> perm) {
   stream engine_stream(cpu_eng());
 
   auto src_md = src_mem.get_desc();
-  auto dta = GET_DATA_TYPE(src_mem);
+  auto dta = src_mem.get_desc().get_data_type();
 
-#ifdef USE_ZENDNN
-  auto data_dims = src_md.dims();
-  auto ndata_dims = src_md.dims().size();
-#else // Use OneDNN
   auto data_dims = src_md.get_dims();
   auto ndata_dims = src_md.get_dims().size();
-#endif // Use OneDNN
 
   memory::dims transposed_dims(ndata_dims);
   memory::dims strides(ndata_dims);
@@ -42,10 +34,11 @@ memory pace_transpose(const memory& src_mem, std::vector<int> perm) {
     total_stride *= data_dims[perm[i]];
   }
 
-  memory dst_mem({data_dims, dta, strides}, cpu_eng(), JIT_MEMORY_ALLOCATE);
+  memory dst_mem({data_dims, dta, strides}, cpu_eng(), DNNL_MEMORY_ALLOCATE);
 
   reorder(src_mem, dst_mem)
-      .execute(engine_stream, {{JIT_ARG_SRC, src_mem}, {JIT_ARG_DST, dst_mem}});
+      .execute(
+          engine_stream, {{DNNL_ARG_SRC, src_mem}, {DNNL_ARG_DST, dst_mem}});
 
   return dst_mem;
 }
@@ -59,7 +52,7 @@ void mha_kernel_impl(
     const int& use_KQ) {
   stream engine_stream(cpu_eng());
 
-  auto dta = GET_DATA_TYPE(input_Q_mem);
+  auto dta = input_Q_mem.get_desc().get_data_type();
 
   // get memory descriptors
   auto query_md = input_Q_mem.get_desc();
@@ -68,13 +61,13 @@ void mha_kernel_impl(
   auto mask_md = input_mask_mem.get_desc();
   auto output_md = output_mem.get_desc();
 
-  const dim_t B = GET_DIMS(query_md, 0);
-  const dim_t N = GET_DIMS(query_md, 1);
-  const dim_t S = GET_DIMS(query_md, 2);
-  const dim_t H = GET_DIMS(query_md, 3);
+  const dim_t B = query_md.get_dims()[0];
+  const dim_t N = query_md.get_dims()[1];
+  const dim_t S = query_md.get_dims()[2];
+  const dim_t H = query_md.get_dims()[3];
 
   // KV cache length L
-  const dim_t L = GET_DIMS(key_md, 2);
+  const dim_t L = key_md.get_dims()[2];
 
   float scale = 1 / sqrt(H);
 
@@ -346,7 +339,7 @@ void multi_head_attention_kernel(
   memory input_V_mem = view_tensor_as_memory(input_V);
   memory output_mem = view_tensor_as_memory(output);
 
-  memory input_mask_mem = memory({}, cpu_eng(), JIT_MEMORY_NONE);
+  memory input_mask_mem = memory({}, cpu_eng(), DNNL_MEMORY_NONE);
 
   if (input_mask.has_value()) {
     input_mask_mem = view_tensor_as_memory(input_mask.value());

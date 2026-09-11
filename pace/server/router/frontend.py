@@ -32,6 +32,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 from transformers import AutoTokenizer
 
+from pace.server.router.continuous_batch_scheduler import ContinuousBatchScheduler
 from pace.server.router.request_handler import router as api_router, set_dependencies
 from pace.server.router.scheduler import IterativeScheduler, PrefillFirstScheduler
 from pace.server.router.streaming import set_scheduler
@@ -69,7 +70,6 @@ def startup_event_wrapper(args):
         model_config = {
             "modelId": args.model,
             "dataType": args.dtype.lower(),
-            "kvCacheType": args.kv_cache_type,
             "norm_backend": op_config.get("norm_backend", ""),
             "qkv_projection_backend": op_config.get("qkv_projection_backend", ""),
             "attention_backend": op_config.get("attention_backend", ""),
@@ -77,6 +77,8 @@ def startup_event_wrapper(args):
             "mlp_backend": op_config.get("mlp_backend", ""),
             "lm_head_backend": op_config.get("lm_head_backend", ""),
         }
+        if args.kv_cache_type is not None:
+            model_config["kvCacheType"] = args.kv_cache_type
         if spec_config:
             model_config["spec_config"] = spec_config
         kv_cache_memory_gb = getattr(args, "kv_cache_memory_gb", None)
@@ -170,7 +172,8 @@ def parse_router_arguments():
     parser.add_argument(
         "--serve_type",
         type=str,
-        choices=["iterative", "continuous_prefill_first"],
+        default="iterative",
+        choices=["iterative", "continuous_prefill_first", "continuous_batch"],
         help="Type of scheduler to use",
     )
     parser.add_argument(
@@ -199,18 +202,30 @@ def parse_router_arguments():
         default=None,
         help="Memory budget for SLAB KV cache pool in GB",
     )
+    parser.add_argument(
+        "--token_budget",
+        type=int,
+        default=2048,
+        help="Max tokens per step for continuous_batch scheduler",
+    )
+    parser.add_argument(
+        "--max_num_running_reqs",
+        type=int,
+        default=128,
+        help="Hard cap on concurrent decode sequences per engine for continuous_batch",
+    )
+    parser.add_argument(
+        "--max_prefill_chunk",
+        type=int,
+        default=0,
+        help="Max prefill chunk size (0=no cap) for continuous_batch scheduler",
+    )
     args = parser.parse_args()
     return args
 
 
 if __name__ == "__main__":
     args = parse_router_arguments()
-    if args.serve_type == "iterative":
-        Scheduler = IterativeScheduler
-    elif args.serve_type == "continuous_prefill_first":
-        Scheduler = PrefillFirstScheduler
-    else:
-        raise ValueError(f"Unknown serve_type: {args.serve_type}")
     if args.scheduler_metrics_enabled in ["True", "true", "1"]:
         args.scheduler_metrics_enabled = True
     else:
@@ -228,12 +243,45 @@ if __name__ == "__main__":
         f"Initializing scheduler with {len(engine_urls)} engine instance(s): {engine_urls}"
     )
 
-    scheduler = Scheduler(
-        engine_urls,
-        args.scheduler_metrics_enabled,
-    )
+    try:
+        spec_config = json.loads(args.spec_config)
+    except json.JSONDecodeError:
+        spec_config = {}
 
-    # Load tokenizer for prompt normalization (token-array decoding)
+    if args.serve_type == "continuous_batch":
+        if args.kv_cache_type is not None:
+            kv_type = args.kv_cache_type.lower()
+            if kv_type not in ("paged", "slab_pool"):
+                PACE_WARNING(
+                    f"'continuous_batch' scheduler only works with non-contiguous KV "
+                    f"cache backends ('PAGED' or 'SLAB_POOL'). Got '{args.kv_cache_type}'. "
+                    f"Overriding to 'SLAB_POOL'."
+                )
+                args.kv_cache_type = "SLAB_POOL"
+        spec_tokens = 1
+        if spec_config:
+            spec_tokens = spec_config.get("num_speculative_tokens", 12) + 1
+        scheduler = ContinuousBatchScheduler(
+            engine_url=engine_urls,
+            scheduler_metrics_enabled=args.scheduler_metrics_enabled,
+            max_num_running_reqs=args.max_num_running_reqs,
+            token_budget=args.token_budget,
+            max_prefill_chunk=args.max_prefill_chunk,
+            tokens_per_decode=spec_tokens,
+        )
+    elif args.serve_type == "iterative":
+        scheduler = IterativeScheduler(
+            engine_urls,
+            args.scheduler_metrics_enabled,
+        )
+    elif args.serve_type == "continuous_prefill_first":
+        scheduler = PrefillFirstScheduler(
+            engine_urls,
+            args.scheduler_metrics_enabled,
+        )
+    else:
+        raise ValueError(f"Unknown serve_type: {args.serve_type}")
+
     PACE_INFO(f"Loading tokenizer for model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     PACE_INFO("Tokenizer loaded successfully")
