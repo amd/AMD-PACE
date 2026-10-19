@@ -12,17 +12,19 @@ AMD PACE is a high-performance LLM inference engine and agentic AI runtime built
 
 * **vLLM Plugin (`pace-vllm`)** — A drop-in [vLLM platform plugin](https://docs.vllm.ai/en/latest/design/plugin_system.html) that routes vLLM's CPU worker through PACE's attention, SlabPool KV cache, Linear/RMSNorm, and eligible unquantized FusedMoE implementations. Compile mode also fuses eligible MLP blocks, and vLLM prefix caching is integrated through `PaceSlabConnector`. More in [packages/pace_vllm/README.md](packages/pace_vllm/README.md).
 
-* **FusedMoE** — A routed Mixture-of-Experts operator with configurable routing, shared experts, and optimized TPP execution. It supports the MoE model paths used by Llama 4, Qwen3 MoE, Gemma 4, and GPT-OSS, and is integrated into `pace-vllm`.
+* **FusedMoE** — A routed Mixture-of-Experts operator with configurable routing, shared experts, and optimized TPP execution. It supports the MoE model paths used by Llama 4, Qwen3 MoE, Qwen3.5 MoE, Gemma 4, and GPT-OSS, and is integrated into `pace-vllm`.
 
 * **Inference Server** — `pace-server` provides a router/engine serving stack with a `continuous_batch` scheduler that combines chunked prefills and decodes, multi-instance NUMA-aware execution, OpenAI-shaped text and chat completion endpoints, and built-in Prometheus and scheduler metrics. More in [InferenceServer.md](docs/InferenceServer.md).
 
 * **Automatic Prefix Caching** — `pace-server` reuses complete prompt-prefix blocks across requests with its `SLAB_POOL` and `PAGED` KV caches. It is enabled by default and can be disabled with `PACE_PREFIX_CACHE=0`.
 
-* **Broad Model Support** — Llama 3 and text-only Llama 4, Qwen2/2.5/3 (including Qwen3 MoE), Phi3/4, Gemma 3 and text-only Gemma 4, GPT-J, OPT, and GPT-OSS, with shared operator and backend infrastructure. See [LLM.md](docs/LLM.md).
+* **Broad Model Support** — Llama 3 and text-only Llama 4, Qwen2/2.5/3 (including Qwen3 MoE), Qwen3.5 and Qwen3.5 MoE (hybrid Gated DeltaNet), Phi3/4, Gemma 3 and text-only Gemma 4, GPT-J, OPT, and GPT-OSS, with shared operator and backend infrastructure. See [LLM.md](docs/LLM.md).
 
 * **PACE Agent** — A LangGraph-based agent runtime for deterministic replay, profiling, and optimization of non-model work such as retrieval, serialization, context assembly, orchestration, and tool I/O. It includes WebVoyager and GAIA workflows and supports local or remote OpenAI-compatible model endpoints. See [packages/pace_agent/README.md](packages/pace_agent/README.md).
 
 * **Speculative Decoding (PARD)** — Built-in PARallel Draft Model Adaptation that runs a smaller draft model ahead of the target and verifies speculated tokens in parallel. More in [SpeculativeDecoding.md](docs/SpeculativeDecoding.md).
+
+* **STeP (Speculative Tensor Parallelism)**: A lossless, training-free, self-speculative decoding method for serving a model whose weights exceed available VRAM. STeP partitions each FFN's channels between a GPU and the CPU and uses the GPU-resident prefix as its own draft model, with the CPU residual running on PACE's fused AVX512 FFN kernel. More in [STeP.md](docs/STeP.md).
 
 ## Contents
 
@@ -67,6 +69,28 @@ AMD PACE provides pre-built **manylinux wheels** on PyPI — the simplest instal
    pip install amd-pace
    ```
 
+### GPU
+
+AMD PACE runs on CPU by default. The `gpu` extra adds what its GPU features need alongside the CPU, on AMD or NVIDIA hardware. Install PyTorch for your accelerator first, so these replace steps 2 and 3:
+
+AMD (ROCm):
+```
+pip install --extra-index-url https://download.pytorch.org/whl/rocm7.2 torch==2.13.0+rocm7.2
+pip install "amd-pace[gpu]"
+```
+
+NVIDIA (CUDA):
+```
+pip install torch==2.13.0
+pip install "amd-pace[gpu]"
+```
+
+To check what a given environment has:
+
+```
+python -c "from pace.utils import describe_device; print(describe_device())"
+```
+
 ### From source (developers)
 
 > NOTE: Building from source requires gcc>=12 and make. On Ubuntu: `sudo apt install build-essential gcc-12 g++-12`.
@@ -94,6 +118,12 @@ AMD PACE provides pre-built **manylinux wheels** on PyPI — the simplest instal
 
     > NOTE: Building AMD PACE, especially the oneDNN component, can require significant memory. If your system does not have enough RAM, the build process may fail or your machine may run out of memory.
 
+4. **For a GPU build**, install PyTorch for your accelerator first — see [GPU](#gpu) — then build without isolation, so the build does not replace it with the CPU PyTorch:
+    ```
+    pip install -r gpu_requirements.txt
+    pip install --no-build-isolation [-v] ".[gpu]"
+    ```
+
 ## PACE Agent
 
 PACE Agent profiles and optimizes the CPU work around LLM calls in agentic workflows. It
@@ -114,6 +144,7 @@ GAIA, and sandbox setup.
 The following models are supported by AMD PACE:
 1. [Large Language Models](docs/LLM.md)
     1. [Speculative Decoding](docs/SpeculativeDecoding.md)
+    1. [STeP: GPU/CPU speculative decoding](docs/STeP.md)
     1. [LLM Benchmarks](benchmarks/llm/performance/README.md)
     1. [LLM Evaluation](benchmarks/llm/accuracy/README.md)
     1. [MLPerf LLM Inference (Server scenario)](docs/MLPerf.md)
@@ -125,6 +156,7 @@ The `examples/` directory contains runnable scripts and notebooks to get started
 * [PACE LLM Streamer](examples/pace_llm_streamer.py) - streaming text generation example
 * [PACE GPT-OSS Chat Notebook](examples/pace_gpt-oss_chat.ipynb) - offline GPT-OSS chat workflow with chat templating and final-answer extraction
 * [PACE Sarvam Translate Quickstart](examples/pace_sarvam_translate_quickstart.ipynb) - offline translation notebook for Sarvam Translate
+* [PACE STeP](examples/pace_step.py) - GPU/CPU speculative decoding with STeP, streaming accepted tokens in green
 * [PACE Server Basic](examples/pace_server_basic.py) - minimal inference server example
 * [Server Playbook](examples/playbook_server.ipynb) - end-to-end inference server notebook
 * [Speculative Server Playbook](examples/playbook_server_speculative.ipynb) - speculative decoding server notebook

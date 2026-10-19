@@ -6,13 +6,28 @@
 
 from transformers import (
     PreTrainedTokenizer,
+    PreTrainedTokenizerBase,
 )
 from datasets import load_dataset, Dataset
 import json
-from typing import Optional
+import os
+from typing import Optional, Sequence
 import random
 import numpy as np
 import torch
+from tqdm import tqdm
+
+from pace.utils.logging import PACE_LLM_ASSERT, PACE_LLM_INFO
+
+# Short names for calibration corpora: hub id, config, split, text field, and whether to stream it rather than download it whole.
+CALIBRATION_DATASETS = {
+    "wikitext2": ("Salesforce/wikitext", "wikitext-2-raw-v1", "train", "text", False),
+    "starcoder": ("bigcode/starcoderdata", None, "train", "content", True),
+    "c4": ("allenai/c4", "en", "train", "text", True),
+}
+
+# Where the text is looked for in a corpus without an entry above.
+_TEXT_FIELDS = ("text", "content", "code")
 
 
 class LLMInferenceDataset:
@@ -55,27 +70,7 @@ class LLMInferenceDataset:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Load dataset
-        if dataset_name:
-            if version:
-                raw_dataset = load_dataset(dataset_name, version, split=split)
-            else:
-                raw_dataset = load_dataset(dataset_name, split=split)
-
-        elif custom_data_path:
-            with open(custom_data_path, "r", encoding="utf-8") as f:
-                if custom_data_path.endswith(".json"):
-                    data = json.load(f)  # a list of dicts
-                elif custom_data_path.endswith(".jsonl"):
-                    data = [json.loads(line) for line in f]
-                else:
-                    raise ValueError("Unsupported file format. Use .json or .jsonl")
-            raw_dataset = Dataset.from_list(data)
-
-        else:
-            raise ValueError(
-                "You must specify either 'dataset_name', 'custom_data', or 'custom_data_path'."
-            )
+        raw_dataset = self._load_raw(dataset_name, version, split, custom_data_path)
 
         # Pre-tokenize all samples and store them
         self.samples = []
@@ -147,6 +142,45 @@ class LLMInferenceDataset:
             self.total = len(self.samples)
         self.index = 0
 
+    @staticmethod
+    def _load_raw(
+        dataset_name: Optional[str] = None,
+        version: Optional[str] = None,
+        split: str = "test",
+        custom_data_path: Optional[str] = None,
+        streaming: bool = False,
+    ):
+        """
+        Load rows from a HuggingFace dataset, or from a JSON/JSONL file of dicts.
+
+        :param dataset_name: Name of the HuggingFace dataset.
+        :param version: Dataset configuration/version (used for HuggingFace datasets).
+        :param split: Dataset split to load (ignored for custom data).
+        :param custom_data_path: Path to a JSON/JSONL file with list of dicts.
+        :param streaming: Stream a HuggingFace dataset rather than download it whole.
+        :return: The rows, each a dict.
+        """
+        if dataset_name:
+            if version:
+                return load_dataset(
+                    dataset_name, version, split=split, streaming=streaming
+                )
+            return load_dataset(dataset_name, split=split, streaming=streaming)
+
+        if custom_data_path:
+            with open(custom_data_path, "r", encoding="utf-8") as f:
+                if custom_data_path.endswith(".json"):
+                    data = json.load(f)  # a list of dicts
+                elif custom_data_path.endswith(".jsonl"):
+                    data = [json.loads(line) for line in f]
+                else:
+                    raise ValueError("Unsupported file format. Use .json or .jsonl")
+            return Dataset.from_list(data)
+
+        raise ValueError(
+            "You must specify either 'dataset_name', 'custom_data', or 'custom_data_path'."
+        )
+
     def __iter__(self):
         self.index = 0
         return self
@@ -205,3 +239,110 @@ class LLMInferenceDataset:
 
     def reset(self):
         self.index = 0
+
+
+class CalibrationDataset(LLMInferenceDataset):
+    """
+    Fixed-length token windows cut from text corpora, for calibration.
+
+    The parent tokenizes each row as a prompt and pads a batch to its longest. Calibration wants every position to be real text, so each corpus is concatenated and cut into `sequence_length` windows, strided so they are not all drawn from its start. Windows are split evenly across the corpora, the remainder going to the first. Loading, iteration and size are the parent's; its constructor is not, since what it tokenizes differs.
+
+    Args:
+        tokenizer: Tokenizer for the model under calibration.
+        datasets: Corpora: aliases from `CALIBRATION_DATASETS`, other hub ids, or JSON/JSONL files of dicts.
+        num_samples: Total windows.
+        sequence_length: Tokens per window.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        datasets: Sequence[str],
+        num_samples: int,
+        sequence_length: int,
+    ):
+        self.tokenizer = tokenizer
+        per_source = num_samples // len(datasets)
+        remainder = num_samples - per_source * len(datasets)
+
+        windows = []
+        for index, name in enumerate(datasets):
+            wanted = per_source + (remainder if index == 0 else 0)
+            if wanted <= 0:
+                continue
+            # Roughly four characters per token, doubled for slack.
+            text = self._corpus_text(name, wanted * sequence_length * 8)
+            # The corpus is tokenized whole and then cut into windows, so the model's length limit does not apply.
+            tokens = tokenizer(
+                text, return_tensors="pt", add_special_tokens=True, verbose=False
+            ).input_ids[0]
+            PACE_LLM_ASSERT(
+                tokens.numel() >= sequence_length,
+                f"dataset {name} tokenized to {tokens.numel()} tokens, fewer than the {sequence_length}-token window",
+            )
+            stride = max(1, (tokens.numel() - sequence_length) // max(1, wanted - 1))
+            for step in range(wanted):
+                start = min(step * stride, tokens.numel() - sequence_length)
+                windows.append(tokens[start : start + sequence_length])
+            PACE_LLM_INFO(f"calibration source {name}: {wanted} windows")
+
+        self.samples = torch.stack(windows)
+        self.total = len(windows)
+        self.index = 0
+
+    def _corpus_text(self, name: str, characters: int) -> str:
+        """
+        Read rows from a corpus until they hold at least `characters` of text.
+
+        Args:
+            name: Alias from `CALIBRATION_DATASETS`, a hub id, or a JSON/JSONL file.
+            characters: Text to read.
+
+        Returns:
+            str: The rows' text, separated by blank lines.
+        """
+        if os.path.isfile(name):
+            rows, fields = self._load_raw(custom_data_path=name), _TEXT_FIELDS
+        else:
+            # An unknown corpus could be any size, and only its first `characters` are read.
+            hub_id, config, split, field, streaming = CALIBRATION_DATASETS.get(
+                name, (name, None, "train", None, True)
+            )
+            rows = self._load_raw(hub_id, config, split, streaming=streaming)
+            fields = (field,) if field else _TEXT_FIELDS
+
+        chunks, size = [], 0
+        with tqdm(
+            total=characters, desc=f"Reading {name}", unit="char", unit_scale=True
+        ) as progress:
+            for row in rows:
+                for field in fields:
+                    value = row.get(field)
+                    if isinstance(value, str) and len(value) > 50:
+                        chunks.append(value)
+                        progress.update(min(len(value), characters - size))
+                        size += len(value)
+                        break
+                if size >= characters:
+                    break
+
+        PACE_LLM_ASSERT(
+            size > 0, f"dataset {name} yielded no usable text in fields {fields}"
+        )
+        return "\n\n".join(chunks)
+
+    def get_batch(self, batch_size: int, start_index: int = 0):
+        """
+        Return windows `start_index` to `start_index + batch_size`.
+
+        Args:
+            batch_size: Windows in the batch; the last batch may hold fewer.
+            start_index: Index of the first window.
+
+        Returns:
+            dict: input_ids and attention_mask, each [batch, sequence_length].
+        """
+        if start_index >= self.total:
+            raise IndexError("Start index exceeds dataset size.")
+        input_ids = self.samples[start_index : start_index + batch_size]
+        return {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}

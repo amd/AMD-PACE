@@ -38,7 +38,10 @@ def main():
         "--dtype", type=str, default="bfloat16", help="Data type for the model"
     )
     parser.add_argument(
-        "--kv_cache_type", type=str, default="BMC", help="KV Cache type"
+        "--kv_cache_type",
+        type=str,
+        default=None,
+        help="KV Cache type",
     )
     parser.add_argument(
         "--serve_type", type=str, default="iterative", help="Serving type"
@@ -69,6 +72,12 @@ def main():
         type=str,
         default="{}",
         help='Speculative decoding config JSON, e.g. \'{"model_name": "amd/PARD-Qwen2.5-0.5B", "num_speculative_tokens": 12}\'',
+    )
+    parser.add_argument(
+        "--generation_backend_config",
+        type=str,
+        default="{}",
+        help="Generation backend configuration as JSON",
     )
     parser.add_argument(
         "--kv_cache_memory_gb",
@@ -309,8 +318,6 @@ def main():
         str(args.server_model),
         "--dtype",
         str(args.dtype),
-        "--kv_cache_type",
-        str(args.kv_cache_type),
         "--op_config",
         str(args.op_config),
         "--scheduler_metrics_enabled",
@@ -321,7 +328,11 @@ def main():
         str(args.num_engine_instances),
         "--spec_config",
         str(args.spec_config),
+        "--generation_backend_config",
+        str(args.generation_backend_config),
     ]
+    if args.kv_cache_type is not None:
+        router_cmd.extend(["--kv_cache_type", str(args.kv_cache_type)])
     if args.kv_cache_memory_gb is not None:
         router_cmd.extend(["--kv_cache_memory_gb", str(args.kv_cache_memory_gb)])
     if args.serve_type == "continuous_batch":

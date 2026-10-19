@@ -57,7 +57,7 @@ class MoEConfig:
 
     Shared experts (Llama4, Qwen2-MoE, DeepSeek V2/V3): num_shared_experts > 0
     enables experts applied to all tokens regardless of routing. They run as
-    dense MLPs.
+    dense MLPs, added unscaled unless shared_expert_gate is set.
     """
 
     hidden_size: int
@@ -70,6 +70,8 @@ class MoEConfig:
     router_bias: bool = True  # whether the router linear has a bias term
     num_shared_experts: int = 0  # shared experts applied to all tokens
     shared_intermediate_size: int = 0  # 0 means same as intermediate_size
+    shared_expert_gate: bool = False  # scale shared experts by a learned
+    # per-token sigmoid (Qwen2-MoE / Qwen3.5) instead of adding them unscaled
     routed_scaling_factor: float = 1.0  # scales the routed expert output (DeepSeek)
     build_router: bool = True  # build the internal router Linear; set False when
     # the model supplies router logits / routing externally (e.g. Gemma4, whose
@@ -139,6 +141,7 @@ class MoEConfig:
             num_shared_experts=_get("num_shared_experts", default=0),
             shared_intermediate_size=_get("shared_intermediate_size", default=0),
             routed_scaling_factor=_get("routed_scaling_factor", default=1.0),
+            shared_expert_gate=kwargs.pop("shared_expert_gate", False),
             routing=kwargs.pop("routing", RoutingType.SOFTMAX),
             renormalize=kwargs.pop("renormalize", _get("norm_topk_prob", default=True)),
             num_expert_group=_get("n_group", "num_expert_group", default=1) or 1,
@@ -271,6 +274,18 @@ class MoEExperts(OperatorBase):
                 ]
             )
 
+        self.shared_gate = (
+            Linear(
+                in_features=moe_config.hidden_size,
+                out_features=1,
+                bias=False,
+                dtype=dtype,
+                backend_impl=backend_impl,
+            )
+            if moe_config.num_shared_experts > 0 and moe_config.shared_expert_gate
+            else None
+        )
+
         # Shared experts with the same intermediate size can be folded into the
         # fused expert stack (decided by the fused backend's preprocess).
         self.foldable_shared = (
@@ -343,10 +358,12 @@ class MoEExperts(OperatorBase):
         return self.down_projs[e](inter)
 
     def _run_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Dense shared experts, summed (added unscaled to the routed output)."""
+        """Dense shared experts, summed, then optionally sigmoid-gated."""
         output = torch.zeros_like(hidden_states)
         for mlp in self.shared_mlps:
             output = output + mlp(hidden_states)
+        if self.shared_gate is not None:
+            output = output * torch.sigmoid(self.shared_gate(hidden_states))
         return output
 
     def route(self, router_logits: torch.Tensor) -> "tuple[torch.Tensor, torch.Tensor]":
@@ -420,20 +437,28 @@ class MoEExperts(OperatorBase):
         num_experts_kernel = self.num_experts
         if self._folded_shared:
             # Folded shared experts are extra stack entries [num_experts,
-            # num_experts + num_shared); each token attends them with weight 1.0
-            # (unscaled — routed_scaling_factor applies to routed experts only).
+            # num_experts + num_shared); each token attends them at weight 1.0,
+            # or at its sigmoid gate when the model scales them per token
+            # (routed_scaling_factor applies to routed experts only).
             shared_ids = torch.arange(
                 self.num_experts,
                 self.num_experts + self.num_shared_experts,
                 dtype=topk_indices.dtype,
                 device=topk_indices.device,
             ).expand(num_tokens, -1)
-            shared_w = torch.ones(
-                num_tokens,
-                self.num_shared_experts,
-                dtype=routing_weights.dtype,
-                device=routing_weights.device,
-            )
+            if self.shared_gate is not None:
+                shared_w = (
+                    torch.sigmoid(self.shared_gate(hidden_states))
+                    .to(routing_weights.dtype)
+                    .expand(num_tokens, self.num_shared_experts)
+                )
+            else:
+                shared_w = torch.ones(
+                    num_tokens,
+                    self.num_shared_experts,
+                    dtype=routing_weights.dtype,
+                    device=routing_weights.device,
+                )
             topk_indices = torch.cat([topk_indices, shared_ids], dim=1)
             routing_weights = torch.cat([routing_weights, shared_w], dim=1)
             output = torch.zeros_like(hidden_states)

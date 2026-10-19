@@ -154,6 +154,11 @@ class TestSamplingConfig(TestCase):
         self.assertEqual(config1.top_k, 50)
         self.assertEqual(config1.temperature, 0.7)
 
+    def test_merge_from_carries_an_explicit_seed(self):
+        config1 = SamplingConfig(eos_token_id=[1])
+        config1.merge_from(SamplingConfig(seed=7, eos_token_id=[1]))
+        self.assertEqual(config1.sampling_seed, 7)
+
     def test_finalize(self):
         sampling_config = SamplingConfig(
             temperature=0.0,

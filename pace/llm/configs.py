@@ -269,6 +269,9 @@ class SamplingConfig(object):
         # The other SamplingConfig object will override the current object (takes precedence)
         if other is not None:
             explicit = getattr(other, "_explicit_keys", frozenset())
+            # Explicit keys are argument names, and the seed argument is stored as sampling_seed.
+            if "seed" in explicit:
+                explicit = explicit | {"sampling_seed"}
             for key, value in other.__dict__.items():
                 if key.startswith("_"):
                     continue
@@ -559,6 +562,9 @@ class OperatorConfig(UserDict):
         self.qkv_projection = self.pop(LLMOperatorType.QKVProjection, BackendType.TPP)
         self.rope = self.pop(LLMOperatorType.RoPE, BackendType.NATIVE)
         self.attention = self.pop(LLMOperatorType.Attention, AttentionBackendType.SLAB)
+        self.gated_deltanet = self.pop(
+            LLMOperatorType.GatedDeltaNet, BackendType.NATIVE
+        )
         self.out_projection = self.pop(LLMOperatorType.OutProjection, BackendType.TPP)
         self.mlp = self.pop(LLMOperatorType.MLP, BackendType.TPP)
         self.norm = self.pop(LLMOperatorType.Norm, BackendType.JIT)
@@ -589,9 +595,8 @@ class OperatorConfig(UserDict):
 class SpecDecodeConfig:
     """Base configuration class for speculative decoding algorithms.
 
-    All speculative decoding configs should inherit from this class so that
-    ``Generator`` and ``LLMModel`` can accept any algorithm-specific config
-    through a single ``spec_config`` parameter.
+    All speculative decoding configs inherit from this class so generation
+    backends can accept any algorithm-specific config through ``spec_config``.
     """
 
     pass

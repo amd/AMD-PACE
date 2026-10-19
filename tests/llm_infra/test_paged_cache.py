@@ -5,7 +5,9 @@
 # ******************************************************************************
 # python -m pytest tests/llm_infra/test_paged_cache.py -v
 
+import os
 import types
+from unittest.mock import patch
 
 import torch
 from torch.testing._internal.common_utils import TestCase
@@ -15,6 +17,10 @@ from pace.llm.attention.paged.cache import (
     PagedKVCache,
     PagedKVCachePool,
     SharedPagedKVCache,
+)
+from pace.llm.attention.recurrent_state import (
+    MergedRecurrentState,
+    RecurrentStateStore,
 )
 from pace.llm.attention.specs import LayerKVSpec
 
@@ -819,6 +825,103 @@ def _make_config(**overrides):
     return types.SimpleNamespace(**defaults)
 
 
+class TestPagedCacheAllocation(TestCase):
+    def test_pool_is_sized_when_first_offline_batch_arrives(self):
+        config = _make_config()
+        cache = PagedCache(
+            config,
+            block_size=16,
+            enable_prefix_cache=False,
+        )
+
+        self.assertIsNone(cache._pool)
+
+        cache.create_context(
+            config,
+            max_seq_length=17,
+            batch_size=3,
+        )
+
+        self.assertEqual(cache._pool.total_blocks, 6)
+
+    def test_pool_resize_clears_prefix_map(self):
+        config = _make_config()
+        cache = PagedCache(
+            config,
+            block_size=16,
+            enable_prefix_cache=True,
+        )
+        context = cache.create_context(config, max_seq_length=16)
+        cache._prefix_map.insert(b"old-pool", 0)
+        cache.remove_context(context)
+
+        cache.create_context(config, max_seq_length=64, batch_size=2)
+
+        self.assertIsNone(cache._prefix_map.peek(b"old-pool"))
+
+    def test_reserve_pool_honors_explicit_and_default_capacity(self):
+        cases = (
+            ({"max_total_tokens": 64}, {}),
+            ({}, {"PACE_MAX_CACHE_TOKENS": "64"}),
+        )
+        for cache_kwargs, environment in cases:
+            with self.subTest(cache_kwargs=cache_kwargs):
+                config = _make_config()
+                cache = PagedCache(
+                    config,
+                    block_size=16,
+                    enable_prefix_cache=False,
+                    **cache_kwargs,
+                )
+
+                self.assertIsNone(cache._pool)
+                with patch.dict(os.environ, environment):
+                    cache.reserve_pool()
+
+                self.assertEqual(cache._pool.total_blocks, 4)
+
+    def test_reserve_pool_honors_memory_budget(self):
+        config = _make_config()
+        probe = PagedCache(
+            config,
+            block_size=16,
+            enable_prefix_cache=False,
+        )
+        memory_gb = probe._bytes_per_token * 64 / 1024**3
+        cache = PagedCache(
+            config,
+            block_size=16,
+            kv_cache_memory_gb=memory_gb,
+            enable_prefix_cache=False,
+        )
+
+        cache.reserve_pool()
+
+        self.assertEqual(cache._pool.total_blocks, 4)
+
+    def test_offline_pool_honors_an_explicit_limit(self):
+        config = _make_config()
+        probe = PagedCache(config, block_size=16, enable_prefix_cache=False)
+        cases = (
+            ({"max_total_tokens": 64}, 4),
+            ({"max_total_tokens": 256}, 16),
+            ({"kv_cache_memory_gb": probe._bytes_per_token * 64 / 1024**3}, 4),
+        )
+        for cache_kwargs, expected_blocks in cases:
+            with self.subTest(cache_kwargs=cache_kwargs):
+                cache = PagedCache(
+                    config,
+                    block_size=16,
+                    enable_prefix_cache=False,
+                    **cache_kwargs,
+                )
+
+                # This batch alone would size a lazy pool to 6 blocks.
+                cache.create_context(config, max_seq_length=17, batch_size=3)
+
+                self.assertEqual(cache._pool.total_blocks, expected_blocks)
+
+
 class TestPagedCacheMergeContexts(TestCase):
     """Tests for PagedCache.merge_contexts — the server decode metadata builder."""
 
@@ -963,3 +1066,58 @@ class TestPagedCacheMergeContexts(TestCase):
         meta = merged.paged_attn_metadata
         ref = self._reference_block_table(contexts, meta.block_table.shape[1])
         self.assertTrue(torch.equal(meta.block_table, ref))
+
+
+class TestPagedCacheRecurrentState(TestCase):
+    """Tests for per-request GDN state on packed paged batches."""
+
+    def _make_cache_and_contexts(self, seq_lens, hybrid=True, block_size=16):
+        layer_types = ["linear_attention", "full_attention"] if hybrid else None
+        config = _make_config(layer_types=layer_types)
+        cache = PagedCache(config, block_size=block_size, max_total_tokens=8192)
+        contexts = []
+        for seq_len in seq_lens:
+            ctx = cache.create_context(config, max_seq_length=4096)
+            for co in ctx.cache_objects:
+                co.seq_len = seq_len
+                co._ensure_blocks_allocated(seq_len)
+            contexts.append(ctx)
+        return cache, contexts
+
+    @staticmethod
+    def _query_lens(merged):
+        qsl = merged.paged_attn_metadata.query_start_loc
+        return (qsl[1:] - qsl[:-1]).tolist()
+
+    def test_context_owns_a_recurrent_store(self):
+        _, contexts = self._make_cache_and_contexts([10])
+        store = contexts[0].kv_cache_manager.recurrent_state
+        self.assertIsInstance(store, RecurrentStateStore)
+        self.assertEqual(store.num_layers, 1)
+
+    def test_decode_merge_exposes_per_request_stores(self):
+        cache, contexts = self._make_cache_and_contexts([10, 20, 30])
+        stores = [c.kv_cache_manager.recurrent_state for c in contexts]
+
+        merged = cache.merge_contexts(contexts, query_len=1)
+
+        self.assertIsInstance(merged.recurrent_state, MergedRecurrentState)
+        self.assertEqual(merged.recurrent_state.stores, stores)
+        self.assertEqual(self._query_lens(merged), [1, 1, 1])
+
+    def test_mixed_merge_carries_per_request_query_lens(self):
+        cache, contexts = self._make_cache_and_contexts([5, 20, 40])
+        stores = [c.kv_cache_manager.recurrent_state for c in contexts]
+        query_lens = [4, 1, 7]
+
+        merged = cache.merge_contexts_mixed(list(zip(contexts, query_lens)))
+
+        self.assertEqual(merged.recurrent_state.stores, stores)
+        self.assertEqual(self._query_lens(merged), query_lens)
+
+    def test_full_attention_model_is_left_untouched(self):
+        cache, contexts = self._make_cache_and_contexts([10, 20], hybrid=False)
+
+        merged = cache.merge_contexts(contexts, query_len=1)
+
+        self.assertIsNone(getattr(merged, "recurrent_state", None))

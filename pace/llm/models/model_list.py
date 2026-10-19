@@ -5,16 +5,11 @@
 # *******************************************************************************
 
 import importlib
-from typing import Type
+from typing import Dict, Tuple, Type
 
-from pace.llm.models.base_model import BaseModelForCausalLM
+from pace.llm.models.base_model import BaseModel
 
-"""
-The dictionary of model architectures supported.
-The key is the model architecture name, and the value is a tuple of the module name and the class name.
-"""
-_MODELS = {
-    # Architecture -> (module, class).
+_DECODER_MODELS = {
     "OPTForCausalLM": ("opt", "OPTForCausalLM"),
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
     "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
@@ -29,45 +24,65 @@ _MODELS = {
     "Llama4ForConditionalGeneration": ("llama4", "Llama4ForCausalLM"),
     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
     "Gemma4ForConditionalGeneration": ("gemma4", "Gemma4ForConditionalGeneration"),
+    "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
+    "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForCausalLM"),
+    "Qwen3_5MoeForCausalLM": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
+    "Qwen3_5MoeForConditionalGeneration": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
+}
+
+_ENCODER_MODELS = {
+    "BertModel": ("bert", "BertModel"),
+    "BertForSequenceClassification": ("bert", "BertForSequenceClassification"),
+    "BertForTokenClassification": ("bert", "BertForTokenClassification"),
+    "ModernBertModel": ("modernbert", "ModernBertModel"),
+    "ModernBertForSequenceClassification": (
+        "modernbert",
+        "ModernBertForSequenceClassification",
+    ),
+    "ModernBertForTokenClassification": (
+        "modernbert",
+        "ModernBertForTokenClassification",
+    ),
+    # MaskedLM checkpoints load as the encoder body; no fill-mask API.
+    "ModernBertForMaskedLM": ("modernbert", "ModernBertModel"),
 }
 
 
 def models_supported():
-    """
-    Get the list of model architectures supported.
-    """
-    return _MODELS.keys()
+    """Decoder architectures loadable by the native generation backend."""
+    return _DECODER_MODELS.keys()
 
 
-def _get_model(model_arch):
-    """
-    Load the model class from the module. This is a helper function for lazy loading.
+def encoder_models_supported():
+    """Encoder architectures loadable by ``EmbeddingModel``."""
+    return _ENCODER_MODELS.keys()
 
-    Args:
-        model_arch: The model architecture name.
 
-    Returns:
-        The model class.
-    """
-    module_name, model_cls_name = _MODELS[model_arch]
+def _load_class(table: Dict[str, Tuple[str, str]], model_arch: str):
+    module_name, model_cls_name = table[model_arch]
     module = importlib.import_module(f"pace.llm.models.{module_name}")
     return getattr(module, model_cls_name, None)
 
 
-def get_model_class(model_arch) -> Type[BaseModelForCausalLM]:
-    """
-    Get the model class for the given model architecture.
-    If the model architecture is not supported, raise a ModuleNotFoundError
+def get_model_class(model_arch) -> Type[BaseModel]:
+    """Decoder class for ``model_arch``. Encoder names are rejected here."""
+    if model_arch in _DECODER_MODELS:
+        return _load_class(_DECODER_MODELS, model_arch)
+    if model_arch in _ENCODER_MODELS:
+        raise ModuleNotFoundError(
+            f"{model_arch} is an encoder model; load it with EmbeddingModel, "
+            "not LLMModel."
+        )
+    raise ModuleNotFoundError(f"The model arch {model_arch} is not supported yet.")
 
-    Args:
-        model_arch: The model architecture name.
 
-    Returns:
-        The model class.
-
-    Raises:
-        ModuleNotFoundError: If the model architecture is not supported.
-    """
-    if model_arch in models_supported():
-        return _get_model(model_arch)
+def get_encoder_model_class(model_arch) -> Type[BaseModel]:
+    """Encoder class for ``model_arch``. Decoder names are rejected here."""
+    if model_arch in _ENCODER_MODELS:
+        return _load_class(_ENCODER_MODELS, model_arch)
+    if model_arch in _DECODER_MODELS:
+        raise ModuleNotFoundError(
+            f"{model_arch} is a decoder model; load it with LLMModel, "
+            "not EmbeddingModel."
+        )
     raise ModuleNotFoundError(f"The model arch {model_arch} is not supported yet.")

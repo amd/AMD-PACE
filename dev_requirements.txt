@@ -1,0 +1,7 @@
+# Benchmark, script and dev tooling. Included by requirements.txt and gpu_requirements.txt.
+
+httpx==0.28.1
+black==26.5.1
+flake8>=7.3.0
+hypothesis>=6.155.7
+expecttest>=0.3.0

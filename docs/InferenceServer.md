@@ -93,10 +93,11 @@ pace-server
 | **Model Configuration** | | | |
 | `--server_model` | `str` | `"facebook/opt-6.7b"` | HuggingFace model name or local path<br>Example: `meta-llama/Llama-3.1-8B-Instruct` |
 | `--dtype` | `str` | `"bfloat16"` | Data type for model weights/compute<br>Options: `float32`, `bfloat16` |
-| `--kv_cache_type` | `str` | `"BMC"` | KV cache implementation<br>Options: `BMC` (Balancing Memory & Compute), `dynamic`, `SLAB_POOL`, `PAGED` |
-| `--kv_cache_memory_gb` | `float` | `None` | Optional per-engine `SLAB_POOL` memory budget in GB. Providing it allocates each engine's slab pool eagerly; otherwise capacity is derived lazily. It does not configure `PAGED` capacity |
+| `--kv_cache_type` | `str` | `SLAB_POOL` for BF16, `PAGED` for FP32 | KV cache implementation<br>Options: `BMC` (Balancing Memory & Compute), `dynamic`, `SLAB_POOL`, `PAGED` |
+| `--kv_cache_memory_gb` | `float` | `None` | Optional per-engine `SLAB_POOL` or `PAGED` memory budget in GB. Providing it eagerly reserves the serving pool. Without it, SLAB defaults to `min(model max positions, 8192)` tokens and PAGED defaults to `PACE_MAX_CACHE_TOKENS` (`262144`) |
 | `--op_config` | `str` | `"{}"` | Operator backend configuration (JSON string, see [Operator Backends](#operator-backend-configuration)) |
 | `--spec_config` | `str` | `"{}"` | Speculative decoding configuration (JSON string)<br>Example: `'{"model_name": "amd/PARD-Qwen2.5-0.5B", "num_speculative_tokens": 12}'`<br>See [Online Speculative Decoding](#online-speculative-decoding-pard) for details |
+| `--generation_backend_config` | `str` | `"{}"` | Generation backend configuration (JSON string). Omit for the native backend<br>Example: `'{"type": "step", "vram_budget_gb": 80}'` selects [STeP](STeP.md) |
 | **Monitoring** | | | |
 | `--enable_prometheus` | flag | off | Start bundled Prometheus sidecar for metrics scraping. See [Monitoring](InferenceServerMonitoring.md) |
 
@@ -110,13 +111,14 @@ pace-server
 
 ### Operator Backend Configuration
 
-The `--op_config` flag accepts a JSON string to configure operator backends. Six operator types can be configured:
+The `--op_config` flag accepts a JSON string to configure operator backends. Seven operator types can be configured:
 
 | Operator | Key | Backends | Default |
 |----------|-----|----------|---------|
 | Normalization | `norm_backend` | `NATIVE`, `JIT` | `NATIVE` |
 | QKV Projection | `qkv_projection_backend` | `NATIVE`, `JIT`, `TPP`, `AOCLDLP` | `TPP` |
 | Attention | `attention_backend` | `JIT`, `NATIVE`, `PAGED`, `SLAB` | Cache-dependent |
+| Gated DeltaNet (linear attention, e.g. Qwen3.5) | `gated_deltanet_backend` | `NATIVE`, `JIT` | `NATIVE` |
 | Output Projection | `out_projection_backend` | `NATIVE`, `JIT`, `TPP`, `AOCLDLP` | `TPP` |
 | MLP | `mlp_backend` | `NATIVE`, `JIT`, `TPP`, `IMBPS`, `AOCLDLP` | `TPP` |
 | LM Head | `lm_head_backend` | `NATIVE`, `JIT`, `TPP`, `AOCLDLP` | `NATIVE` |
@@ -137,9 +139,10 @@ The attention backend is finalized from the KV cache: `DYNAMIC`/`BMC` use
 `SLAB_POOL` and `PAGED` reuse complete prompt-prefix blocks across requests by
 default. Set `PACE_PREFIX_CACHE=0` before launching the server to disable this,
 or set `PACE_PREFIX_HASH=sha256` to use SHA-256 instead of the default
-`xxhash` block hash. `PAGED` capacity is controlled by
-`PACE_MAX_CACHE_TOKENS` (default `262144`). Cache hit and pool utilization
-statistics are exposed through `/v1/server_metrics` and Prometheus. See the
+`xxhash` block hash. `PACE_MAX_CACHE_TOKENS` overrides the implicit token
+capacity for either pooled backend; `--kv_cache_memory_gb` provides an explicit
+memory budget. Cache hit and pool utilization statistics are exposed through
+`/v1/server_metrics` and Prometheus. See the
 [Performance Guide](PerformanceGuide.md#environment-variables-reference) for
 the remaining cache and backend environment variables.
 

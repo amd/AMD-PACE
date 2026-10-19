@@ -77,9 +77,9 @@ PACE Agent profiles a real agent run and turns it into an actionable report, fol
 three questions:
 
 ```bash
-pace-agent profile <agent> --config run.json --out run/  # record + profile a run
-pace-agent optimize run/ --impl optimized                # evaluate a recorded run
-pace-agent report run/                                   # render the latest result
+pace-agent profile <agent> --config run.json --characterize-runs 10 --out run/  # record + profile a representative run
+pace-agent optimize run/ --impl optimized                                       # evaluate a recorded run
+pace-agent report run/                                                          # render the latest result
 ```
 
 `<agent>` is an import spec or Python file path. It may expose `run(llm, task)`, a compiled
@@ -99,6 +99,21 @@ projected E2E. It does not measure a full candidate replay. The command writes
 A run with no candidate coverage, replay-contract divergence, or failed parity is invalid and
 receives no speedup claim.
 
+### Step 1: profile with characterization — record a representative run, not the first one
+
+An agent asked the same question twice does not do the same thing twice, so recording the
+first live run makes one arbitrary sample reproducible without making it typical. With
+`--characterize-runs N`, `profile` runs the agent N times live, records a representative run
+instead, and reports how representative it is. It is off by default (`characterize_runs: 1`).
+
+```bash
+pace-agent profile pace_agent.examples.webvoyager --config run.json \
+  --characterize-runs 10 --characterize-strategy mode --out run/
+```
+
+Strategies, verdicts, config keys and cost are in step 1 of
+[docs/deterministic-replay.md](docs/deterministic-replay.md#step-1-profile-with-characterization).
+
 ### Example agents
 
 PACE Agent ships several runnable [LangGraph](https://github.com/langchain-ai/langgraph) agents you
@@ -117,7 +132,8 @@ can profile with `pace-agent profile pace_agent.examples.<name> --config <config
 
 Ready-to-edit configs for several of these live in `packages/pace_agent/configs/`
 (`basic_example.json`, `pace_agent_rag_gptoss.json`, `pace_agent_testgen.json`) — copy one, point its
-`llm.endpoint` at your endpoint, and pass it with `--config`.
+`llm.endpoint` at your endpoint, and pass it with `--config`. `pace_agent_characterize.json` is the
+same idea with characterization enabled; it names no workload, so it works for any of these agents.
 
 ## Configuration
 
@@ -228,7 +244,7 @@ and running `pace-agent profile` on any graph.
 ## Documentation
 
 - **[docs/agent-integration.md](docs/agent-integration.md)** — profile any LangGraph agent in one line (`profile_invoke`, `instrument`, `@pace_agent.op`).
-- **[docs/deterministic-replay.md](docs/deterministic-replay.md)** — record/replay, replay modes, the strict replay contract, and candidate coverage.
+- **[docs/deterministic-replay.md](docs/deterministic-replay.md)** — the two benchmark steps: profile with characterization (step 1) and replay (step 2), including replay modes, the strict replay contract, and candidate coverage.
 - **[docs/providers.md](docs/providers.md)** — the naive / optimized / provider tier model and registering a provider.
 - **[docs/benchmark-methodology.md](docs/benchmark-methodology.md)** — measurement profiles, interleaving, bootstrap CIs, and tail-percentile gating.
 - **[docs/trajectory-format.md](docs/trajectory-format.md)** — the safe msgpack trajectory format and codec registry.

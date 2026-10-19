@@ -9,6 +9,8 @@ from typing import Union, Optional
 import torch
 from torch import nn
 
+from pace.utils.logging import PACE_WARNING
+
 from .base import (
     AttentionBackend,
     AttentionBackendType,
@@ -84,6 +86,7 @@ class Attention(nn.Module):
         sinks: Optional[torch.Tensor] = None,
         scale: Optional[float] = None,
         chunk_size: int = 0,
+        is_causal: bool = True,
     ):
         super().__init__()
         attn_backend = opconfig.attention
@@ -103,6 +106,28 @@ class Attention(nn.Module):
                 sliding_window=sliding_window,
                 sinks=sinks,
                 chunk_size=chunk_size,
+                is_causal=is_causal,
+            )
+        elif not is_causal:
+            # Encoder (bidirectional) attention is only implemented on the
+            # contiguous backends; SLAB/PAGED are causal-decode KV-cache
+            # backends and cannot service an encoder forward. An encoder keeps
+            # no cache, so there is nothing those backends would have provided:
+            # fall back to NATIVE rather than refusing to load the model.
+            PACE_WARNING(
+                f"Attention: {attn_backend} cannot serve encoder (is_causal="
+                f"False) attention, which keeps no KV cache. Falling back to "
+                f"{AttentionBackendType.NATIVE} for this layer."
+            )
+            self._backend = ContiguousAttentionBackend(
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                AttentionBackendType.NATIVE,
+                sliding_window=sliding_window,
+                sinks=sinks,
+                chunk_size=chunk_size,
+                is_causal=is_causal,
             )
         elif attn_backend == AttentionBackendType.SLAB:
             self._backend = SlabAttentionBackend(

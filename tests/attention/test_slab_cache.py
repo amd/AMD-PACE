@@ -217,6 +217,7 @@ class TestSlabCacheBackend(TestCase):
         # First context: small
         ctx1 = cache.create_context(config, max_seq_length=32, batch_size=1)
         old_max = cache._manager.max_total_tokens
+        cache._prefix_map.insert(b"old-pool", 0)
 
         cache.remove_context(ctx1)
 
@@ -224,7 +225,20 @@ class TestSlabCacheBackend(TestCase):
         ctx2 = cache.create_context(config, max_seq_length=256, batch_size=4)
         new_max = cache._manager.max_total_tokens
         self.assertGreater(new_max, old_max)
+        self.assertIsNone(cache._prefix_map.peek(b"old-pool"))
         cache.remove_context(ctx2)
+
+    def test_ensure_manager_rejects_resize_with_active_context(self):
+        from pace.llm.attention.slab.cache import SlabCache
+
+        config = _MockConfig()
+        cache = SlabCache(config)
+        context = cache.create_context(config, max_seq_length=32)
+
+        with self.assertRaisesRegex(RuntimeError, "requests are active"):
+            cache.create_context(config, max_seq_length=256, batch_size=4)
+
+        cache.remove_context(context)
 
     def test_merge_contexts(self):
         """merge_contexts combines multiple single-sequence contexts."""
@@ -246,9 +260,26 @@ class TestSlabCacheBackend(TestCase):
 
         config = _MockConfig()
         cache = SlabCache(config, kv_cache_memory_gb=0.01)
+        self.assertIsNone(cache._manager)
+
+        cache.reserve_pool()
+
         self.assertIsNotNone(cache._manager)
         self.assertGreater(cache._manager.max_total_tokens, 0)
 
         ctx = cache.create_context(config, max_seq_length=64)
         self.assertIsNotNone(ctx)
         cache.remove_context(ctx)
+
+    def test_reserve_pool_uses_default_capacity(self):
+        from pace.llm.attention.slab.cache import SlabCache
+
+        config = _MockConfig()
+        cache = SlabCache(config)
+
+        cache.reserve_pool()
+
+        self.assertEqual(
+            cache._manager.max_total_tokens,
+            min(config.max_position_embeddings, 8192),
+        )

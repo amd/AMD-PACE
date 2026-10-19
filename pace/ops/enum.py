@@ -30,10 +30,13 @@ class OperatorType(StrEnum):
     LAYERNORM = auto()
     RMSNORM = auto()
     L2NORM = auto()
+    RMSNORM_GATED = auto()
     ROTARYEMBEDDING = auto()
     MOEROUTER_SOFTMAX = auto()
     MOEROUTER_SIGMOID = auto()
     MOEROUTER_GROUPED_SIGMOID = auto()
+    GATED_DELTANET_RECURRENCE = auto()
+    GATED_DELTANET_CONV1D = auto()
 
 
 class FusedOperatorType(StrEnum):

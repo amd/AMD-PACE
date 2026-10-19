@@ -37,3 +37,9 @@ class ConfigError(PaceAgentError):
 
 class TaskStalled(PaceAgentError):
     exit_code = 8
+
+
+class CharacterizationFailed(PaceAgentError):
+    """Characterization could not collect enough live runs to choose a representative from."""
+
+    exit_code = 9

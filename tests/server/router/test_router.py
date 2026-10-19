@@ -1000,26 +1000,32 @@ class EngineLogprobsBuilderTests(unittest.TestCase):
         self.assertEqual(obj["top_logprobs"], [[]])
 
     def test_build_prompt_logprobs_object(self):
+        from types import SimpleNamespace
+
         torch = self.torch
         vocab = 5
         prompt_ids = [1, 3, 0, 4]
         # [1, seq, vocab] raw logits; logits at pos t predict token t+1.
         full_logits = torch.randn(1, len(prompt_ids), vocab)
-
-        obj = self.ModelExecutor._build_prompt_logprobs_object(
-            prompt_ids, full_logits, logprobs_n=2
+        input_logprobs = torch.log_softmax(
+            full_logits.squeeze(0), dim=-1, dtype=torch.float32
         )
+        state = SimpleNamespace(
+            prompt_token_ids=torch.tensor([prompt_ids]),
+            logprobs_n=2,
+            backend_state=SimpleNamespace(prompt_start=0),
+        )
+        obj = self.ModelExecutor()._prompt_logprobs_from_tensor(state, input_logprobs)
 
         self.assertEqual(obj["token_ids"], prompt_ids)
         # First prompt token has no predecessor -> None logprob, empty top.
         self.assertIsNone(obj["token_logprobs"][0])
         self.assertEqual(obj["top_logprobs"][0], [])
         # Remaining logprobs come from log_softmax(logits[i-1])[token_i].
-        lp = torch.log_softmax(full_logits.squeeze(0), dim=-1, dtype=torch.float32)
         for i in range(1, len(prompt_ids)):
             self.assertAlmostEqual(
                 obj["token_logprobs"][i],
-                float(lp[i - 1, prompt_ids[i]].item()),
+                float(input_logprobs[i - 1, prompt_ids[i]].item()),
                 places=5,
             )
             self.assertEqual(len(obj["top_logprobs"][i]), 2)

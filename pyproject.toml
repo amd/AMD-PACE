@@ -22,6 +22,9 @@ license-files = ["LICENSE", "NOTICE"]
 keywords = ["amd", "pace", "llm", "inference", "pytorch", "cpu"]
 dynamic = ["version", "dependencies"]
 
+[project.optional-dependencies]
+gpu = ["accelerate>=1.13.0"]
+
 [tool.setuptools.dynamic]
 dependencies = { file = ["runtime_requirements.txt"] }
 

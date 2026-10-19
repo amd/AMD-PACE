@@ -5,6 +5,7 @@
 # ******************************************************************************
 
 import os
+import threading
 from collections import OrderedDict
 from typing import Optional, Tuple
 
@@ -15,7 +16,39 @@ from pace.llm.attention.base import (
     AttentionBackend,
     AttentionBackendType,
 )
+from pace.llm.attention.eviction.cache import EvictingKVCache
 from pace.utils.logging import PACE_LLM_ASSERT
+
+# Cache the encoder window boolean only when it is cheap to keep. 512×512
+# bool is 256 KiB; 32K×32K would be 1 GiB and is rebuilt per call instead.
+_ENCODER_WINDOW_CACHE_CELLS = 512 * 512
+# Module-level: every sliding layer of one encoder asks for the same boolean.
+_ENCODER_WINDOW_CACHE_ENTRIES = 8
+_encoder_windows: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+
+_ENCODER_MASK_CACHE_ENTRIES = max(
+    1, int(os.getenv("PACE_ENCODER_MASK_CACHE_MAX_ENTRIES", "64"))
+)
+_encoder_masks: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+_encoder_attention_cache_lock = threading.RLock()
+
+
+def _encoder_attention_mask_key(attention_mask: Optional[torch.Tensor]) -> tuple:
+    if attention_mask is None:
+        return ()
+    return tuple(attention_mask.detach().cpu().flatten().tolist())
+
+
+def reset_encoder_window_cache() -> None:
+    """Drop all cached encoder window patterns."""
+    with _encoder_attention_cache_lock:
+        _encoder_windows.clear()
+
+
+def reset_encoder_mask_cache() -> None:
+    """Drop all cached encoder additive masks."""
+    with _encoder_attention_cache_lock:
+        _encoder_masks.clear()
 
 
 class MaskCache:
@@ -37,7 +70,6 @@ class MaskCache:
     (default 1000) to cap memory from many distinct shapes.
     """
 
-    # pool_key -> (buf, content_key); order is LRU (oldest first).
     _pool: OrderedDict[tuple, tuple[torch.Tensor, tuple]] = OrderedDict()
     _MAX_ENTRIES: int = max(1, int(os.getenv("PACE_MASK_CACHE_MAX_ENTRIES", "1000")))
 
@@ -57,6 +89,7 @@ class MaskCache:
         leading_pad: Optional[torch.Tensor] = None,
         owner: str = "",
         chunk_size: int = 0,
+        valid_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return a ``[bs, 1, q_len, kv_len]`` additive causal mask.
 
@@ -70,11 +103,14 @@ class MaskCache:
                 non-serving (single-request) path.  Using a per-request owner
                 prevents concurrent requests that happen to share the same
                 ``(shape, dtype)`` from aliasing each other's mask buffer.
+            valid_lens: Optional per-row valid key counts for left-aligned
+                eviction windows where rows may differ in filled length.
         """
         shape = (bs, 1, q_len, kv_len)
         pool_key = (shape, dtype, owner)
         pad_tuple = tuple(leading_pad.tolist()) if leading_pad is not None else ()
-        content_key = (seq_len, sliding_window, chunk_size, pad_tuple)
+        valid_tuple = tuple(valid_lens.tolist()) if valid_lens is not None else ()
+        content_key = (seq_len, sliding_window, chunk_size, pad_tuple, valid_tuple)
         min_val = torch.finfo(dtype).min
 
         entry = MaskCache._pool.get(pool_key)
@@ -86,12 +122,10 @@ class MaskCache:
         else:
             buf = torch.empty(shape, dtype=dtype)
 
-        # Write causal mask
         effective = seq_len if seq_len > 0 else kv_len
         buf.fill_(min_val)
         buf.triu_(diagonal=effective - q_len + 1)
 
-        # Sliding window
         if sliding_window > 0:
             q_pos = torch.arange(kv_len - q_len, kv_len)
             k_pos = torch.arange(kv_len)
@@ -120,10 +154,14 @@ class MaskCache:
                 )
                 buf.masked_fill_(diff_chunk.unsqueeze(0).unsqueeze(0), min_val)
 
-        # Leading pad
         if leading_pad is not None and (leading_pad > 0).any():
             col = torch.arange(kv_len, device=leading_pad.device)
             flags = col.unsqueeze(0) < leading_pad.unsqueeze(1)  # [B, kv]
+            buf.masked_fill_(flags[:, None, None, :], min_val)
+
+        if valid_lens is not None:
+            col = torch.arange(kv_len, device=valid_lens.device)
+            flags = col.unsqueeze(0) >= valid_lens.unsqueeze(1)  # [B, kv]
             buf.masked_fill_(flags[:, None, None, :], min_val)
 
         MaskCache._pool[pool_key] = (buf, content_key)
@@ -271,6 +309,7 @@ class ContiguousAttentionBackend(AttentionBackend):
         sliding_window: int = 0,
         sinks: Optional[torch.Tensor] = None,
         chunk_size: int = 0,
+        is_causal: bool = True,
     ):
         super().__init__()
         use_gqa = num_heads != num_kv_heads
@@ -281,6 +320,10 @@ class ContiguousAttentionBackend(AttentionBackend):
         self.sinks = sinks
         self.sliding_window = sliding_window if self._has_sliding else 0
         self.chunk_size = chunk_size if self._has_chunk else 0
+        self._is_causal = is_causal
+        self._forward_impl = (
+            self._forward_causal if is_causal else self._forward_encoder
+        )
         self._mask_cache = MaskCache()
 
         if self._use_jit:
@@ -291,7 +334,6 @@ class ContiguousAttentionBackend(AttentionBackend):
             self._attn_fn = self._native_sdpa
             self._attn_list_fn = self._native_sdpa_list
 
-    # Unified mask
     def _get_mask(
         self,
         Q: torch.Tensor,
@@ -299,6 +341,7 @@ class ContiguousAttentionBackend(AttentionBackend):
         leading_pad: torch.Tensor,
         trailing_pad: int,
         owner: str = "",
+        valid_lens: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Return a [B,1,q,kv] additive mask, or None when not needed.
 
@@ -319,6 +362,7 @@ class ContiguousAttentionBackend(AttentionBackend):
 
         needs_mask = (
             has_pad
+            or valid_lens is not None
             or self._has_sliding
             or self._has_chunk
             or self._has_sinks
@@ -338,10 +382,117 @@ class ContiguousAttentionBackend(AttentionBackend):
             lp,
             owner,
             chunk_size=self.chunk_size,
+            valid_lens=valid_lens,
         )
 
-    # Forward
+    def _build_encoder_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        bs: int,
+        q_len: int,
+        kv_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Additive ``[B, 1, q, kv]`` mask, or None when unmasked.
+
+        ``device`` must come from Q/K/V because the window mask is built even
+        when ``attention_mask`` is None. Reuses a pooled buffer when shape,
+        sliding window, dtype, device, and padding match so local layers do not
+        each rebuild the same tensor. Entries larger than
+        ``_ENCODER_WINDOW_CACHE_CELLS`` cells are not retained.
+        """
+        has_pad = attention_mask is not None and not bool(attention_mask.all())
+        has_window = self.sliding_window > 0
+        if not has_pad and not has_window:
+            return None
+
+        retain = bs * q_len * kv_len <= _ENCODER_WINDOW_CACHE_CELLS
+        pool_key = None
+        if retain:
+            pad_key = _encoder_attention_mask_key(attention_mask if has_pad else None)
+            pool_key = (
+                bs,
+                q_len,
+                kv_len,
+                self.sliding_window,
+                dtype,
+                device,
+                pad_key,
+            )
+            with _encoder_attention_cache_lock:
+                cached = _encoder_masks.get(pool_key)
+                if cached is not None:
+                    _encoder_masks.move_to_end(pool_key)
+                    return cached
+
+        base = torch.zeros((bs, 1, q_len, kv_len), dtype=dtype, device=device)
+
+        min_val = torch.finfo(dtype).min
+
+        if has_window:
+            base.masked_fill_(
+                self._encoder_window_outside(q_len, kv_len, device)[None, None, :, :],
+                min_val,
+            )
+
+        if has_pad:
+            pad = attention_mask == 0  # [B, S] True on padded key positions
+            base.masked_fill_(pad[:, None, None, :], min_val)
+
+        out = base.contiguous()
+        if retain:
+            with _encoder_attention_cache_lock:
+                _encoder_masks[pool_key] = out
+                _encoder_masks.move_to_end(pool_key)
+                while len(_encoder_masks) > _ENCODER_MASK_CACHE_ENTRIES:
+                    _encoder_masks.popitem(last=False)
+        return out
+
+    def _encoder_window_outside(
+        self, q_len: int, kv_len: int, device: torch.device
+    ) -> torch.Tensor:
+        """Boolean ``[q, kv]``: True where ``|i - j|`` is outside the window."""
+        half = self.sliding_window // 2
+        key = (q_len, kv_len, half, device)
+        with _encoder_attention_cache_lock:
+            cached = _encoder_windows.get(key)
+            if cached is not None:
+                _encoder_windows.move_to_end(key)
+                return cached
+        q_pos = torch.arange(q_len, device=device).unsqueeze(1)
+        k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+        outside = (q_pos - k_pos).abs() > half
+        if q_len * kv_len <= _ENCODER_WINDOW_CACHE_CELLS:
+            with _encoder_attention_cache_lock:
+                _encoder_windows[key] = outside
+                while len(_encoder_windows) > _ENCODER_WINDOW_CACHE_ENTRIES:
+                    _encoder_windows.popitem(last=False)
+        return outside
+
+    def _forward_encoder(self, Q, K, V, kv_cache=None, positions=None, **kwargs):
+        """Cacheless bidirectional attention for encoder models.
+
+        Q/K/V arrive as ``[B, S, H, D]`` (BSHD); transpose to BHSD, run a
+        single full-attention pass (no causal mask, no KV cache update),
+        then transpose back. ``kv_cache`` and ``positions`` are accepted and
+        ignored so this matches ``_forward_causal``, letting ``__init__`` pick
+        between the two once.
+        """
+        attention_mask = kwargs.get("attention_mask")
+        Q = Q.transpose(1, 2)
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
+        mask = self._build_encoder_mask(
+            attention_mask, Q.shape[0], Q.shape[2], K.shape[2], Q.dtype, Q.device
+        )
+        out = self._attn_fn(Q, K, V, mask)
+        return out.transpose(1, 2)
+
     def forward(self, Q, K, V, kv_cache, positions, **kwargs):
+        return self._forward_impl(Q, K, V, kv_cache, positions, **kwargs)
+
+    def _forward_causal(self, Q, K, V, kv_cache, positions, **kwargs):
         Q = Q.transpose(1, 2)
         PACE_LLM_ASSERT(
             (K is None) == (V is None),
@@ -354,6 +505,8 @@ class ContiguousAttentionBackend(AttentionBackend):
 
         if isinstance(kv_cache, list):
             out = self._forward_list(Q, K, V, kv_cache, positions)
+        elif isinstance(kv_cache, EvictingKVCache):
+            out = self._forward_evicting(Q, K, V, kv_cache, positions)
         else:
             K, V = kv_cache.update_cache(K, V, concat_dim=2)
             if not self._has_chunk and _can_use_brgemm_prefill(
@@ -384,6 +537,42 @@ class ContiguousAttentionBackend(AttentionBackend):
 
         return out.transpose(1, 2)
 
+    def _forward_evicting(self, Q, K, V, kv_cache, positions):
+        if self._has_sliding or self._has_chunk:
+            raise NotImplementedError(
+                "KV eviction is not supported alongside sliding-window or "
+                "chunked attention: those masks depend on the physical KV "
+                "order, which in-place eviction permutes."
+            )
+
+        context = kv_cache.context
+        K, V = kv_cache.update_cache(K, V, concat_dim=2, positions=positions)
+        if context.owns_rotation:
+            Q = self._rotate_query(Q, context)
+
+        if context.left_aligned:
+            leading_pad = torch.zeros(Q.shape[0], dtype=torch.long, device=Q.device)
+            valid_lens = kv_cache.kv_valid_lens
+        else:
+            leading_pad = context.plan.leading_pad
+            valid_lens = None
+
+        mask = self._get_mask(
+            Q,
+            K,
+            leading_pad,
+            trailing_pad=K.shape[2] - kv_cache.seq_len,
+            owner=getattr(kv_cache, "token", ""),
+            valid_lens=valid_lens,
+        )
+        if self._has_sinks:
+            K, V, mask = _apply_sink_to_kv(Q, K, V, mask, self.sinks)
+        return self._attn_fn(Q, K, V, mask)
+
+    @staticmethod
+    def _rotate_query(Q, context):
+        return context.rope.rotate(Q, context.plan.query_positions)
+
     def _forward_list(self, Q, K, V, kv_cache_list, positions):
         bsz = Q.shape[0]
         Q_list, K_list, V_list, mask_list = [], [], [], []
@@ -409,7 +598,12 @@ class ContiguousAttentionBackend(AttentionBackend):
 
         return self._attn_list_fn(Q_list, K_list, V_list, mask_list)
 
-    # Kernel dispatches
+    # Only `_native_sdpa` consults `self._is_causal`. The JIT kernels take
+    # no causal flag at all -- `multi_head_attention` is always called with
+    # False and `grouped_query_attention` has no such parameter -- so on those
+    # paths causality is carried entirely by the explicit mask `_get_mask`
+    # builds. SDPA is the exception because it offers an `is_causal` shortcut
+    # that applies a triangular mask of its own, which an encoder must not get.
     def _jit_mha(self, Q, K, V, mask):
         return torch.ops.pace.multi_head_attention(
             Q.contiguous(), K.contiguous(), V.contiguous(), mask, False
@@ -425,8 +619,14 @@ class ContiguousAttentionBackend(AttentionBackend):
             return F.scaled_dot_product_attention(
                 Q, K, V, attn_mask=mask, enable_gqa=self._enable_gqa
             )
+        # is_causal is gated on self._is_causal so the encoder path (no mask)
+        # runs full bidirectional attention rather than a triangular mask.
         return F.scaled_dot_product_attention(
-            Q, K, V, is_causal=(Q.shape[2] > 1), enable_gqa=self._enable_gqa
+            Q,
+            K,
+            V,
+            is_causal=(self._is_causal and Q.shape[2] > 1),
+            enable_gqa=self._enable_gqa,
         )
 
     def _jit_mha_list(self, Q_list, K_list, V_list, mask_list):

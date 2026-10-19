@@ -37,6 +37,7 @@ class DisabledTqdm(tqdm):
 
 def download_or_cached_weights(
     model_name: str,
+    native_only: bool = True,
 ) -> os.PathLike:
     """
     Download the model weights from the Hugging Face Hub
@@ -49,6 +50,7 @@ def download_or_cached_weights(
 
     Args:
         model_name (str): Model name or path
+        native_only (bool): Refuse architectures the native backend does not implement
 
     Returns:
         os.PathLike: Path to the model
@@ -64,7 +66,7 @@ def download_or_cached_weights(
     }
 
     # Do not download the original files
-    ignore_patterns = ["*.md", "original/**/*", "flax*", "tf*"]
+    ignore_patterns = ["*.md", "original/*", "consolidated*", "flax*", "tf*"]
 
     # If online access is available, prefer to download the safetensors file format
     if not constants.HF_HUB_OFFLINE:
@@ -92,16 +94,17 @@ def download_or_cached_weights(
     # the config file only, if not supported, raise an
     # error, it not download the weights or find them
     # in the cache
-    model_config_file = hf_hub_download(
-        model_name, filename=constants.CONFIG_NAME, cache_dir=cache_dir
-    )
-    model_config = AutoConfig.from_pretrained(model_config_file)
-    model_arch = model_config.architectures[0]
-    if model_arch not in models_supported():
-        raise ValueError(
-            f"Model {model_name} is not supported by the library. "
-            f"Supported models are: {models_supported()}"
+    if native_only:
+        model_config_file = hf_hub_download(
+            model_name, filename=constants.CONFIG_NAME, cache_dir=cache_dir
         )
+        model_config = AutoConfig.from_pretrained(model_config_file)
+        model_arch = model_config.architectures[0]
+        if model_arch not in models_supported():
+            raise ValueError(
+                f"Model {model_name} is not supported by the library. "
+                f"Supported models are: {models_supported()}"
+            )
 
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
@@ -129,13 +132,16 @@ def download_or_cached_weights(
     return Path(hf_folder)
 
 
-def resolve_model_path(model_name_or_path: Union[str, os.PathLike]) -> os.PathLike:
+def resolve_model_path(
+    model_name_or_path: Union[str, os.PathLike], native_only: bool = True
+) -> os.PathLike:
     """
     Resolve the model path by downloading the model weights
     if the model name is provided.
 
     Args:
         model_name_or_path (Union[str, os.PathLike]): Model name or path
+        native_only (bool): Refuse architectures the native backend does not implement
 
     Returns:
         os.PathLike: Path to the model
@@ -148,6 +154,6 @@ def resolve_model_path(model_name_or_path: Union[str, os.PathLike]) -> os.PathLi
     else:
         # If it's not a directory, it's a model name,
         # download the model weights
-        model_path = download_or_cached_weights(model_name_or_path)
+        model_path = download_or_cached_weights(model_name_or_path, native_only)
 
     return model_path

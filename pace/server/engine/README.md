@@ -345,6 +345,7 @@ curl -X POST "http://localhost:8000/step" \
 - **norm_backend**: `NATIVE` or `JIT`
 - **qkv_projection_backend**: Linear backend for fused QKV projection
 - **attention_backend**: `JIT`, `NATIVE`, `SLAB`, or `PAGED`; finalized to match `kvCacheType`
+- **gated_deltanet_backend**: `NATIVE` or `JIT`; Gated DeltaNet linear-attention layers (e.g. Qwen3.5)
 - **out_projection_backend**: Linear backend for attention output projection
 - **mlp_backend**: MLP or FusedMoE backend
 - **lm_head_backend**: Linear backend for the language-model head

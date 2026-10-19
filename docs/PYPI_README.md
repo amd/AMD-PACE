@@ -27,6 +27,30 @@ pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.13.0
 pip install amd-pace
 ```
 
+## GPU
+
+PACE runs on CPU by default. For the features that use a GPU alongside it, install PyTorch for your accelerator and add the `gpu` extra, instead of steps 1 and 2 above.
+
+AMD (ROCm):
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/rocm7.2 torch==2.13.0+rocm7.2
+pip install "amd-pace[gpu]"
+```
+
+NVIDIA (CUDA):
+
+```bash
+pip install torch==2.13.0
+pip install "amd-pace[gpu]"
+```
+
+To check what a given environment has:
+
+```bash
+python -c "from pace.utils import describe_device; print(describe_device())"
+```
+
 ## Quick example
 
 Inference server (router + engine, OpenAI-compatible endpoint):

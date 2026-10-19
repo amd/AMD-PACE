@@ -1,6 +1,7 @@
 # ******************************************************************************
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
+# Portions of this file consist of AI-generated content
 # ******************************************************************************
 
 from typing import Optional
@@ -196,6 +197,53 @@ def _fake_rmsnorm(
     eps: float,
 ):
     return torch.empty_like(x)
+
+
+@register_fake("pace::rmsnorm_gated")
+def _fake_rmsnorm_gated(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+):
+    torch._check(x.shape == gate.shape)
+    return x.new_empty(x.shape)
+
+
+@register_fake("pace::recurrent_gated_delta_rule")
+@register_fake("pace::chunk_gated_delta_rule")
+def _fake_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+):
+    # One output row per value head; `state` is advanced in place.
+    return query.new_empty((query.size(0), query.size(1), value.size(2), value.size(3)))
+
+
+@register_fake("pace::causal_conv1d_update")
+def _fake_causal_conv1d_update(
+    input: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+):
+    return torch.empty_like(input)
+
+
+@register_fake("pace::causal_conv1d_prefill")
+def _fake_causal_conv1d_prefill(
+    input: torch.Tensor,
+    conv_state: Optional[torch.Tensor],
+    weight: torch.Tensor,
+):
+    batch, channels, seq_len = input.shape
+    # The kernel writes token-major [B, T, C] and returns its [B, C, T] view.
+    out = input.new_empty((batch, seq_len, channels)).transpose(1, 2)
+    new_state = input.new_empty((batch, channels, weight.size(1) - 1))
+    return out, new_state
 
 
 @register_fake("pace::moe_route_softmax")

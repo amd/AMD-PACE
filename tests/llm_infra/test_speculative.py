@@ -57,7 +57,7 @@ class TestPardSpeculativeDecoder(TestCase):
 
     @patch("pace.llm.speculative.init_model", return_value=MockDraftModel())
     @patch("pace.llm.speculative.resolve_model_path", return_value="/mock/path")
-    @patch("pace.llm.generator.validate_generator_inputs", return_value=None)
+    @patch("pace.llm.speculative.validate_model_inputs", return_value=None)
     def setUp(self, mock_validate, mock_resolve, mock_init):
         self.config = PardSpecDecodeConfig(
             model_name_or_path="/mock/draft",
@@ -82,6 +82,17 @@ class TestPardSpeculativeDecoder(TestCase):
     def test_create_draft_kv_cache(self):
         kv_cache = self.decoder.create_draft_kv_cache(128, KVCacheType.DYNAMIC)
         self.assertIsNotNone(kv_cache)
+
+    def test_slab_draft_pool_scales_with_outer_batch(self):
+        self.decoder.prepare_draft_batch(128, KVCacheType.SLAB_POOL, 1)
+        first_capacity = self.decoder._draft_cache_backend._manager.max_total_tokens
+
+        self.decoder.prepare_draft_batch(128, KVCacheType.SLAB_POOL, 4)
+
+        self.assertGreaterEqual(
+            self.decoder._draft_cache_backend._manager.max_total_tokens,
+            first_capacity * 4,
+        )
 
     def test_create_draft_kv_cache_paged(self):
         kv_cache = self.decoder.create_draft_kv_cache(128, KVCacheType.PAGED)
@@ -178,23 +189,30 @@ class TestPardSpeculativeDecoder(TestCase):
 
     @patch("pace.llm.speculative.init_model", return_value=MockDraftModel())
     @patch("pace.llm.speculative.resolve_model_path", return_value="/mock/path")
-    @patch("pace.llm.generator.validate_generator_inputs", return_value=None)
+    @patch("pace.llm.speculative.validate_model_inputs", return_value=None)
     def test_speculate_initial_positions_paged_packs_input(
         self, mock_validate, mock_resolve, mock_init
     ):
         """Paged + padded prefill: draft model receives packed input
         stripped of padding, with actual query lengths in metadata."""
-        decoder = PardSpeculativeDecoder(config=self.config, dtype=torch.bfloat16)
+        decoder = PardSpeculativeDecoder(
+            config=self.config,
+            dtype=torch.bfloat16,
+            cache_type=KVCacheType.PAGED,
+        )
 
         model_input = torch.tensor([[0, 0, 0, 42, 43, 44]])
         initial_positions = torch.tensor([[0, 0, 0, 0, 1, 2]])
         actual_length = 3
 
-        sampling_config = SamplingConfig(max_new_tokens=20, eos_token_id=[2])
-        sampling_config.finalize()
-        decoder.prepare(model_input, sampling_config, KVCacheType.PAGED)
-
-        output = decoder.speculate(model_input, initial_positions=initial_positions)
+        kv_cache = decoder.create_draft_kv_cache(128, KVCacheType.PAGED)
+        num_computed = torch.zeros(1, dtype=torch.long)
+        output = decoder.speculate(
+            model_input,
+            draft_kv_cache=kv_cache,
+            draft_num_computed=num_computed,
+            initial_positions=initial_positions,
+        )
 
         spec_count = decoder.num_speculative_tokens - 1
         expected_packed_len = actual_length + spec_count
@@ -210,18 +228,7 @@ class TestPardSpeculativeDecoder(TestCase):
         self.assertTrue(torch.equal(decoder.model.last_positions, expected_positions))
 
         # num_computed should advance by actual_length + spec_count
-        self.assertEqual(decoder._num_computed_tokens.item(), expected_packed_len)
-
-    def test_get_stats_empty(self):
-        self.decoder._total_accepted = []
-        self.assertIsNone(self.decoder.get_stats())
-
-    def test_get_stats_after_verify(self):
-        self.decoder._total_accepted = [3, 2, 4]
-        stats = self.decoder.get_stats()
-        self.assertIsNotNone(stats)
-        self.assertEqual(stats.total_speculated_tokens, 9)
-        self.assertAlmostEqual(stats.mean_accepted_tokens, 3.0)
+        self.assertEqual(num_computed.item(), expected_packed_len)
 
 
 @suppress_logging_cls()
@@ -229,7 +236,7 @@ class TestCreateSpeculativeDecoder(TestCase):
 
     @patch("pace.llm.speculative.init_model", return_value=MockDraftModel())
     @patch("pace.llm.speculative.resolve_model_path", return_value="/mock/path")
-    @patch("pace.llm.generator.validate_generator_inputs", return_value=None)
+    @patch("pace.llm.speculative.validate_model_inputs", return_value=None)
     def test_creates_pard_decoder(self, mock_validate, mock_resolve, mock_init):
         config = PardSpecDecodeConfig(
             model_name_or_path="/mock/draft",
@@ -247,7 +254,7 @@ class TestCreateSpeculativeDecoder(TestCase):
 
     @patch("pace.llm.speculative.init_model", return_value=MockDraftModel())
     @patch("pace.llm.speculative.resolve_model_path", return_value="/mock/path")
-    @patch("pace.llm.generator.validate_generator_inputs", return_value=None)
+    @patch("pace.llm.speculative.validate_model_inputs", return_value=None)
     def test_pard_token_none_raises(self, mock_validate, mock_resolve, mock_init):
         mock_model = MockDraftModel()
         mock_model.config.pard_token = None
@@ -275,7 +282,7 @@ class TestSpeculativeAcceptanceRange(TestCase):
 
     @patch("pace.llm.speculative.init_model", return_value=MockDraftModel())
     @patch("pace.llm.speculative.resolve_model_path", return_value="/mock/path")
-    @patch("pace.llm.generator.validate_generator_inputs", return_value=None)
+    @patch("pace.llm.speculative.validate_model_inputs", return_value=None)
     def setUp(self, mock_validate, mock_resolve, mock_init):
         self.config = PardSpecDecodeConfig(
             model_name_or_path="/mock/draft",

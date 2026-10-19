@@ -104,11 +104,19 @@ def compute_layer_kv_specs(config: PretrainedConfig) -> List[LayerKVSpec]:
     source_by_type = {}
     if num_shared > 0:
         for i in range(first_shared):
-            source_by_type[layer_type_of(i)] = i
+            if layer_type_of(i) != "linear_attention":
+                source_by_type[layer_type_of(i)] = i
 
     specs: List[LayerKVSpec] = []
+    spec_index_of_layer = {}
     for i in range(num_layers):
         layer_type = layer_type_of(i)
+        # Linear-attention layers (e.g. Qwen3.5 Gated DeltaNet) keep their own
+        # recurrent state and never read or write KV, so they get no spec and
+        # no storage. The returned list is therefore compact over KV-holding
+        # layers, which is how cache backends index it.
+        if layer_type == "linear_attention":
+            continue
         is_sliding = layer_type == "sliding_attention"
 
         head_dim = (
@@ -122,15 +130,17 @@ def compute_layer_kv_specs(config: PretrainedConfig) -> List[LayerKVSpec]:
 
         target = None
         if num_shared > 0 and i >= first_shared:
-            target = source_by_type.get(layer_type)
-            if target is None:
+            source_layer = source_by_type.get(layer_type)
+            if source_layer is None:
                 raise ValueError(
                     f"Layer {i} is among the last num_kv_shared_layers="
                     f"{num_shared} of {num_layers} layers, so it must reuse the "
                     f"KV of an earlier '{layer_type}' layer, but none exists "
                     f"before index {first_shared}."
                 )
+            target = spec_index_of_layer[source_layer]
 
+        spec_index_of_layer[i] = len(specs)
         specs.append(LayerKVSpec(num_kv_heads, head_dim, sw, target))
 
     return specs

@@ -38,6 +38,27 @@ A suite writes one `query_<i>/` directory per task (each with its own `result.js
 and trajectory) plus a run-level `result.json` holding the per-task table and the aggregate.
 Progress is printed per task as it starts and finishes, and failures are printed again at the end.
 
+## Step 1: profile with characterization — which run gets recorded
+
+A browser agent on a live site is the least repeatable workload PACE Agent runs — the same task
+can be answered in three clicks or fifteen, on pages that change between runs. By default
+the first live run is the one recorded, so the benchmark inherits whatever that run
+happened to do.
+
+`characterize_runs` samples the paths first and records a representative one:
+
+```bash
+pace-agent profile pace_agent.examples.webvoyager \
+  --config packages/pace_agent/configs/pace_agent_wv_characterize.json \
+  --characterize-runs 10 --out pace_agent_results/wv/
+```
+
+This is the expensive knob on this workload: `characterize_runs x tasks` live browser
+sessions, each hitting a real site. The 90-task GAIA suite at `--characterize-runs 10` is
+900 sessions. Start with a handful of tasks and `--characterize-runs 5` to see how stable they
+are before spending a suite's worth. Full details in step 1 of
+[deterministic-replay.md](deterministic-replay.md#step-1-profile-with-characterization).
+
 ## Configuration
 
 ```json

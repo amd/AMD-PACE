@@ -37,6 +37,8 @@ Unlike the models before LLMs gained popularity, which was mostly focused on mod
 | QWEN2/2.5     | ✅        | ❌                  | ❌                  |
 | QWEN3         | ✅        | ❌                  | ❌                  |
 | QWEN3 MoE     | ✅        | ❌                  | ❌                  |
+| QWEN3.5       | ✅        | ❌                  | ❌                  |
+| QWEN3.5 MoE   | ✅        | ❌                  | ❌                  |
 | Gemma 3       | ✅        | ❌                  | ❌                  |
 | Gemma 4 (text)| ✅        | ❌                  | ❌                  |
 | GptOss        | ✅        | ❌                  | ❌                  |
@@ -80,26 +82,26 @@ For a more detailed example, please refer to the example given in `examples/pace
 These are the components of the infrastructure and they are all under `pace/llm`:
 
 ### LLMModel
-The `LLMModel` class is what is exposed to the user and what the user should use to run inference on any model. The `LLMModel` class accepts a model id (from HF) or path to a model locally. `LLMModel` class is like a frontend to the `Generator` class, on calling `generate` method, it internally calls the `Generator` class to run inference on the model.
+`LLMModel` is the user-facing inference class. It owns a `GenerationBackend` and delegates generation to that backend.
 
 `LLMModel` methods:
 1. Constructor: Accepts the path to the model path (mandatory), a tokenizer path, and the data type for the model.
 2. `generate`: Accepts the input and runs inference on the model. The `generate` method accepts the input, and the sampling criteria.
 
-### Generator
-The `Generator` class is responsible for generating the output from the model. The `Generator` class is model independent and can be used to run inference on any model.
+### GenerationBackend
+`GenerationBackend` defines the shared request lifecycle used by offline generation and the inference server. It has two implementations:
+1. `NativeGenerationBackend`, the PACE implementation and the default.
+2. [STeP](STeP.md), which splits each FFN between a GPU and the CPU, selected with `generation_backend_config=StepGenerationBackendConfig(...)`.
 
-The `Generator` class is responsible for:
+The backend is responsible for:
 1. Loading the model, loading the correct weights and configurations for the model (through [`model_utils`](#model_utils))
 2. Loading and managing the tokenizer.
 3. Preprocessing the input, managing the sampling, and the stopping criteria.
 4. Running inference on the model in an auto-regressive manner.
-5. Managing KV cache for the model with the help of `KVCacheManager` (from `pace.llm.attention`).
+5. Managing request-local KV cache and speculative state.
+6. Packing offline and server SLAB_POOL/PAGED batches through the same batch builder.
 
-`Generator` methods:
-1. Constructor: Accepts the model path, tokenizer path, and the data type for the model.
-2. `prepare_for_generate`: Accepts the input and the sampling criteria and prepares the input, the mask and the sampler and the stopping criteria for the model.
-3. `generate`: Accepts the input and runs inference on the model. The `generate` method accepts the input, and runs a while loop to generate the output. The loop passes the input through the model, the sampler and finally breaks when the stopping criteria is met.
+The standard lifecycle methods are `create_request`, `prefill`, `decode`, `mixed`, `release`, and `generate`.
 
 ### Sampler
 `Sampler` class is responsible for sampling the next token from the model. The `Sampler` class is model independent and can be used to run inference on any model. The `Sampler` takes in the logits from the model and samples the next token based on the sampling criteria. The Sampling criteria is provided by [`SamplingConfig`](#samplingconfig).
@@ -230,6 +232,8 @@ PACE supports multiple KV cache types, defined in `KVCacheType` (`pace/llm/atten
 | `BMC` | Block-Major Contiguous cache. Splits the cache into blocks controlled by `PACE_BMC_NUM_SPLITS`. Better memory utilization for longer sequences. | JIT, NATIVE |
 | `SLAB_POOL` | Pool-based slab allocator for production serving. Pre-allocates a fixed memory pool with configurable block sizes. See [SlabAttention.md](SlabAttention.md) for details. | SLAB |
 | `PAGED` | Paged attention with block-level memory management. Pool size controlled by `PACE_MAX_CACHE_TOKENS` (default 262144). | PAGED |
+
+For StreamingLLM / EQUIP eviction, see [EQUIP.md](EQUIP.md).
 
 `SLAB_POOL` and `PAGED` enable automatic prefix-cache reuse by default. Only
 complete cache blocks are reused; set `PACE_PREFIX_CACHE=0` to disable the

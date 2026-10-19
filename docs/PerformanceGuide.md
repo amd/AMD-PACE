@@ -81,15 +81,16 @@ PACE employs a modular operator framework that separates an operator's interface
 ### How to Use AMD PACE Operators
 PACE operators can be selected through `OperatorConfig` when constructing
 `LLMModel`. Offline defaults are QKV/output/MLP/LM-head → `TPP`, norm → `JIT`,
-RoPE → `NATIVE`, and attention → the backend required by the selected KV cache.
-The server has separate defaults documented in
+RoPE and Gated DeltaNet → `NATIVE`, and attention → the backend required by the
+selected KV cache. The server has separate defaults documented in
 [InferenceServer.md](InferenceServer.md#operator-backend-configuration).
 
-The Python API exposes seven LLM operator types:
+The Python API exposes eight LLM operator types:
 * `Norm`: Normalization operator
 * `QKVProjection`: Query-Key-Value projection operator
 * `RoPE`: Rotary position embedding
 * `Attention`: Attention mechanism operator
+* `GatedDeltaNet`: Gated DeltaNet linear-attention primitives (Qwen3.5)
 * `OutProjection`: Output projection operator
 * `MLP`: Multi-Layer Perceptron operator
 * `LMHead`: Language Model Head operator

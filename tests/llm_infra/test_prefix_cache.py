@@ -340,45 +340,56 @@ class TestPrefixCacheMixinProtocol(unittest.TestCase):
     def test_disabled_returns_no_match(self):
         backend = self._MockBackend(block_size=4, enable=False)
         self.assertFalse(backend.prefix_cache_enabled)
-        blocks, matched = backend.try_prefix_match([1, 2, 3, 4])
+        hashes = compute_block_hashes([1, 2, 3, 4], 4)
+        blocks, matched = backend.try_prefix_match(hashes, 4)
         self.assertEqual(blocks, [])
         self.assertEqual(matched, 0)
 
     def test_full_lifecycle(self):
         backend = self._MockBackend(block_size=4, enable=True)
         tokens = list(range(100, 108))
-        backend.insert_prefix(self._MockContext(block_indices=[10, 20]), tokens)
+        hashes = compute_block_hashes(tokens, 4)
+        backend.insert_prefix(self._MockContext(block_indices=[10, 20]), hashes)
 
-        blocks, matched = backend.try_prefix_match(tokens + [999, 998, 997, 996])
+        query = tokens + [999, 998, 997, 996]
+        blocks, matched = backend.try_prefix_match(
+            compute_block_hashes(query, 4), len(query)
+        )
         self.assertEqual(blocks, [10, 20])
         self.assertEqual(matched, 8)
 
         ctx2 = self._MockContext()
-        backend.claim_prefix_blocks(ctx2, tokens, blocks, matched)
+        backend.claim_prefix_blocks(ctx2, hashes, blocks, matched)
         self.assertEqual(ctx2.prefix_matched_tokens, 8)
         backend._release_prefix_refs(ctx2)
 
     def test_dedup_frees_duplicate_blocks(self):
         backend = self._MockBackend(block_size=4, enable=True)
         tokens = list(range(100, 108))
-        backend.insert_prefix(self._MockContext(block_indices=[10, 20]), tokens)
-        backend.insert_prefix(self._MockContext(block_indices=[30, 40]), tokens)
+        hashes = compute_block_hashes(tokens, 4)
+        backend.insert_prefix(self._MockContext(block_indices=[10, 20]), hashes)
+        backend.insert_prefix(self._MockContext(block_indices=[30, 40]), hashes)
         self.assertEqual(backend.freed_duplicates, [30, 40])
 
     def test_chained_hash_prevents_false_match(self):
         backend = self._MockBackend(block_size=4, enable=True)
+        tokens = [1, 2, 3, 4, 10, 20, 30, 40]
         backend.insert_prefix(
-            self._MockContext(block_indices=[0, 1]), [1, 2, 3, 4, 10, 20, 30, 40]
+            self._MockContext(block_indices=[0, 1]),
+            compute_block_hashes(tokens, 4),
         )
-        _, matched = backend.try_prefix_match([5, 6, 7, 8, 10, 20, 30, 40])
+        query = [5, 6, 7, 8, 10, 20, 30, 40]
+        _, matched = backend.try_prefix_match(
+            compute_block_hashes(query, 4), len(query)
+        )
         self.assertEqual(matched, 0)
 
     def test_insert_records_and_release_frees_all_refs(self):
         backend = self._MockBackend(block_size=4, enable=True)
         tokens = list(range(100, 108))
         ctx = self._MockContext(block_indices=[10, 20])
-        backend.insert_prefix(ctx, tokens)
         hashes = compute_block_hashes(tokens, 4)
+        backend.insert_prefix(ctx, hashes)
         self.assertEqual(ctx.prefix_held_hashes, hashes)
         self.assertTrue(all(backend._prefix_map._map[h].ref_count == 1 for h in hashes))
         backend._release_prefix_refs(ctx)
@@ -393,9 +404,10 @@ class TestPrefixCacheMixinProtocol(unittest.TestCase):
             lambda ctx, pos, old, canon: ctx.block_indices.__setitem__(pos, canon)
         )
         tokens = list(range(100, 108))
-        backend.insert_prefix(self._MockContext(block_indices=[10, 20]), tokens)
+        hashes = compute_block_hashes(tokens, 4)
+        backend.insert_prefix(self._MockContext(block_indices=[10, 20]), hashes)
         ctx = self._MockContext(block_indices=[30, 40])
-        backend.insert_prefix(ctx, tokens)
+        backend.insert_prefix(ctx, hashes)
         self.assertEqual(backend.freed_duplicates, [30, 40])
         self.assertEqual(ctx.block_indices, [10, 20])
 
@@ -403,10 +415,10 @@ class TestPrefixCacheMixinProtocol(unittest.TestCase):
         backend = self._MockBackend(block_size=4, enable=True)
         tokens = list(range(100, 108))
         ctx = self._MockContext(block_indices=[10, 20])
-        backend.insert_prefix(ctx, tokens)
-        backend.insert_prefix(ctx, tokens)
-        self.assertEqual(backend.freed_duplicates, [])
         hashes = compute_block_hashes(tokens, 4)
+        backend.insert_prefix(ctx, hashes)
+        backend.insert_prefix(ctx, hashes)
+        self.assertEqual(backend.freed_duplicates, [])
         self.assertTrue(all(backend._prefix_map._map[h].ref_count == 1 for h in hashes))
 
 
@@ -453,6 +465,28 @@ class TestPrefixCacheConfigInit(unittest.TestCase):
         mixin = self._make_mixin()
         resolved = mixin._init_prefix_cache_from_config(self._FakeConfig(), "Test")
         self.assertEqual(resolved, 16)
+
+    def test_full_attention_keeps_prefix_cache_when_enabled(self):
+        mixin = self._make_mixin()
+        mixin._init_prefix_cache_from_config(
+            self._FakeConfig(), "Test", enable_prefix_cache=True
+        )
+        self.assertTrue(mixin.prefix_cache_enabled)
+
+    class _GdnConfig(_FakeConfig):
+        layer_types = ["full_attention", "linear_attention"]
+
+    def test_gdn_models_force_disable_prefix_cache(self):
+        mixin = self._make_mixin()
+        mixin._init_prefix_cache_from_config(self._GdnConfig(), "Test")
+        self.assertFalse(mixin.prefix_cache_enabled)
+
+    def test_gdn_disable_overrides_explicit_enable(self):
+        mixin = self._make_mixin()
+        mixin._init_prefix_cache_from_config(
+            self._GdnConfig(), "Test", enable_prefix_cache=True
+        )
+        self.assertFalse(mixin.prefix_cache_enabled)
 
 
 class TestHashAlgorithmSelection(unittest.TestCase):
@@ -529,11 +563,12 @@ class TestSlabReuseInsertSafety(unittest.TestCase):
         tokens = list(range(100, 108))  # two full blocks of size 4
         cache._manager._blocks_by_token["A"] = [10, 20]
         cache._manager._blocks_by_token["B"] = [30, 40]
+        hashes = compute_block_hashes(tokens, 4)
 
-        cache.insert_prefix(self._Ctx("A"), tokens)
+        cache.insert_prefix(self._Ctx("A"), hashes)
         # Second identical request: blocks 30/40 dedup to canonical 10/20. B is
         # repointed onto 10/20, and its duplicates 30/40 are released.
-        cache.insert_prefix(self._Ctx("B"), tokens)
+        cache.insert_prefix(self._Ctx("B"), hashes)
         self.assertEqual(cache._manager.reassigns, [("B", 0, 10), ("B", 1, 20)])
         self.assertEqual(cache._manager.released, [30, 40])
         self.assertEqual(cache._manager._blocks_by_token["B"], [10, 20])
@@ -543,8 +578,9 @@ class TestSlabReuseInsertSafety(unittest.TestCase):
         # 3 full blocks: first 2 reused (matched_tokens=8), 3rd is new suffix.
         tokens = list(range(200, 212))
         cache._manager._blocks_by_token["S"] = [11, 22, 33]
+        hashes = compute_block_hashes(tokens, 4)
 
-        inserted = cache.insert_prefix(self._Ctx("S", matched_tokens=8), tokens)
+        inserted = cache.insert_prefix(self._Ctx("S", matched_tokens=8), hashes)
 
         # Only the suffix block (index 33) is retained and inserted.
         self.assertEqual(cache._manager.retained, [33])
@@ -552,7 +588,7 @@ class TestSlabReuseInsertSafety(unittest.TestCase):
         self.assertEqual(cache._manager.released, [])
         # The reused prefix region was not registered as a standalone entry:
         # a fresh lookup breaks on the (unregistered) first prefix block.
-        _, matched_tokens = cache.try_prefix_match(tokens)
+        _, matched_tokens = cache.try_prefix_match(hashes, len(tokens))
         self.assertEqual(matched_tokens, 0)
 
     def test_free_duplicate_block_releases(self):

@@ -20,13 +20,13 @@ The PACE vLLM plugin brings PACE's CPU optimizations to vLLM with no application
 
 - Linux x86_64 with AVX512F + AVX512_BF16 (AMD Zen4 / EPYC 5th Gen or newer)
 - Python 3.10 – 3.14
-- vLLM 0.25.x – 0.28.0 (CPU build)
+- vLLM 0.28.x – 0.30.0 (CPU build)
 
 ## Install
 
 ```bash
 # 1. vLLM CPU build (pace-vllm is a plugin; it no-ops without vllm).
-pip install https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cpu
+pip install https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0+cpu-cp38-abi3-manylinux_2_39_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cpu
 
 # 2. pace-vllm
 pip install pace-vllm

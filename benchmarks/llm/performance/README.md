@@ -35,10 +35,7 @@ The benchmarking process is configured using a JSON file. Below is an example co
             "MLP": "TPP",
             "LMHead": "TPP"
         },
-        "spec_config": {
-            "model_name": "amd/PARD-Llama-3.2-1B",
-            "num_speculated_tokens": 12
-        }
+        "spec_config": null
     },
     "use_real_data": true,
     "generation_args": {
@@ -61,6 +58,24 @@ The benchmarking process is configured using a JSON file. Below is an example co
 }
 ```
 
+For speculative decoding, provide `spec_config`, set `batch_size` to 1, and
+omit `input_tokens`. GSM8K inputs retain their natural token lengths:
+
+```json
+{
+    "model_args": {
+        "spec_config": {
+            "model_name": "amd/PARD-Llama-3.2-1B",
+            "num_speculated_tokens": 12
+        }
+    },
+    "generation_args": {
+        "output_tokens": 128,
+        "batch_size": 1
+    }
+}
+```
+
 #### Configuration Parameters
 
 - `frameworks`: List of frameworks to benchmark (e.g., `"pace"`, `"hf"`, `"vllm"`, `"vllm_zentorch"`, `"zentorch"`).
@@ -70,7 +85,9 @@ The benchmarking process is configured using a JSON file. Below is an example co
     - `llm_operators`: Dictionary specifying operator implementations (e.g., `"Norm": "NATIVE"`).
 - `use_real_data`: Boolean indicating whether to use real data from a dataset.
 - `generation_args`: Dictionary of generation parameters, including:
-    - `input_tokens`: Number of input tokens.
+    - `input_tokens`: Fixed input length for non-speculative benchmarks.
+      Shorter inputs are padded and longer inputs are truncated. This field is
+      omitted or set to `null` when `spec_config` is provided.
     - `output_tokens`: Number of output tokens.
     - `batch_size`: Batch size for benchmarking.
     - `kv_cache_type`: Type of key-value cache (e.g., `"BMC"`).
@@ -111,7 +128,12 @@ The `BenchMarkDataGenerator` class is used to generate input data for benchmarki
 
 If using real data, it loads and tokenizes the dataset using the provided tokenizer, and is saved in memory according to the batch size and input tokens. If using random data, it picks random tokens based on the input tokens and batch size from the tokenizer and the same data will be reused across runs. Once the data is generated, it can be accessed using the `next` method, and it will infinitely loop through the data, giving a random batch of input data each time.
 
-NOTE: The data generator cannot be used for evaluation purposes, as it does not guarantee the same data across runs and is not representative of the dataset.
+Speculative benchmarks always use the pinned GSM8K test split in deterministic
+order with batch size 1. Inputs keep their natural token length without padding
+or truncation.
+
+NOTE: Random-selection mode is not suitable for evaluation. Deterministic mode
+guarantees input ordering but does not calculate dataset accuracy.
 
 #### Example Usage
 

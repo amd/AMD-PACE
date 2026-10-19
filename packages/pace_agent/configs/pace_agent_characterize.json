@@ -1,0 +1,7 @@
+{
+    "characterize_runs": 20,
+    "characterize": { "strategy": "auto", "granularity": "action", "min_success": 3, "keep_trajectories": false },
+    "llm_backend": { "type": "openai", "base_url": "ADD YOUR LLM ENDPOINT HERE (e.g. http://localhost:8000/v1)", "model": "openai/gpt-oss-20b", "temperature": 0.0, "seed": 0, "max_tokens": 1024, "api_key_env": "ADD YOUR API-KEY ENV VAR HERE (if the endpoint needs auth)" },
+    "num_runs": 10,
+    "warmup_runs": 1
+}

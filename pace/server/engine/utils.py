@@ -3,12 +3,23 @@
 # All rights reserved.
 # ******************************************************************************
 
-from pydantic import BaseModel, ConfigDict, Field, conlist, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    conlist,
+    field_validator,
+    model_validator,
+)
 from typing import List, Union, Optional
 from typing import Dict, Any
 
 from uuid import UUID
-import torch
+
+from pace.llm.generation.config import (
+    GenerationBackendConfig,
+    resolve_generation_backend_config,
+)
 
 
 class PrefillItem(BaseModel):
@@ -74,50 +85,25 @@ class ModelConfig(BaseModel):
 
     modelId: str
     dataType: str = "bf16"
-    kvCacheType: str = "SLAB_POOL"
+    kvCacheType: Optional[str] = None
     norm_backend: str = "NATIVE"
     qkv_projection_backend: str = "TPP"
     attention_backend: str = "SLAB"
+    gated_deltanet_backend: str = "NATIVE"
     out_projection_backend: str = "TPP"
     mlp_backend: str = "TPP"
     lm_head_backend: str = "NATIVE"
     spec_config: Optional[Dict[str, Any]] = None
     kv_cache_memory_gb: Optional[float] = None
+    generation_backend_config: Optional[GenerationBackendConfig] = None
+
+    @field_validator("generation_backend_config", mode="before")
+    @classmethod
+    def _resolve_generation_backend_config(cls, value):
+        if value is None:
+            return None
+        return resolve_generation_backend_config(value)
 
 
 class ServerConfig(BaseModel):
     modelConfig: ModelConfig
-
-
-class TorchDtypeResolver:
-    """
-    Utility class to resolve string representations of data types to corresponding
-    PyTorch dtype objects.
-
-    This class provides a mapping from common string names (such as "bf16", "fp16", "float32")
-    to their respective `torch.dtype` objects. It is useful for converting user or configuration
-    input into the correct PyTorch dtype for model initialization or tensor operations.
-
-    Usage:
-        dtype = TorchDtypeResolver.resolve("bf16")  # returns torch.bfloat16
-
-    Raises:
-        ValueError: If the provided string does not correspond to a supported dtype.
-    """
-
-    _dtype_map = {
-        "bf16": torch.bfloat16,
-        "bfloat16": torch.bfloat16,
-        "fp16": torch.float16,
-        "float16": torch.float16,
-        "fp32": torch.float32,
-        "float32": torch.float32,
-        "float": torch.float32,
-    }
-
-    @classmethod
-    def resolve(cls, dtype_str: str):
-        key = dtype_str.lower()
-        if key not in cls._dtype_map:
-            raise ValueError(f"Unsupported dtype string: {dtype_str}")
-        return cls._dtype_map[key]

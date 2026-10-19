@@ -204,6 +204,24 @@ class Gemma3RMSNorm(RMSNorm):
         )
 
 
+class RMSNormGated(RMSNorm):
+    """RMSNorm followed by a SiLU gate: ``(weight * rmsnorm(x)) * silu(gate)``.
+
+    Used for the Gated DeltaNet output norm (Qwen3.5). ``gate`` is required;
+    an ungated norm is plain :class:`RMSNorm`. ``weight`` is a standard
+    RMSNorm weight (ones init).
+    """
+
+    @property
+    def operator_type(self):
+        return OperatorType.RMSNORM_GATED
+
+    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        return self.backend.execute(
+            x, gate, self.normalized_shape, self.weight, self.eps
+        )
+
+
 class FusedLayerNormResidual(OperatorBase):
     """Fused residual add + LayerNorm: residual_out = x + residual,
     normed = layernorm(residual_out)"""

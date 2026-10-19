@@ -39,7 +39,7 @@ class TestRegister(unittest.TestCase):
         mock_load.assert_not_called()
 
     def test_prerelease_inside_range_is_supported(self) -> None:
-        with patch("vllm.__version__", "0.28.0rc1"):
+        with patch("vllm.__version__", "0.30.0rc1"):
             supported, _, _, _ = pace_vllm._check_vllm_version_supported()
         self.assertTrue(supported)
 

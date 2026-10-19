@@ -160,8 +160,17 @@ def profile(agent_path, cfg, out_dir):
         )
 
     ctx = CaptureContext()
+    characterization, keep_trajectories = None, False
     with watch(label=f"profile task {str((task or {}).get('query'))[:60]!r}"):
-        traj = Recorder().record(agent, llm, agent_path, task=task, ctx=ctx)
+        n_live = max(1, int(getattr(cfg, "characterize_runs", 1) or 1))
+        if n_live > 1:
+            # characterization: record a representative run rather than whichever went first
+            characterization, keep_trajectories = _characterize(
+                agent, llm, agent_path, task, cfg, n_live
+            )
+            traj, ctx = characterization.trajectory, characterization.context
+        else:
+            traj = Recorder().record(agent, llm, agent_path, task=task, ctx=ctx)
         _stamp_config_identity(traj, cfg)
         per_node = node_counter.timings_of(ctx.node_samples, ctx.node_order)
         player = Player()
@@ -222,6 +231,9 @@ def profile(agent_path, cfg, out_dir):
         "context_growth": _context_growth(llm),
         "stats": {"per_tool": per_tool},
     }
+    if characterization is not None:
+        # inline, so the result answers what the trajectory was chosen out of on its own
+        result["characterization"] = characterization.summary()
     if graded_key:
         result["scoring"] = {"gold_key": graded_key}
         result.update(score.score(result["answer"], gold))
@@ -235,6 +247,8 @@ def profile(agent_path, cfg, out_dir):
     )
 
     rd = RunDir(out_dir)
+    if characterization is not None:
+        characterization.save(out_dir, keep_trajectories=keep_trajectories)
     if replay_safe:
         traj.save(out_dir)
     elif isinstance(res, dict) and res.get("per_step"):
@@ -264,6 +278,16 @@ def profile(agent_path, cfg, out_dir):
     )
     # no auto-report: report.md is produced only by `pace-agent report <dir>`
     return out_dir
+
+
+def _characterize(agent, llm, agent_path, task, cfg, n_live):
+    """Choose which live run to record. Returns ``(characterization, keep_trajectories)``."""
+    from pace_agent.characterize import characterize
+    from pace_agent.characterize import options as characterize_options
+
+    opts = characterize_options.resolve(getattr(cfg, "characterize", None))
+    keep = opts.pop("keep_trajectories")
+    return characterize(agent, llm, agent_path, task=task, n=n_live, **opts), keep
 
 
 def _stamp_config_identity(traj, cfg):

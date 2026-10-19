@@ -12,11 +12,12 @@ import pace  # noqa: F401
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from torch.testing._internal.common_utils import TestCase
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BatchEncoding
 from pace.utils.logging import suppress_logging_cls
 from pace.llm import KVCacheType
 
 from data import BenchMarkDataGenerator
+from arguments import verify_input_config
 from datastructs import (
     ModelArgs,
     GenerationArgs,
@@ -81,6 +82,52 @@ class TestBenchMarkDataGenerator(TestCase):
         self.assertEqual(data["input_ids"].shape, (batch_size, input_tokens))
         self.assertEqual(data["attention_mask"].shape, (batch_size, input_tokens))
 
+    def test_deterministic_send_uses_each_batch_in_order(self):
+        data_generator = BenchMarkDataGenerator.__new__(BenchMarkDataGenerator)
+        data_generator.deterministic = True
+        data_generator.next_data_index = 0
+        data_generator.data_in_memory = ["first", "second", "third"]
+
+        self.assertEqual(data_generator.send(None), "first")
+        self.assertEqual(data_generator.send(None), "second")
+        self.assertEqual(data_generator.send(None), "third")
+        with self.assertRaisesRegex(
+            AssertionError, "No deterministic data batches remain."
+        ):
+            data_generator.send(None)
+
+    def test_unpadded_real_data_keeps_natural_length(self):
+        class FakeDataset:
+            def batch(self, batch_size, drop_last_batch):
+                return [{"question": ["short question"]}]
+
+        tokenizer = mock.Mock()
+        tokenizer.chat_template = None
+        tokenizer.return_value = BatchEncoding(
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            }
+        )
+        with mock.patch("datasets.load_dataset", return_value=FakeDataset()):
+            data_generator = BenchMarkDataGenerator(
+                tokenizer=tokenizer,
+                input_tokens=None,
+                batch_size=1,
+                max_iter=1,
+                use_real_data=True,
+                deterministic=True,
+            )
+
+        data = data_generator.send(None)
+        self.assertEqual(data["input_ids"].shape, (1, 3))
+        tokenizer.assert_called_once_with(
+            ["short question"],
+            padding=False,
+            truncation=False,
+            return_tensors="pt",
+        )
+
     @settings(max_examples=5, deadline=None)
     @given(
         input_tokens=st.integers(min_value=1, max_value=1920),
@@ -129,6 +176,37 @@ class TestBenchMarkDataGenerator(TestCase):
             use_real_data=use_real_data,
         )
         self.assertTrue(len(data_generator.data_in_memory) > 0)
+
+
+class TestBenchmarkArguments(TestCase):
+
+    def test_input_config_rejects_fixed_spec_input_length(self):
+        spec_config = {
+            "model_name": "amd/PARD-Qwen2.5-0.5B",
+            "num_speculated_tokens": 12,
+        }
+        with self.assertRaisesRegex(
+            AssertionError,
+            "input_tokens must be omitted or null when spec_config is provided",
+        ):
+            verify_input_config(
+                spec_config,
+                {"input_tokens": 128, "batch_size": 1},
+            )
+        verify_input_config(
+            spec_config,
+            {"input_tokens": None, "batch_size": 1},
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "input_tokens must be a positive integer",
+        ):
+            verify_input_config(None, {"input_tokens": None, "batch_size": 1})
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Speculative decoding benchmarks require batch_size=1",
+        ):
+            verify_input_config(spec_config, {"batch_size": 2})
 
 
 @suppress_logging_cls()

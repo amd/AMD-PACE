@@ -20,6 +20,58 @@ class ModelOutput:
 
 
 @dataclass
+class EmbeddingOutput:
+    """Output of an encoder embedding model.
+
+    Args:
+        embeddings: Pooled sentence embeddings, shape [batch_size, hidden_size]
+            (optionally L2-normalized).
+        last_hidden_state: Per-token encoder hidden states,
+            shape [batch_size, seq_len, hidden_size]. Retained so callers can
+            apply a custom pooling strategy.
+    """
+
+    embeddings: torch.Tensor
+    last_hidden_state: Optional[torch.Tensor] = None
+
+
+@dataclass
+class ClassifierOutput:
+    """Output of an encoder sequence-classification model.
+
+    Args:
+        logits: Class logits, shape [batch_size, num_labels].
+        probabilities: Optional softmax (multi-class) / sigmoid (multi-label)
+            probabilities, same shape as logits.
+        predicted_class_ids: Optional argmax class id per sequence,
+            shape [batch_size].
+    """
+
+    logits: torch.Tensor
+    probabilities: Optional[torch.Tensor] = None
+    predicted_class_ids: Optional[torch.Tensor] = None
+
+
+@dataclass
+class TokenClassifierOutput:
+    """Output of an encoder token-classification model (NER / PII).
+
+    Unlike :class:`ClassifierOutput` (one label per sequence), this carries a
+    label distribution for *every token* in the sequence.
+
+    Args:
+        logits: Per-token class logits, shape [batch_size, seq_len, num_labels].
+        probabilities: Optional softmax probabilities, same shape as logits.
+        predicted_class_ids: Optional argmax class id per token,
+            shape [batch_size, seq_len].
+    """
+
+    logits: torch.Tensor
+    probabilities: Optional[torch.Tensor] = None
+    predicted_class_ids: Optional[torch.Tensor] = None
+
+
+@dataclass
 class SamplerOutput:
     """
     Output of the sampler. Contains the sampled tokens, and

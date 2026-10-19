@@ -19,7 +19,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from pace.llm.attention.base import KVCacheType, KVCacheManager
+from pace.llm.attention.base import (
+    KVCacheType,
+    KVCacheManager,
+)
 from pace.llm.attention.paged.cache import PagedKVCache, compute_slot_mapping
 from pace.llm.attention.paged.ops import (
     PagedAttentionMetadata,
@@ -184,6 +187,13 @@ def create_paged_kv_cache_manager(
     manager.cache_objects = cache_objects
     manager._blocks_per_seq = blocks_per_seq
     manager._batch_size = batch_size
+
+    from pace.llm.attention.recurrent_state import (
+        RecurrentStateStore,
+        num_recurrent_layers,
+    )
+
+    manager.recurrent_state = RecurrentStateStore(num_recurrent_layers(model_config))
     return manager
 
 

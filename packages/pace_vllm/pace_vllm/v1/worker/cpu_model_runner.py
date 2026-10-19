@@ -6,16 +6,16 @@
 
 """PaceModelRunner: vLLM v1 CPU model runner subclass.
 
-Owns the slab-backed KV state. `_allocate_kv_cache_tensors` ships zero-sized
-placeholders for attention layers (real K/V lives in `SlabPool`) while vLLM
-allocates and reshapes Mamba / linear-attention state through its native path;
-`initialize_kv_cache` builds the `PaceKVCache` and populates the attention
-backend's layer registry; `_update_states` fans out request lifecycle events
-(create / remove / reset on preempt) to the slab.
+Owns the slab-backed KV state. vLLM receives zero-sized placeholders for
+attention layers (real K/V lives in `SlabPool`) while it allocates native
+Mamba / linear-attention state. `initialize_kv_cache` builds the `PaceKVCache`
+and populates the attention backend's layer registry; `_update_states` fans
+out request lifecycle events (create / remove / reset on preempt) to the slab.
 """
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -71,8 +71,20 @@ class PaceModelRunner(CPUModelRunner):
         """
         return
 
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        super().initialize_kv_cache(kv_cache_config)
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        if kv_cache_allocation_context is None:
+            super().initialize_kv_cache(kv_cache_config, is_profiling)
+        else:
+            super().initialize_kv_cache(
+                kv_cache_config,
+                is_profiling,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+            )
 
         self.pace_kv_cache = PaceKVCache.from_kv_cache_config(
             kv_cache_config,
@@ -123,9 +135,8 @@ class PaceModelRunner(CPUModelRunner):
             connector.register_kv_cache(self.pace_kv_cache)
             self._pace_connector = connector
 
-    def _allocate_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig
-    ) -> dict[str, torch.Tensor]:
+    @staticmethod
+    def _attention_layer_names(kv_cache_config: KVCacheConfig) -> set[str]:
         from vllm.v1.kv_cache_interface import (
             AttentionSpec,
             UniformTypeKVCacheSpecs,
@@ -135,9 +146,25 @@ class PaceModelRunner(CPUModelRunner):
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
-                spec = next(iter(spec.kv_cache_specs.values()), None)
-            if isinstance(spec, AttentionSpec):
+                layer_specs = tuple(spec.kv_cache_specs.values())
+                if layer_specs and all(
+                    isinstance(layer_spec, AttentionSpec) for layer_spec in layer_specs
+                ):
+                    attention_layers.update(group.layer_names)
+                else:
+                    attention_layers.update(
+                        name
+                        for name, layer_spec in spec.kv_cache_specs.items()
+                        if isinstance(layer_spec, AttentionSpec)
+                    )
+            elif isinstance(spec, AttentionSpec):
                 attention_layers.update(group.layer_names)
+        return attention_layers
+
+    def _allocate_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor]:
+        attention_layers = self._attention_layer_names(kv_cache_config)
 
         raw_tensors: dict[str, torch.Tensor] = {}
         packed_backing: torch.Tensor | None = None
@@ -171,6 +198,54 @@ class PaceModelRunner(CPUModelRunner):
                     raw_tensors[layer_name] = tensor
 
         return raw_tensors
+
+    def initialize_kv_cache_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if hasattr(CPUModelRunner, "_allocate_kv_cache_tensors"):
+            return super().initialize_kv_cache_tensors(
+                kv_cache_config, kernel_block_sizes
+            )
+
+        from vllm.v1.worker.utils import allocate_kv_cache, bind_kv_cache
+
+        attention_layers = self._attention_layer_names(kv_cache_config)
+        all_layers = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+        }
+        kv_caches: dict[str, torch.Tensor] = {}
+        if all_layers - attention_layers:
+            allocation_context = kv_cache_allocation_context or nullcontext()
+            with allocation_context:
+                kv_caches = allocate_kv_cache(
+                    kv_cache_config,
+                    self.device,
+                    self.cache_config.get_resolved_kv_cache_layout(),
+                    kernel_block_sizes,
+                )
+
+        for layer_name in attention_layers:
+            kv_caches[layer_name] = torch.empty(0, dtype=torch.int8, device=self.device)
+
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
+            kv_caches[layer_name] = kv_caches[target_layer_name]
+
+        num_attn_module = (
+            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
+        )
+        bind_kv_cache(
+            kv_caches,
+            self.compilation_config.static_forward_context,
+            self.kv_caches,
+            num_attn_module,
+            kv_cache_groups=kv_cache_config.kv_cache_groups,
+        )
+        return kv_caches
 
     def _update_states(self, scheduler_output: "SchedulerOutput"):
         if self.pace_kv_cache is not None:

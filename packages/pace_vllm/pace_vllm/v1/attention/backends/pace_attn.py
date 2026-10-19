@@ -83,6 +83,10 @@ class PaceAttentionBackend(AttentionBackend):
     def supports_sink(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return True
+
     @staticmethod
     def get_impl_cls() -> type["PaceAttentionImpl"]:
         return PaceAttentionImpl
@@ -275,8 +279,8 @@ class PaceAttentionImpl(AttentionImpl[PaceAttentionMetadata]):
         self,
         layer: AttentionLayer,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
         kv_cache: torch.Tensor,
         attn_metadata: PaceAttentionMetadata | None,
         output: torch.Tensor | None = None,
@@ -327,13 +331,16 @@ class PaceAttentionImpl(AttentionImpl[PaceAttentionMetadata]):
             )
 
         q = query.contiguous().view(-1, self.num_heads, self.head_size)
-        k = key.contiguous().view(-1, self.num_kv_heads, self.head_size)
-        v = value.contiguous().view(-1, self.num_kv_heads, self.head_size)
 
         seq_ids = attn_metadata.seq_ids
         query_lens = attn_metadata.query_lens
 
-        pool.cache_update(seq_ids, k, v, query_lens)
+        if key is not None and value is not None:
+            k = key.contiguous().view(-1, self.num_kv_heads, self.head_size)
+            v = value.contiguous().view(-1, self.num_kv_heads, self.head_size)
+            pool.cache_update(seq_ids, k, v, query_lens)
+        elif key is not None or value is not None:
+            raise RuntimeError("PaceAttentionImpl requires key and value together.")
 
         sinks_tensor = self.sinks if self.sinks is not None else self._SINKS_EMPTY
         attn_out = pool.attention(

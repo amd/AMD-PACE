@@ -4,12 +4,16 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 
+import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
+import types
 import unittest
 import urllib.parse
 import urllib.request
@@ -231,3 +235,122 @@ class TestLoop(unittest.TestCase):
         res = RunDir(out).read_result()
         self.assertGreater(res["attribution"]["model"], 0)
         self.assertIn("e2e", res)
+
+
+class CountingLLM(StubLLM):
+    """StubLLM that reports its call count the way the real client does."""
+
+    def metrics(self):
+        return {"llm_calls": len(self.calls)}
+
+
+def _sweep_agent(calls_per_run, fixed_path=False, fail_on=()):
+    """Live run i makes calls_per_run[i] model calls. With fixed_path every run reports the
+    same one step, so only the amount of work differs. Runs in fail_on raise."""
+    state = {"run": -1}
+
+    def run(llm, task=None):
+        state["run"] += 1
+        if state["run"] in fail_on:
+            raise RuntimeError("site timed out")
+        n = calls_per_run[min(state["run"], len(calls_per_run) - 1)]
+        for _ in range(n):
+            llm.complete([{"role": "user", "content": "observe"}])
+        actions = ["answer"] if fixed_path else ["scroll"] * (n - 1) + ["answer"]
+        return {
+            "answer": "ok",
+            "iterations": n,
+            "per_step": [{"step": i + 1, "action": a} for i, a in enumerate(actions)],
+        }
+
+    return types.SimpleNamespace(run=run, REPLAY_SAFE=False)
+
+
+class TestCharacterization(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def _profile(self, name, **cfg_kw):
+        from pace_agent.config import RunConfig
+        from pace_agent.profile.profiler import profile
+
+        # live run 0 is a runaway: 12 model calls against a typical 3
+        agent = _sweep_agent([12, 3, 3, 3, 3])
+        cfg = RunConfig(tasks=[{"query": "q"}], num_runs=1, warmup=0, **cfg_kw)
+        out = os.path.join(self.tmp, name)
+        with (
+            patch("pace_agent.profile.profiler.import_agent", return_value=agent),
+            patch("pace_agent.profile.profiler._llm", return_value=CountingLLM()),
+            redirect_stdout(StringIO()),
+        ):
+            profile("agent.py", cfg, out)
+        with open(os.path.join(out, "trace.json")) as f:
+            steps = json.load(f)["steps"]
+        return RunDir(out).read_result(), steps, out
+
+    def test_profile_records_a_representative_run_not_the_first(self):
+        res, steps, _ = self._profile("first")
+        self.assertEqual(len(steps), 12)
+        self.assertNotIn("characterization", res)
+
+        res, steps, out = self._profile("characterized", characterize_runs=5)
+        self.assertEqual(len(steps), 3)
+        self.assertEqual(res["characterization"]["selected_run"], 1)
+        # metrics describe the recorded run alone, not the whole sweep
+        self.assertEqual(res["run_metrics"]["llm_calls"], 3)
+        with open(render(out)) as f:
+            self.assertIn("\n## Path characterization\n", f.read())
+
+    def test_a_runaway_on_a_fixed_path_is_reported_not_hidden(self):
+        from pace_agent.characterize import characterize
+
+        # every run walks the same path, so only the work axis can expose the runaway
+        agent = _sweep_agent([1, 1, 12, 1, 1], fixed_path=True)
+        s = characterize(agent, CountingLLM(), n=5, verbose=False).summary()
+        self.assertTrue(s["path_is_uninformative"])
+        self.assertEqual(s["outlier_runs"], [2])
+        self.assertEqual(s["verdict"], "wide")
+
+    def test_failed_live_runs_are_skipped_and_the_rest_keep_their_numbers(self):
+        from pace_agent.characterize import characterize
+        from pace_agent.errors import CharacterizationFailed
+
+        ch = characterize(
+            _sweep_agent([3], fail_on={0}), CountingLLM(), n=4, verbose=False
+        )
+        self.assertEqual([f["run"] for f in ch.failures], [0])
+        # run 0 never produced a trajectory, so the first one that did is run 1
+        self.assertEqual(ch.summary()["selected_run"], 1)
+        with self.assertRaises(CharacterizationFailed) as cm:
+            characterize(
+                _sweep_agent([3], fail_on={0, 1}), CountingLLM(), n=2, verbose=False
+            )
+        self.assertEqual(cm.exception.exit_code, 9)
+
+    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "the watchdog needs SIGALRM")
+    def test_a_stalled_live_run_fails_alone_and_the_watchdog_stays_armed(self):
+        from pace_agent.characterize import characterize
+        from pace_agent.watchdog import watch
+
+        state = {"run": -1}
+
+        def run(llm, task=None):
+            state["run"] += 1
+            if state["run"] < 2:
+                time.sleep(3)  # wedged: no progress for longer than the limit
+            return {"answer": "ok", "per_step": [{"action": "answer"}]}
+
+        agent = types.SimpleNamespace(run=run, REPLAY_SAFE=False)
+        # profile wraps characterization in a watch; the second stall must be caught too
+        with (
+            patch.dict(os.environ, {"PACE_AGENT_MAX_TIMEOUT": "0.5"}),
+            watch(label="profile task"),
+        ):
+            ch = characterize(agent, CountingLLM(), n=3, verbose=False)
+            armed = signal.getitimer(signal.ITIMER_REAL)[0] > 0
+        stalled = [
+            f["run"] for f in ch.failures if f["error"].startswith("TaskStalled")
+        ]
+        self.assertEqual(stalled, [0, 1])
+        self.assertTrue(armed)

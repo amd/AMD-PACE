@@ -11,6 +11,7 @@ import shutil
 import statistics
 import sys
 import time
+from collections import Counter
 
 from pace_agent import score
 from pace_agent.bench.tools import DEFAULT_TOOLS, bench_tools
@@ -118,6 +119,21 @@ def _out_dir(args, workload):
     return os.path.join("pace_agent_results", f"{ts}_{workload}")
 
 
+def _apply_characterize_overrides(cfg, args):
+    """CLI flags win over the config's characterize block, like --query wins over its tasks."""
+    if getattr(args, "characterize_runs", None) is not None:
+        cfg.characterize_runs = args.characterize_runs
+    if getattr(args, "characterize_strategy", None):
+        cfg.characterize = {
+            **(cfg.characterize or {}),
+            "strategy": args.characterize_strategy,
+        }
+    from pace_agent.characterize import options
+
+    options.resolve(cfg.characterize)  # a bad override must fail before any live run
+    return cfg
+
+
 def cmd_profile(args):
     if not args.agent:
         print("error: agent is required unless --list is used")
@@ -134,6 +150,7 @@ def cmd_profile(args):
     cfg = load_config(args.config)
     if args.query:
         cfg.tasks = [{"query": q} for q in args.query]
+    _apply_characterize_overrides(cfg, args)
     load_plugins(cfg.plugins)
     apply_pinning(cfg.pinning)
     agent_path = _resolve_agent(args.agent)
@@ -278,6 +295,9 @@ def _profile_multi(agent_path, cfg, tasks, out):
             for n in sorted({n for r in per for n in (r.get("per_node") or {})})
         },
     }
+    char = _characterization_rollup(per)
+    if char:
+        agg["characterization"] = char
     if gold_key:
         agg.update(score.aggregate(per))
         agg["scoring"] = {"gold_key": gold_key}
@@ -341,6 +361,32 @@ def _profile_multi(agent_path, cfg, tasks, out):
         )
         return 1
     return 0
+
+
+def _characterization_rollup(per):
+    """Characterization across a suite, including how many tasks still had to record an
+    outlier because no better run was available."""
+    chars = [r["characterization"] for r in per if r.get("characterization")]
+    if not chars:
+        return None
+
+    def tally(key):
+        labels = [c[key] for c in chars if c.get(key) is not None]
+        return dict(sorted(Counter(labels).items()))
+
+    def median(key):
+        return round(statistics.median(c.get(key, 0) for c in chars), 4)
+
+    return {
+        "n_tasks": len(chars),
+        "live_runs_total": sum(c.get("n_runs", 0) for c in chars),
+        "modal_share_median": median("modal_share"),
+        "normalized_entropy_median": median("normalized_entropy"),
+        "stability": tally("stability"),
+        "work_stability": tally("work_stability"),
+        "verdict": tally("verdict"),
+        "n_recorded_outliers": sum(bool(c.get("selected_is_outlier")) for c in chars),
+    }
 
 
 def cmd_optimize(args):
@@ -483,6 +529,9 @@ def _print_bench(rows, tiers):
 
 
 def main(argv=None):
+    # local import: characterize reaches back into replay, which imports pace_agent.config
+    from pace_agent.characterize.select import STRATEGIES
+
     p = argparse.ArgumentParser(prog="pace-agent")
     p.add_argument("--llm", default=os.environ.get("PACE_AGENT_LLM_ENDPOINT"))
     sub = p.add_subparsers(dest="cmd")
@@ -500,6 +549,16 @@ def main(argv=None):
     pp.add_argument("--query", action="append")
     pp.add_argument("--config")
     pp.add_argument("--out")
+    # LIVE runs sampled before recording; distinct from num_runs, which replays.
+    pp.add_argument(
+        "--characterize-runs", dest="characterize_runs", type=int, default=None
+    )
+    pp.add_argument(
+        "--characterize-strategy",
+        dest="characterize_strategy",
+        choices=STRATEGIES,
+        default=None,
+    )
 
     popt = sub.add_parser("optimize")
     popt.add_argument("run_dir")

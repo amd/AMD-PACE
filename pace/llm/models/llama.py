@@ -26,7 +26,7 @@
 # The file contains the implemention of LLAMA models, as well as Phi3/4 models. Since they are the same,
 # the implementation is shared between the two models.
 
-from typing import List, Tuple, Iterable, Union, Callable
+from typing import List, Optional, Tuple, Iterable, Union, Callable
 
 import torch
 from torch import nn
@@ -35,6 +35,7 @@ from transformers import LlamaConfig, PhiConfig
 from pace.llm.outputs import ModelOutput
 from pace.llm.configs import OperatorConfig
 from pace.llm.attention import KVCacheBase, KVCacheManager
+from pace.llm.attention.eviction import cache_owns_rope
 from pace.llm.models.base_model import BaseModelForCausalLM
 from pace.llm.ops import (
     Linear,
@@ -107,7 +108,8 @@ class LlamaAttention(nn.Module):
         K = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         V = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
-        Q, K = position_embeddings(query=Q, key=K, unsqueeze_dim=2)
+        if not cache_owns_rope(kv_cache):
+            Q, K = position_embeddings(query=Q, key=K, unsqueeze_dim=2)
 
         attn_output = self.attn(Q, K, V, kv_cache, positions, **kwargs)
         attn_output = attn_output.reshape(bsz, q_len, -1)
@@ -218,7 +220,13 @@ class LlamaModel(nn.Module):
 
         is_kv_cache_list = isinstance(kv_cache, list)
 
-        position_embeddings: Callable = self.rotary_emb(hidden_states, positions)
+        # Cache-owned RoPE re-indexes into [0, budget); indexing the model's
+        # table with absolute positions would fail past max_position_embeddings.
+        position_embeddings: Optional[Callable] = (
+            None
+            if cache_owns_rope(kv_cache)
+            else self.rotary_emb(hidden_states, positions)
+        )
 
         if is_kv_cache_list:
             if len(kv_cache) != input_shape[0]:
@@ -257,6 +265,8 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(BaseModelForCausalLM):
+
+    supports_eviction_rope = True
 
     target_map = {
         "gate_up_proj": ["gate_proj", "up_proj"],

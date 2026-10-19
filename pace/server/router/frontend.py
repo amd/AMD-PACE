@@ -38,6 +38,7 @@ from pace.server.router.scheduler import IterativeScheduler, PrefillFirstSchedul
 from pace.server.router.streaming import set_scheduler
 from pace.server.router.tokenizer_utils import init_tokenizer
 from pace.server.router.utils import http_config
+from pace.llm.generation.config import resolve_generation_backend_config
 from pace.utils.logging import PACE_DEBUG, PACE_INFO, PACE_WARNING
 
 app = FastAPI()
@@ -47,45 +48,74 @@ metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
 
+def _optional_json(value, warning):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        PACE_WARNING(warning)
+        return {}
+
+
+def build_model_config(args):
+    """Build the engine payload without assuming a concrete generation backend."""
+
+    op_config = _optional_json(
+        getattr(args, "op_config", "{}"),
+        "Invalid op_config JSON. Proceeding with default operator backends.",
+    )
+    spec_config = _optional_json(
+        getattr(args, "spec_config", "{}"),
+        "Invalid spec_config JSON. Proceeding without speculative decoding.",
+    )
+    backend_value = json.loads(getattr(args, "generation_backend_config", "{}"))
+    generation_backend_config = (
+        resolve_generation_backend_config(backend_value)
+        if backend_value != {}
+        else None
+    )
+    model_config = {
+        "modelId": args.model,
+        "dataType": args.dtype.lower(),
+        "norm_backend": op_config.get("norm_backend", ""),
+        "qkv_projection_backend": op_config.get("qkv_projection_backend", ""),
+        "attention_backend": op_config.get("attention_backend", ""),
+        "gated_deltanet_backend": op_config.get("gated_deltanet_backend", ""),
+        "out_projection_backend": op_config.get("out_projection_backend", ""),
+        "mlp_backend": op_config.get("mlp_backend", ""),
+        "lm_head_backend": op_config.get("lm_head_backend", ""),
+    }
+    if getattr(args, "kv_cache_type", None) is not None:
+        model_config["kvCacheType"] = args.kv_cache_type
+    if spec_config:
+        model_config["spec_config"] = spec_config
+    if generation_backend_config is not None:
+        model_config["generation_backend_config"] = (
+            generation_backend_config.model_dump(mode="json")
+        )
+    if getattr(args, "kv_cache_memory_gb", None) is not None:
+        model_config["kv_cache_memory_gb"] = args.kv_cache_memory_gb
+    return model_config
+
+
+def resolve_serve_type(args) -> str:
+    """The scheduler to run: the one requested, unless the generation backend only works under the iterative scheduler."""
+    backend_value = json.loads(getattr(args, "generation_backend_config", "{}"))
+    if backend_value == {} or args.serve_type == "iterative":
+        return args.serve_type
+    backend_config = resolve_generation_backend_config(backend_value)
+    if getattr(backend_config, "requires_iterative_scheduler", False):
+        PACE_WARNING(
+            f"generation backend '{backend_config.type}' serves one request at a time, which only the iterative scheduler does; overriding serve_type '{args.serve_type}' to 'iterative'"
+        )
+        return "iterative"
+    return args.serve_type
+
+
 def startup_event_wrapper(args):
     @app.on_event("startup")
     async def startup_event():
         """Configure all backend engine instances and start the scheduler."""
-        try:
-            op_config = json.loads(args.op_config)
-        except json.JSONDecodeError:
-            PACE_WARNING(
-                "Invalid op_config JSON. Proceeding with default operator backends."
-            )
-            op_config = {}
-
-        try:
-            spec_config = json.loads(args.spec_config)
-        except json.JSONDecodeError:
-            PACE_WARNING(
-                "Invalid spec_config JSON. Proceeding without speculative decoding."
-            )
-            spec_config = {}
-
-        model_config = {
-            "modelId": args.model,
-            "dataType": args.dtype.lower(),
-            "norm_backend": op_config.get("norm_backend", ""),
-            "qkv_projection_backend": op_config.get("qkv_projection_backend", ""),
-            "attention_backend": op_config.get("attention_backend", ""),
-            "out_projection_backend": op_config.get("out_projection_backend", ""),
-            "mlp_backend": op_config.get("mlp_backend", ""),
-            "lm_head_backend": op_config.get("lm_head_backend", ""),
-        }
-        if args.kv_cache_type is not None:
-            model_config["kvCacheType"] = args.kv_cache_type
-        if spec_config:
-            model_config["spec_config"] = spec_config
-        kv_cache_memory_gb = getattr(args, "kv_cache_memory_gb", None)
-        if kv_cache_memory_gb is not None:
-            model_config["kv_cache_memory_gb"] = kv_cache_memory_gb
-
-        config_payload = {"modelConfig": model_config}
+        config_payload = {"modelConfig": build_model_config(args)}
 
         num_instances = args.num_engine_instances
         PACE_INFO(f"Configuring {num_instances} engine instance(s)")
@@ -168,7 +198,12 @@ def parse_router_arguments():
     )
     parser.add_argument("--model", type=str, help="Model name to load")
     parser.add_argument("--dtype", type=str, help="Data type for the model")
-    parser.add_argument("--kv_cache_type", type=str, help="KV cache type")
+    parser.add_argument(
+        "--kv_cache_type",
+        type=str,
+        default=None,
+        help="KV cache type",
+    )
     parser.add_argument(
         "--serve_type",
         type=str,
@@ -195,6 +230,12 @@ def parse_router_arguments():
     )
     parser.add_argument(
         "--spec_config", type=str, default="{}", help="Speculative decoding config JSON"
+    )
+    parser.add_argument(
+        "--generation_backend_config",
+        type=str,
+        default="{}",
+        help="Generation backend configuration as JSON",
     )
     parser.add_argument(
         "--kv_cache_memory_gb",
@@ -230,6 +271,7 @@ if __name__ == "__main__":
         args.scheduler_metrics_enabled = True
     else:
         args.scheduler_metrics_enabled = False
+    args.serve_type = resolve_serve_type(args)
     PACE_INFO(f"Using {args.serve_type} scheduler")
     PACE_INFO(f"Scheduler-Wide statistics enabled: {args.scheduler_metrics_enabled}")
 
@@ -283,7 +325,8 @@ if __name__ == "__main__":
         raise ValueError(f"Unknown serve_type: {args.serve_type}")
 
     PACE_INFO(f"Loading tokenizer for model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # fix_mistral_regex only changes Mistral tokenizers saved with the faulty pre-tokenizer regex.
+    tokenizer = AutoTokenizer.from_pretrained(args.model, fix_mistral_regex=True)
     PACE_INFO("Tokenizer loaded successfully")
 
     init_tokenizer(tokenizer)

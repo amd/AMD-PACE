@@ -16,6 +16,7 @@ torch.classes.pace.SlabPool. No global state map -- state is directly
 on the class instance, ref-counted and garbage collected.
 """
 
+import os
 import threading
 from typing import Optional, List
 import torch
@@ -28,9 +29,13 @@ from pace.llm.attention.base import (
 from pace.llm.attention.prefix_cache import (
     PrefixCacheContextMixin,
     PrefixCacheMixin,
-    compute_block_hashes,
 )
-from pace.utils.logging import PACE_LLM_INFO
+from pace.llm.attention.recurrent_state import (
+    RecurrentStateStore,
+    MergedRecurrentState,
+    num_recurrent_layers,
+)
+from pace.utils.logging import PACE_LLM_INFO, PACE_LLM_WARNING
 
 _BF16_BYTES = 2
 
@@ -169,6 +174,7 @@ class SlabPoolContext(PrefixCacheContextMixin, CacheContext):
         self._cache_objects = _SlabPoolLayerList(pool_manager, tokens)
         self.slab_query_lens: Optional[List[int]] = None
         self._init_prefix_fields()
+        self.recurrent_state = None
 
     @property
     def cache_objects(self):
@@ -366,8 +372,14 @@ class SlabPoolManager:
             seq_id = self._token_to_seq_id.get(token)
             if seq_id is None:
                 return
+            # Hybrid models (e.g. Qwen3.5) have linear-attention layers that
+            # never write KV, so those per-layer pools stay length 0. Clamp the
+            # truncation to each pool's own length so a global remove_len does
+            # not try to remove more tokens than a (never-written) pool holds.
             for pool in self._owned_pools:
-                pool.truncate_sequence(seq_id, remove_len)
+                pool_len = pool.get_sequence_length(seq_id)
+                if pool_len > 0:
+                    pool.truncate_sequence(seq_id, min(remove_len, pool_len))
 
     def get_sequence_length(self, token: str) -> int:
         with self._lock:
@@ -497,7 +509,7 @@ class SlabCache(PrefixCacheMixin, Cache):
 
     Implements the Cache ABC and mixes in PrefixCacheMixin for prefix
     caching (enabled by default; disable via ``PACE_PREFIX_CACHE=0`` or kwarg
-    ``enable_prefix_cache=False``).
+    ``enable_prefix_cache=False``; always off for Gated DeltaNet models).
 
     SLAB reuses cached prefix blocks zero-copy: matched blocks are referenced
     by the new sequence via the C++ ``SlabPool.assign_prefix_blocks`` and kept
@@ -506,10 +518,8 @@ class SlabCache(PrefixCacheMixin, Cache):
     The prefix-hash block size is derived from SLAB's autotuned block size so
     hashing granularity matches the pool's physical blocks.
 
-    When kv_cache_memory_gb is provided (server path), the SlabPoolManager
-    is created eagerly so the pool is allocated before any requests.
-    Otherwise (offline / spec-decode) the manager is created lazily in
-    create_context() once max_seq_length and batch_size are known.
+    ``reserve_pool()`` allocates serving capacity before requests arrive.
+    Offline callers allocate lazily in ``create_context()``.
     """
 
     # kwargs accepted by SlabPoolManager; others are silently ignored.
@@ -519,17 +529,58 @@ class SlabCache(PrefixCacheMixin, Cache):
         "block_size",
         "default_max_seq_len",
     }
+    supports_packing = True
 
     def __init__(self, config: PretrainedConfig, **kwargs):
         self._config = config
         self._kwargs = {k: v for k, v in kwargs.items() if k in self._SUPPORTED_KWARGS}
         self._manager: Optional[SlabPoolManager] = None
-        if "kv_cache_memory_gb" in self._kwargs:
-            self._manager = SlabPoolManager(config, **self._kwargs)
 
         self._resolved_block_size = self._init_prefix_cache_from_config(
             config, "SlabCache", autotune_fn=autotune_block_size, **kwargs
         )
+
+    def reserve_pool(self) -> None:
+        """
+        Create the slab pool at its configured size, or at PACE_MAX_CACHE_TOKENS when none was configured.
+
+        PACE_MAX_CACHE_TOKENS defaults to max_position_embeddings, capped at 8192.
+        """
+        if self._manager is None:
+            kwargs = dict(self._kwargs)
+            if "max_total_tokens" not in kwargs and "kv_cache_memory_gb" not in kwargs:
+                default_tokens = min(
+                    getattr(self._config, "max_position_embeddings", 4096),
+                    8192,
+                )
+                capacity = int(os.getenv("PACE_MAX_CACHE_TOKENS", str(default_tokens)))
+                PACE_LLM_WARNING(
+                    "SLAB serving cache capacity was not configured; reserving "
+                    f"{capacity} tokens"
+                )
+                kwargs["max_total_tokens"] = capacity
+            self._manager = SlabPoolManager(self._config, **kwargs)
+
+    def get_stats(self) -> dict:
+        """Slab-pool and prefix-cache statistics."""
+        stats = {}
+        if self._manager is not None:
+            stats["pool"] = self._manager.get_stats()
+        stats["prefix_cache"] = self.get_prefix_cache_stats()
+        return stats
+
+    def prepare_batch(
+        self,
+        max_seq_length: int,
+        batch_size: int,
+        spec_headroom: int = 0,
+    ) -> None:
+        """
+        Size the pool for batch_size sequences of max_seq_length + spec_headroom tokens.
+
+        A configured size is kept. Otherwise a pool that is too small is rebuilt, which is only allowed while no request is active.
+        """
+        self._ensure_manager(max_seq_length, batch_size, spec_headroom)
 
     def _ensure_manager(
         self, max_seq_length: int, batch_size: int, spec_headroom: int
@@ -561,7 +612,14 @@ class SlabCache(PrefixCacheMixin, Cache):
                 return
             if self._manager.max_total_tokens >= needed_tokens:
                 return
+            if self._manager.get_active_tokens():
+                # TODO: Support live pool growth by migrating active sequence
+                # contexts. Until then, resizing is safe only while idle.
+                raise RuntimeError(
+                    "cannot resize SLAB cache pool while requests are active"
+                )
             self._manager = None
+            self._on_pool_reset()
 
         kw = dict(self._kwargs)
         if "max_total_tokens" not in kw and "kv_cache_memory_gb" not in kw:
@@ -578,24 +636,38 @@ class SlabCache(PrefixCacheMixin, Cache):
 
         self._ensure_manager(max_seq_length, batch_size, spec_headroom)
 
+        num_gdn = num_recurrent_layers(config)
         if token is not None:
             pool_token = self._manager.create_sequence(
                 max_seq_len=effective_len, token=token
             )
-            return SlabPoolContext(self._manager, [pool_token])
-
-        tokens = []
-        for _ in range(batch_size):
-            pool_token = self._manager.create_sequence(max_seq_len=effective_len)
-            tokens.append(pool_token)
-        return SlabPoolContext(self._manager, tokens)
+            ctx = SlabPoolContext(self._manager, [pool_token])
+        else:
+            tokens = []
+            for _ in range(batch_size):
+                pool_token = self._manager.create_sequence(max_seq_len=effective_len)
+                tokens.append(pool_token)
+            ctx = SlabPoolContext(self._manager, tokens)
+        # Per-request GDN state. Prefix reuse is disabled for GDN models
+        # (PrefixCacheMixin) because a prefix hit would skip this store.
+        ctx.recurrent_state = RecurrentStateStore(num_gdn)
+        return ctx
 
     def merge_contexts(self, contexts, **kwargs) -> SlabPoolContext:
-        """Combine per-sequence contexts into a single batched context."""
+        """Combine per-sequence contexts into a single batched context.
+
+        merge_contexts returns a single SlabPoolContext (not a list), so the
+        per-request GDN stores are wrapped in a MergedRecurrentState in the same
+        order as the merged tokens, keeping GDN batch rows aligned with the KV
+        cache / input batch order."""
         all_tokens = []
         for ctx in contexts:
             all_tokens.extend(ctx.tokens)
-        return SlabPoolContext(self._manager, all_tokens)
+        merged = SlabPoolContext(self._manager, all_tokens)
+        merged.recurrent_state = MergedRecurrentState(
+            [ctx.recurrent_state for ctx in contexts]
+        )
+        return merged
 
     def merge_contexts_mixed(self, contexts_with_query_lens: list) -> SlabPoolContext:
         """Merge contexts with per-sequence query lengths for mixed batches.
@@ -604,19 +676,25 @@ class SlabCache(PrefixCacheMixin, Cache):
             contexts_with_query_lens: List of ``(kv_cache_context, query_len)``
                 tuples.  The query_len per sequence is stored on the returned
                 context as ``slab_query_lens`` so the attention kernel can
-                dispatch the packed path correctly.
+                dispatch the packed path correctly. Per-request GDN stores are
+                wrapped in a ``MergedRecurrentState`` in the same order.
         """
         all_tokens = []
         query_lens = []
+        stores = []
         for ctx, ql in contexts_with_query_lens:
             mgr = ctx.kv_cache_manager if hasattr(ctx, "kv_cache_manager") else ctx
+            src = mgr if isinstance(mgr, SlabPoolContext) else ctx
             if isinstance(mgr, SlabPoolContext):
                 all_tokens.extend(mgr.tokens)
             else:
                 all_tokens.extend(ctx.tokens)
             query_lens.append(ql)
+            stores.append(getattr(src, "recurrent_state", None))
         merged = SlabPoolContext(self._manager, all_tokens)
         merged.slab_query_lens = query_lens
+        if stores and all(s is not None for s in stores):
+            merged.recurrent_state = MergedRecurrentState(stores)
         return merged
 
     def build_prefill_metadata(self, *args, **kwargs):
@@ -631,9 +709,7 @@ class SlabCache(PrefixCacheMixin, Cache):
             return []
         return self._manager.get_block_indices(context.tokens[0])
 
-    def _claim_prefix_blocks_impl(
-        self, context, token_ids, matched_blocks, num_matched_tokens
-    ):
+    def _claim_prefix_blocks_impl(self, context, matched_blocks, num_matched_tokens):
         """Zero-copy: point the new sequence at the cached physical blocks."""
         if not context.tokens or self._manager is None:
             return
@@ -664,7 +740,11 @@ class SlabCache(PrefixCacheMixin, Cache):
         self._manager.retain_blocks(blocks[:num_full_blocks])
         return blocks
 
-    def insert_prefix(self, context, token_ids: list) -> int:
+    def insert_prefix(
+        self,
+        context,
+        block_hashes: List[bytes],
+    ) -> int:
         """Register newly-computed suffix blocks and retain them in the pool.
 
         The reused prefix (``prefix_matched_tokens``) is already shared zero-copy
@@ -677,11 +757,10 @@ class SlabCache(PrefixCacheMixin, Cache):
         if not blocks:
             return 0
         skip = getattr(context, "prefix_matched_tokens", 0) // self._prefix_block_size
-        hashes = compute_block_hashes(token_ids, self._prefix_block_size)
-        num_full = min(len(hashes), len(blocks))
+        num_full = min(len(block_hashes), len(blocks))
         if num_full > skip:
             self._manager.retain_blocks(blocks[skip:num_full])
-        return self._register_blocks(context, hashes, blocks, start=skip)
+        return self._register_blocks(context, block_hashes, blocks, start=skip)
 
     def evict_prefix_blocks(self, num_blocks: int) -> list:
         """Evict LRU cached blocks and release their retained pool blocks."""

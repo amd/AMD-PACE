@@ -1,6 +1,7 @@
 /******************************************************************************
  * Copyright (c) 2025 Advanced Micro Devices, Inc.
  * All rights reserved.
+ * Portions of this file consist of AI-generated content
  ******************************************************************************/
 
 #ifndef NORM_H
@@ -18,6 +19,12 @@ std::tuple<at::Tensor, at::Tensor> fused_add_rmsnorm_op(
 
 at::Tensor rmsnorm_op(
     const at::Tensor& x,
+    const at::Tensor& weight,
+    double eps);
+
+at::Tensor rmsnorm_gated_op(
+    const at::Tensor& x,
+    const at::Tensor& gate,
     const at::Tensor& weight,
     double eps);
 

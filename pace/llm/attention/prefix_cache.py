@@ -223,7 +223,6 @@ class PrefixCacheContextMixin:
     def _init_prefix_fields(self) -> None:
         self.prefix_matched_tokens: int = 0
         self.prefix_matched_blocks: List[int] = []
-        self.prefix_token_ids: Optional[List[int]] = None
         # Every block hash whose ref this context owns (claimed + inserted),
         # released exactly once in _release_prefix_refs on removal.
         self.prefix_held_hashes: List[bytes] = []
@@ -237,6 +236,10 @@ class PrefixCacheMixin:
     and implement ``_get_block_indices_for_context(context) -> list[int]``.
     Backends that own a block pool also override ``_claim_prefix_blocks_impl``
     and ``_free_duplicate_block``.
+
+    Gated DeltaNet (linear-attention) models force-disable prefix reuse:
+    prefix entries store full-attention KV blocks only, not conv/recurrent
+    state, so a hit would skip the prefix without that memory.
     """
 
     def _init_prefix_cache(self, block_size: int, enable: bool) -> None:
@@ -261,7 +264,9 @@ class PrefixCacheMixin:
         autotuned (e.g. SLAB) must pass ``autotune_fn`` so the prefix hashing
         granularity matches the cache's real block size.  Prefix caching is
         enabled by default on every backend; disable it as opt-out via
-        ``enable_prefix_cache=False`` or ``PACE_PREFIX_CACHE=0``.
+        ``enable_prefix_cache=False`` or ``PACE_PREFIX_CACHE=0``.  Hybrid
+        Gated DeltaNet models always disable it (prefix KV without conv /
+        recurrent state would change results vs a cache miss).
         """
         block_size = kwargs.get("block_size", 0)
         if block_size <= 0:
@@ -280,6 +285,18 @@ class PrefixCacheMixin:
         enable = kwargs.get(
             "enable_prefix_cache", os.getenv("PACE_PREFIX_CACHE", "1") == "1"
         )
+        from pace.llm.attention.recurrent_state import num_recurrent_layers
+
+        if enable and num_recurrent_layers(config) > 0:
+            enable = False
+            from pace.utils.logging import PACE_LLM_WARNING
+
+            PACE_LLM_WARNING(
+                f"{backend_label}: prefix caching disabled for Gated "
+                "DeltaNet (linear-attention) models such as Qwen3.5: "
+                "prefix entries store only full-attention KV, not conv/"
+                "recurrent state."
+            )
         self._init_prefix_cache(block_size, enable)
         if self.prefix_cache_enabled:
             from pace.utils.logging import PACE_LLM_INFO
@@ -294,7 +311,16 @@ class PrefixCacheMixin:
     def prefix_cache_enabled(self) -> bool:
         return getattr(self, "_prefix_map", None) is not None
 
-    def try_prefix_match(self, token_ids: list) -> Tuple[list, int]:
+    def _on_pool_reset(self) -> None:
+        """Drop pool-local block IDs whenever the physical pool is replaced."""
+        enabled = self.prefix_cache_enabled
+        self._init_prefix_cache(self._prefix_block_size, enabled)
+
+    def try_prefix_match(
+        self,
+        block_hashes: List[bytes],
+        query_token_count: int,
+    ) -> Tuple[list, int]:
         """Find reusable KV blocks for a token prefix.
 
         Returns ``(matched_block_indices, num_matched_tokens)``. Only full-block
@@ -303,24 +329,24 @@ class PrefixCacheMixin:
         """
         if self._prefix_map is None:
             return [], 0
-        hashes = compute_block_hashes(token_ids, self._prefix_block_size)
-        matched, num_blocks = self._prefix_map.match_prefix(hashes)
+        matched, num_blocks = self._prefix_map.match_prefix(block_hashes)
         num_matched_tokens = num_blocks * self._prefix_block_size
-        self._prefix_map.record_query(len(token_ids), num_matched_tokens)
+        self._prefix_map.record_query(query_token_count, num_matched_tokens)
         return matched, num_matched_tokens
 
     def claim_prefix_blocks(
-        self, context, token_ids: list, matched_blocks: list, num_matched_tokens: int
+        self,
+        context,
+        block_hashes: List[bytes],
+        matched_blocks: list,
+        num_matched_tokens: int,
     ) -> None:
         """Assign matched prefix blocks to a request and increment refs."""
         if not matched_blocks:
             return
-        self._claim_prefix_blocks_impl(
-            context, token_ids, matched_blocks, num_matched_tokens
-        )
+        self._claim_prefix_blocks_impl(context, matched_blocks, num_matched_tokens)
         if self._prefix_map is not None:
-            hashes = compute_block_hashes(token_ids, self._prefix_block_size)
-            claimed = hashes[: len(matched_blocks)]
+            claimed = block_hashes[: len(matched_blocks)]
             for bh in claimed:
                 self._prefix_map.increment_ref(bh)
             held = getattr(context, "prefix_held_hashes", None) or []
@@ -328,41 +354,51 @@ class PrefixCacheMixin:
 
         context.prefix_matched_tokens = num_matched_tokens
         context.prefix_matched_blocks = list(matched_blocks)
-        context.prefix_token_ids = list(token_ids)
 
     def _claim_prefix_blocks_impl(
-        self, context, token_ids, matched_blocks, num_matched_tokens
+        self, context, matched_blocks, num_matched_tokens
     ) -> None:
         """Assign physical prefix blocks to a context. Override in pool backends."""
         pass
 
-    def insert_prefix(self, context, token_ids: list) -> int:
+    def insert_prefix(
+        self,
+        context,
+        block_hashes: List[bytes],
+    ) -> int:
         """Register completed full blocks; returns the number of new entries."""
         if self._prefix_map is None:
             return 0
         blocks = self._get_block_indices_for_context(context)
         if not blocks:
             return 0
-        hashes = compute_block_hashes(token_ids, self._prefix_block_size)
-        return self._register_blocks(context, hashes, blocks)
+        return self._register_blocks(context, block_hashes, blocks)
 
     def preinsert_computed_blocks(
-        self, context, token_ids: list, num_full_blocks: int
+        self,
+        context,
+        block_hashes: List[bytes],
+        num_full_blocks: int,
     ) -> int:
-        """Reserve+register a context's full prefix blocks before the forward so
-        a same-step follower can reuse them (intra-batch dedup)."""
+        """Reserve and publish computed prefix blocks for same-step reuse."""
         if self._prefix_map is None or num_full_blocks <= 0:
             return 0
         blocks = self._reserve_blocks_for_context(context, num_full_blocks)
         if not blocks:
             return 0
-        hashes = compute_block_hashes(token_ids, self._prefix_block_size)
-        n = min(num_full_blocks, len(hashes), len(blocks))
-        return self._register_blocks(context, hashes[:n], blocks[:n]) if n > 0 else 0
+        count = min(num_full_blocks, len(block_hashes), len(blocks))
+        return (
+            self._register_blocks(
+                context,
+                block_hashes[:count],
+                blocks[:count],
+            )
+            if count > 0
+            else 0
+        )
 
     def _reserve_blocks_for_context(self, context, num_full_blocks: int) -> list:
-        """Eagerly allocate a context's first ``num_full_blocks`` blocks. Pool
-        backends override; others don't support intra-batch dedup."""
+        """Reserve physical blocks before the model forward."""
         return []
 
     def _register_blocks(self, context, hashes, blocks, start: int = 0) -> int:

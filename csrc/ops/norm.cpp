@@ -1,6 +1,7 @@
 /******************************************************************************
  * Copyright (c) 2025 Advanced Micro Devices, Inc.
  * All rights reserved.
+ * Portions of this file consist of AI-generated content
  ******************************************************************************/
 
 #include <ATen/ATen.h>
@@ -54,6 +55,16 @@ inline void check_bias(
       bias.size(0) == x.size(-1), op, ": bias size must match last dim of x");
 }
 
+inline void check_gate(
+    const at::Tensor& x,
+    const at::Tensor& gate,
+    const char* op) {
+  TORCH_CHECK(
+      gate.scalar_type() == at::kBFloat16, op, ": gate must be BFloat16");
+  TORCH_CHECK(
+      x.sizes() == gate.sizes(), op, ": x and gate must have the same shape");
+}
+
 } // namespace
 
 std::tuple<at::Tensor, at::Tensor> fused_add_rmsnorm_op(
@@ -74,6 +85,17 @@ at::Tensor rmsnorm_op(
   PROFILE_PACE_FUNCTION("rmsnorm");
   check_norm_inputs(x, weight, "rmsnorm");
   return kernels::rmsnorm(x, weight, eps);
+}
+
+at::Tensor rmsnorm_gated_op(
+    const at::Tensor& x,
+    const at::Tensor& gate,
+    const at::Tensor& weight,
+    double eps) {
+  PROFILE_PACE_FUNCTION("rmsnorm_gated");
+  check_norm_inputs(x, weight, "rmsnorm_gated");
+  check_gate(x, gate, "rmsnorm_gated");
+  return kernels::rmsnorm_gated(x, gate, weight, eps);
 }
 
 std::tuple<at::Tensor, at::Tensor> fused_add_layernorm_op(
@@ -109,6 +131,8 @@ TORCH_LIBRARY_FRAGMENT(pace, m) {
       "fused_add_rmsnorm(Tensor x, Tensor residual, Tensor weight, float eps) -> (Tensor, Tensor)");
   m.def("rmsnorm(Tensor x, Tensor weight, float eps) -> Tensor");
   m.def(
+      "rmsnorm_gated(Tensor x, Tensor gate, Tensor weight, float eps) -> Tensor");
+  m.def(
       "fused_add_layernorm(Tensor x, Tensor residual, Tensor weight, Tensor bias, float eps) -> (Tensor, Tensor)");
   m.def("layernorm(Tensor x, Tensor weight, Tensor bias, float eps) -> Tensor");
 }
@@ -116,6 +140,7 @@ TORCH_LIBRARY_FRAGMENT(pace, m) {
 TORCH_LIBRARY_IMPL(pace, CPU, m) {
   m.impl("fused_add_rmsnorm", pace::fused_add_rmsnorm_op);
   m.impl("rmsnorm", pace::rmsnorm_op);
+  m.impl("rmsnorm_gated", pace::rmsnorm_gated_op);
   m.impl("fused_add_layernorm", pace::fused_add_layernorm_op);
   m.impl("layernorm", pace::layernorm_op);
 }

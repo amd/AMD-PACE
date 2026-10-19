@@ -53,6 +53,9 @@ class TestPaceAttentionBackend(unittest.TestCase):
     def test_supports_sink(self) -> None:
         self.assertTrue(PaceAttentionBackend.supports_sink())
 
+    def test_supports_sliding_window(self) -> None:
+        self.assertTrue(PaceAttentionBackend.supports_sliding_window())
+
     def test_get_supported_head_sizes(self) -> None:
         sizes = PaceAttentionBackend.get_supported_head_sizes()
         self.assertIn(64, sizes)
@@ -242,6 +245,28 @@ class TestPaceAttentionImplOutputBuffer(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(ret, attn_value.view_as(query)))
+
+    def test_shared_kv_layer_skips_cache_update(self) -> None:
+        impl = self._make_impl()
+        attn_value = torch.full((2, 4, 8), 5.0, dtype=torch.bfloat16)
+        pool = self._make_pool(attn_value)
+        impl._pace_pool = pool
+        query = torch.zeros((2, 32), dtype=torch.bfloat16)
+        output = torch.empty_like(query)
+
+        ret = impl.forward(
+            self._make_layer(),
+            query,
+            None,
+            None,
+            torch.empty(0),
+            self._make_metadata(2),
+            output=output,
+        )
+
+        self.assertFalse(pool.cache_update_called)
+        self.assertIs(ret, output)
+        self.assertTrue(torch.equal(output, attn_value.view_as(query)))
 
     def test_warmup_returns_output_buffer_when_provided(self) -> None:
         # During dummy_run / warmup, attn_metadata is None. We must not

@@ -23,8 +23,13 @@ class RunConfig:
     tasks: list = field(default_factory=list)  # [{query, start_url?, max_iter?}, ...]
     max_iter: int = 80
     max_llm_calls: int = 200
-    num_runs: int = 10
+    num_runs: int = 10  # deterministic replays of the recorded trajectory
     warmup: int = 1
+    # characterization: LIVE runs sampled to pick what to record. 1 records the first run as before.
+    characterize_runs: int = 1
+    # {strategy: auto|mode|medoid|first, granularity: action|action_arg|coarse,
+    #  min_success: int, keep_trajectories: bool}
+    characterize: dict = field(default_factory=dict)
     pinning: dict = field(default_factory=dict)
     telemetry: str = "off"
     out: str | None = None
@@ -101,6 +106,10 @@ def load_config(path):
         cfg.tasks = [{**cfg.task_defaults, **t} for t in cfg.tasks]
     # fail on a malformed scoring block now, not 90 tasks later
     score.resolve(cfg.scoring)
+    # likewise for characterization. Local import: characterize reaches back into replay.
+    from pace_agent.characterize import options as characterize_options
+
+    characterize_options.resolve(cfg.characterize)
     return cfg
 
 

@@ -1,6 +1,7 @@
 # ******************************************************************************
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # All rights reserved.
+# Portions of this file consist of AI-generated content
 # ******************************************************************************
 
 """Mock-based tests for engine frontend endpoints.
@@ -106,8 +107,7 @@ class TestStepEndpoint(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _fake_sequence(req_id, **kwargs):
-    """Build a lightweight Sequence stand-in for endpoint tests."""
+def _fake_sequence(req_id, *args, **kwargs):
     seq = Mock()
     seq.id = req_id if isinstance(req_id, uuid.UUID) else uuid.UUID(req_id)
     return seq
@@ -115,15 +115,11 @@ def _fake_sequence(req_id, **kwargs):
 
 class TestStepAutoMixedEndpoint(unittest.TestCase):
 
-    SEQUENCE_PATH = "pace.server.engine.frontend.Sequence"
-
     def setUp(self):
         self.client = TestClient(app)
         model_executor.prefill_queue = {}
         model_executor.decode_queue = {}
-        model_executor._spec_decoder = None
         model_executor.model_config = Mock()
-        model_executor._cache_backend = Mock()
         model_executor._tokenizer = Mock()
         model_executor._model = Mock()
 
@@ -137,7 +133,7 @@ class TestStepAutoMixedEndpoint(unittest.TestCase):
         rid = _uuid()
         prefill_out = {rid: {"status": "PREFILL_COMPLETED", "token_ids": [42]}}
         with (
-            patch(self.SEQUENCE_PATH, side_effect=_fake_sequence),
+            patch.object(model_executor, "create_sequence", side_effect=_fake_sequence),
             patch.object(
                 model_executor,
                 "prefill_decode_mixed_batch",
@@ -216,7 +212,11 @@ class TestStepAutoMixedEndpoint(unittest.TestCase):
         self.assertEqual(captured["chunk_info_map"][rid], (50, 50))
 
     def test_prefill_creation_error_captured(self):
-        with patch(self.SEQUENCE_PATH, side_effect=RuntimeError("bad config")):
+        with patch.object(
+            model_executor,
+            "create_sequence",
+            side_effect=RuntimeError("bad config"),
+        ):
             resp = self.client.post(
                 "/step_auto_mixed",
                 json={"prefill_batch": [_prefill_item()]},
@@ -225,6 +225,27 @@ class TestStepAutoMixedEndpoint(unittest.TestCase):
         data = resp.json()
         errors = [v for v in data["prefill_result"].values() if "error" in v]
         self.assertGreater(len(errors), 0)
+
+    def test_duplicate_prefill_id_is_rejected(self):
+        rid = _uuid()
+        with (
+            patch.object(model_executor, "create_sequence") as create_sequence,
+            patch.object(model_executor, "prefill_decode_mixed_batch") as mixed_batch,
+        ):
+            resp = self.client.post(
+                "/step_auto_mixed",
+                json={
+                    "prefill_batch": [
+                        _prefill_item(req_id=rid),
+                        _prefill_item(req_id=rid),
+                    ]
+                },
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("duplicate request IDs", resp.json()["detail"])
+        create_sequence.assert_not_called()
+        mixed_batch.assert_not_called()
 
     def test_mixed_batch_crash_returns_500(self):
         rid = _uuid()
@@ -242,29 +263,6 @@ class TestStepAutoMixedEndpoint(unittest.TestCase):
                 json={"prefill_batch": [_prefill_item(req_id=rid)]},
             )
         self.assertEqual(resp.status_code, 500)
-
-    def test_spec_decoder_headroom(self):
-        spec_mock = Mock()
-        spec_mock.num_speculative_tokens = 5
-        model_executor._spec_decoder = spec_mock
-
-        rid = _uuid()
-        with (
-            patch(self.SEQUENCE_PATH, side_effect=_fake_sequence),
-            patch.object(
-                model_executor,
-                "prefill_decode_mixed_batch",
-                return_value=(
-                    {rid: {"status": "PREFILL_COMPLETED", "token_ids": [1]}},
-                    {},
-                ),
-            ),
-        ):
-            resp = self.client.post(
-                "/step_auto_mixed",
-                json={"prefill_batch": [_prefill_item(req_id=rid)]},
-            )
-        self.assertEqual(resp.status_code, 200)
 
 
 # ---------------------------------------------------------------------------

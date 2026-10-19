@@ -11,11 +11,17 @@ from .normalization import (
     RMSNorm,
     L2Norm,
     Gemma3RMSNorm,
+    RMSNormGated,
     FusedRMSNormResidual,
     FusedGemma3RMSNormResidual,
     FusedLayerNormResidual,
 )
 from .rotary_embedding import RotaryEmbedding
+from .gated_deltanet import (
+    GatedDeltaAttention,
+    GatedDeltaRecurrence,
+    CausalConv1dUpdate,
+)
 from .activations import SoftMax, Sigmoid, Activation
 from .fused_linear import (
     FusedLinearGelu,
@@ -47,10 +53,14 @@ __all__ = [
     "RMSNorm",
     "L2Norm",
     "Gemma3RMSNorm",
+    "RMSNormGated",
     "FusedRMSNormResidual",
     "FusedGemma3RMSNormResidual",
     "FusedLayerNormResidual",
     "RotaryEmbedding",
+    "GatedDeltaAttention",
+    "GatedDeltaRecurrence",
+    "CausalConv1dUpdate",
     "SoftMax",
     "Sigmoid",
     "Activation",

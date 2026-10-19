@@ -8,7 +8,7 @@ import argparse
 import os
 import json
 from importlib.util import find_spec
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -31,6 +31,27 @@ def check_if_lib_available(packages: List[str]):
             find_spec(package),
             f"The library {package} is not installed, and is required for this benchmark.",
         )
+
+
+def verify_input_config(spec_config: Optional[dict], generation_args: dict):
+    has_input_tokens = "input_tokens" in generation_args
+    input_tokens = generation_args.get("input_tokens")
+    if spec_config is not None:
+        PACE_LLM_ASSERT(
+            input_tokens is None,
+            "input_tokens must be omitted or null when spec_config is provided.",
+        )
+        PACE_LLM_ASSERT(
+            generation_args["batch_size"] == 1,
+            "Speculative decoding benchmarks require batch_size=1 "
+            "to avoid input padding.",
+        )
+        return
+
+    PACE_LLM_ASSERT(
+        has_input_tokens and isinstance(input_tokens, int) and input_tokens >= 1,
+        "input_tokens must be a positive integer.",
+    )
 
 
 def verify_and_convert_operators(operators: dict) -> dict:
@@ -118,20 +139,18 @@ def verify_args(args) -> dict:
             config["model_args"]["llm_operators"]
         )
 
-    if config["model_args"].get("spec_config") is not None:
+    spec_config = config["model_args"].get("spec_config")
+    if spec_config is not None:
         PACE_LLM_ASSERT(
-            "model_name" in config["model_args"]["spec_config"],
+            "model_name" in spec_config,
             "spec_config must contain 'model_name'.",
         )
         PACE_LLM_ASSERT(
-            "num_speculated_tokens" in config["model_args"]["spec_config"],
+            "num_speculated_tokens" in spec_config,
             "spec_config must contain 'num_speculated_tokens'.",
         )
 
-    PACE_LLM_ASSERT(
-        config["generation_args"]["input_tokens"] >= 1,
-        "input_tokens must be a positive integer.",
-    )
+    verify_input_config(spec_config, config["generation_args"])
     PACE_LLM_ASSERT(
         config["generation_args"]["output_tokens"] >= 1,
         "output_tokens must be a positive integer.",
@@ -208,14 +227,11 @@ def get_args() -> BenchmarkArgs:
     #             "MLP": "TPP",
     #             "LMHead": "NATIVE"
     #         },
-    #        "spec_config": {                       // PACE specific speculated tokens configuration
-    #             "model_name": "amd/PARD-Llama-3.2-1B",   // Model name for speculating
-    #             "num_speculated_tokens": 12           // Number of speculated tokens
-    #         }
+    #         "spec_config": null,                  // Set for speculative decoding
     #     },
     #     "use_real_data": true,                    // Whether to use real data for benchmarking
     #     "generation_args": {
-    #         "input_tokens": 128,                  // Number of input tokens
+    #         "input_tokens": 128,                  // Fixed length: pad or truncate
     #         "output_tokens": 128,                 // Number of output tokens
     #         "batch_size": 1,                      // Batch size for benchmarking
     #         "kv_cache_type": "BMC",               // Type of KV cache to use (BMC or DYNAMIC)
@@ -252,7 +268,7 @@ def get_args() -> BenchmarkArgs:
         spec_config=config["model_args"].get("spec_config", None),
     )
     generation_args = GenerationArgs(
-        input_tokens=config["generation_args"]["input_tokens"],
+        input_tokens=config["generation_args"].get("input_tokens"),
         output_tokens=config["generation_args"]["output_tokens"],
         batch_size=config["generation_args"]["batch_size"],
         kv_cache_type=config["generation_args"]["kv_cache_type"],

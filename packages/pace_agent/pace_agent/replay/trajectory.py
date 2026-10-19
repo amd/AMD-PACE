@@ -18,6 +18,8 @@ ARTIFACT_CLASS = {
     "result.json": "shareable",
     "env.json": "shareable",
     "trace.json": "diagnostic",
+    # action_arg paths can carry what the agent typed, so not shareable
+    "characterization.json": "diagnostic",
     "trajectory.msgpack": "confidential",
     "trajectory.pkl": "confidential",
 }

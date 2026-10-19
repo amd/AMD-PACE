@@ -9,8 +9,8 @@
 Hybrid models (Qwen3.5-MoE, Qwen3-Next, Jamba) ship Mamba groups alongside
 attention groups in `KVCacheConfig`. SlabPool only services attention, so
 `PaceKVCache.from_kv_cache_config` filters non-AttentionSpec layers and
-`PaceModelRunner._allocate_kv_cache_tensors` leaves their storage to vLLM --
-shipping a zero-sized placeholder for a Mamba layer crashes the first forward.
+`PaceModelRunner` leaves their storage to vLLM -- shipping a zero-sized
+placeholder for a Mamba layer crashes the first forward.
 
 MLA (`MLAAttentionSpec`) is a subclass of `FullAttentionSpec`, so the existing
 `isinstance(layer_spec, AttentionSpec)` filter accepts it silently. SlabPool's
@@ -23,10 +23,11 @@ from __future__ import annotations
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.v1.worker.cpu_model_runner import CPUModelRunner
 
 import pace_vllm
 from pace_vllm.v1 import kv_cache as kv_cache_module
@@ -110,7 +111,14 @@ def _kv_cache_config(*groups, tensors=None, num_blocks=0):
 def _kv_tensor(size, shared_by):
     from vllm.v1.kv_cache_interface import KVCacheTensor
 
-    return KVCacheTensor(size=size, shared_by=list(shared_by))
+    if "shared_by" in KVCacheTensor.__dataclass_fields__:
+        return KVCacheTensor(size=size, shared_by=list(shared_by))
+    return KVCacheTensor(
+        size=size,
+        layers=list(shared_by),
+        layer_stride=size,
+        block_stride=size,
+    )
 
 
 def _group(layer_names, spec):
@@ -136,10 +144,27 @@ def _uniform_group(name_to_spec):
     )
 
 
+def _unified_allocator_runner(model_type: str, shared_layers=None) -> PaceModelRunner:
+    runner = PaceModelRunner.__new__(PaceModelRunner)
+    runner.device = torch.device("cpu")
+    runner.cache_config = SimpleNamespace(get_resolved_kv_cache_layout=lambda: None)
+    runner.shared_kv_cache_layers = dict(shared_layers or {})
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type=model_type)
+    )
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.kv_caches = []
+    return runner
+
+
 class TestMambaHybridAllocation(unittest.TestCase):
     """PaceModelRunner leaves Mamba storage to vLLM while slab attention uses
     zero-sized placeholders."""
 
+    @unittest.skipUnless(
+        hasattr(CPUModelRunner, "_allocate_kv_cache_tensors"),
+        "raw allocation hook unavailable",
+    )
     def test_allocate_raw_tensors_only_materializes_mamba_storage(self) -> None:
         spec = _mamba_spec()
         size = 2 * spec.page_size_bytes
@@ -149,7 +174,7 @@ class TestMambaHybridAllocation(unittest.TestCase):
             tensors=[_kv_tensor(size, ["attn.0", "ssm.0"])],
             num_blocks=2,
         )
-        runner = MagicMock(spec=PaceModelRunner)
+        runner = PaceModelRunner.__new__(PaceModelRunner)
         runner.device = torch.device("cpu")
         runner.runner_only_attn_layers = set()
 
@@ -157,6 +182,59 @@ class TestMambaHybridAllocation(unittest.TestCase):
 
         self.assertEqual(raw_tensors["attn.0"].numel(), 0)
         self.assertEqual(raw_tensors["ssm.0"].numel(), size)
+
+    @unittest.skipIf(
+        hasattr(CPUModelRunner, "_allocate_kv_cache_tensors"),
+        "unified allocation hook unavailable",
+    )
+    def test_initialize_tensors_only_keeps_mamba_storage(self) -> None:
+        spec = _mamba_spec()
+        size = 2 * spec.page_size_bytes
+        cfg = _kv_cache_config(
+            _group(["attn.0"], _attention_spec()),
+            _group(["ssm.0"], spec),
+            tensors=[_kv_tensor(size, ["attn.0", "ssm.0"])],
+            num_blocks=2,
+        )
+        runner = _unified_allocator_runner("qwen3_5_moe")
+        mamba_tensor = torch.ones(size, dtype=torch.int8)
+
+        with (
+            patch(
+                "vllm.v1.worker.utils.allocate_kv_cache",
+                return_value={
+                    "attn.0": torch.ones(size, dtype=torch.int8),
+                    "ssm.0": mamba_tensor,
+                },
+            ) as mock_allocate,
+            patch("vllm.v1.worker.utils.bind_kv_cache") as mock_bind,
+        ):
+            tensors = runner.initialize_kv_cache_tensors(cfg, [16, 16])
+
+        mock_allocate.assert_called_once()
+        mock_bind.assert_called_once()
+        self.assertEqual(tensors["attn.0"].numel(), 0)
+        self.assertIs(tensors["ssm.0"], mamba_tensor)
+
+    @unittest.skipIf(
+        hasattr(CPUModelRunner, "_allocate_kv_cache_tensors"),
+        "unified allocation hook unavailable",
+    )
+    def test_shared_attention_follower_does_not_allocate_storage(self) -> None:
+        group = _uniform_group({"attn.0": _attention_spec()})
+        group.layer_names.append("attn.shared")
+        cfg = _kv_cache_config(group, num_blocks=2)
+        runner = _unified_allocator_runner("gemma4", {"attn.shared": "attn.0"})
+
+        with (
+            patch("vllm.v1.worker.utils.allocate_kv_cache") as mock_allocate,
+            patch("vllm.v1.worker.utils.bind_kv_cache"),
+        ):
+            tensors = runner.initialize_kv_cache_tensors(cfg, [16])
+
+        mock_allocate.assert_not_called()
+        self.assertEqual(tensors["attn.0"].numel(), 0)
+        self.assertIs(tensors["attn.shared"], tensors["attn.0"])
 
     def test_from_kv_cache_config_skips_mamba_group(self) -> None:
         cfg = _kv_cache_config(

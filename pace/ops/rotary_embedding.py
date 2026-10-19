@@ -245,11 +245,21 @@ def _compute_yarn_cos_sin_cache(
     max_position_embeddings: int,
     rope_scaling: Dict[str, Any],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    factor = rope_scaling["factor"]
+    factor = rope_scaling.get("factor")
     original_max_position_embeddings = rope_scaling.get(
         "original_max_position_embeddings", max_position_embeddings
     )
-    if "original_max_position_embeddings" in rope_scaling:
+    # DeepSeek-V3 (and others) omit `factor` and instead express the scaling as
+    # the ratio between the extended and the pretrained context length. One of
+    # the two has to be declared: with neither, the ratio collapses to 1.0 and
+    # YaRN silently degrades to no scaling at all, which hides a broken config
+    # behind plausible-looking output.
+    if factor is None:
+        PACE_ASSERT(
+            "original_max_position_embeddings" in rope_scaling,
+            "YaRN RoPE requires either `factor` or "
+            "`original_max_position_embeddings` in rope_scaling; got neither.",
+        )
         factor = max_position_embeddings / original_max_position_embeddings
 
     attention_factor = rope_scaling.get("attention_factor")
@@ -516,7 +526,13 @@ class RotaryEmbedding(OperatorBase):
         position_ids: torch.Tensor,
         return_cos_sin: bool = False,
         offsets: Optional[torch.Tensor] = None,
+        unsqueeze_dim: int = 1,
     ) -> Union[Callable, Tuple[torch.Tensor, torch.Tensor]]:
+        # ``unsqueeze_dim`` selects the layout the returned callable expects: 1
+        # for BHSD (the decoder path, and the default) or 2 for BSHD. Callers
+        # holding BSHD tensors would otherwise have to transpose into BHSD and
+        # back around every call. ``apply_rotary_emb`` accepts either, fused
+        # kernel included.
 
         # Since just indexing is done, we do not implement a custom backend
         # @TODO: have a method which applies the rotary embedding to the input tensor
@@ -545,7 +561,7 @@ class RotaryEmbedding(OperatorBase):
             self.apply_rotary_emb,
             cos=cos,
             sin=sin,
-            unsqueeze_dim=1,
+            unsqueeze_dim=unsqueeze_dim,
         )
 
     def _apply_rotary_emb(
@@ -580,6 +596,19 @@ class RotaryEmbedding(OperatorBase):
                 return torch.cat((o1, o2), dim=-1)
             else:
                 return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    def apply_rotary_to(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        unsqueeze_dim: int = 1,
+        is_neox_style: bool = True,
+    ) -> torch.Tensor:
+        """Apply RoPE to a single BHSD/BSHD tensor at the given cos/sin."""
+        return self._apply_rotary_emb(
+            x.contiguous(), cos, sin, unsqueeze_dim, is_neox_style
+        )
 
     def apply_rotary_emb(
         self,
@@ -628,8 +657,8 @@ class RotaryEmbedding(OperatorBase):
             except Exception:
                 pass
 
-        query = self._apply_rotary_emb(query, cos, sin, unsqueeze_dim, is_neox_style)
-        key = self._apply_rotary_emb(key, cos, sin, unsqueeze_dim, is_neox_style)
+        query = self.apply_rotary_to(query, cos, sin, unsqueeze_dim, is_neox_style)
+        key = self.apply_rotary_to(key, cos, sin, unsqueeze_dim, is_neox_style)
         return query, key
 
     def extra_repr(self):

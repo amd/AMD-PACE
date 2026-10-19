@@ -23,8 +23,8 @@ from transformers.utils import (
 )
 
 from pace.llm.configs import OperatorConfig
-from pace.llm.models.model_list import get_model_class
-from pace.llm.models.base_model import BaseModelForCausalLM
+from pace.llm.models.model_list import get_encoder_model_class, get_model_class
+from pace.llm.models.base_model import BaseModel
 from pace.utils.logging import PACE_LLM_INFO
 
 
@@ -115,10 +115,10 @@ def get_weight_iterator(
 
 
 def load_weights(
-    model: BaseModelForCausalLM,
+    model: BaseModel,
     model_path: Union[str, os.PathLike],
     disable_tqdm: Optional[bool] = False,
-) -> BaseModelForCausalLM:
+) -> BaseModel:
     """
     Load weights from a checkpoint file into the model.
     Check for the following conditions to load model weights:
@@ -183,7 +183,8 @@ def init_model(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     opconfig: Optional[OperatorConfig] = None,
     disable_tqdm: Optional[bool] = False,
-) -> BaseModelForCausalLM:
+    encoder: bool = False,
+) -> BaseModel:
     """
     Initialize the model from the given model path, with the given dtype.
     Load the model weights from the checkpoint file.
@@ -191,6 +192,9 @@ def init_model(
     Args:
         model_path: Path to the model checkpoint.
         dtype: Data type to initialize the model with.
+        encoder: If True, resolve ``architectures[0]`` against the encoder
+            table (``EmbeddingModel``). If False, against the decoder table
+            (``LLMModel`` / generation backend).
 
     Returns:
         Model with weights loaded.
@@ -199,7 +203,8 @@ def init_model(
     model_config = AutoConfig.from_pretrained(model_path)
     model_arch = model_config.architectures[0]
     PACE_LLM_INFO(f"Creating the model: {model_arch}")
-    model_class = get_model_class(model_arch)
+    resolver = get_encoder_model_class if encoder else get_model_class
+    model_class = resolver(model_arch)
 
     with set_default_torch_dtype(dtype):
         with no_init_weights():
@@ -225,12 +230,17 @@ def get_tokenizer(
         Tokenizer.
     """
 
+    # fix_mistral_regex only changes Mistral tokenizers saved with the faulty pre-tokenizer regex.
     try:
         # If tokenizer path is specificed, it gets priority
         if tokenizer_path is not None:
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path, fix_mistral_regex=True
+            )
         else:
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, fix_mistral_regex=True
+            )
     except OSError:
         error_message = "Tokenizer not found at {model_path}"
         if tokenizer_path is not None:

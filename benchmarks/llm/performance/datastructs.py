@@ -49,12 +49,18 @@ class ModelArgs(BaseData):
 
 @dataclass
 class GenerationArgs(BaseData):
-    input_tokens: int
+    input_tokens: Optional[int]
     output_tokens: int
     batch_size: int
     kv_cache_type: str
     do_sample: bool
     manual_seed: int
+
+    def to_dict(self):
+        dict_val = copy.deepcopy(vars(self))
+        if self.input_tokens is None:
+            dict_val.pop("input_tokens")
+        return dict_val
 
 
 @dataclass

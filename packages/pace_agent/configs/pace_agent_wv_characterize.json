@@ -1,0 +1,16 @@
+{
+    "workload": "webvoyager",
+    "characterize_runs": 10,
+    "characterize": { "strategy": "auto", "granularity": "action", "min_success": 3, "keep_trajectories": false },
+    "task_defaults": { "max_iter": 12, "capture_snapshots": true },
+    "tasks": [
+        { "query": "derivative of x^2 when x=5.6", "start_url": "https://www.wolframalpha.com/" },
+        { "query": "Provide a recipe for vegetarian lasagna with more than 100 reviews and a rating of at least 4.5 stars suitable for 6 people.", "start_url": "https://www.allrecipes.com/" },
+        { "query": "Find a report on the BBC News website about recent developments in renewable energy technologies in the UK.", "start_url": "https://www.bbc.com/news/" }
+    ],
+    "llm_backend": { "type": "openai", "base_url": "ADD YOUR LLM ENDPOINT HERE (e.g. http://localhost:8000/v1)", "model": "openai/gpt-oss-20b", "temperature": 0.0, "seed": 0, "max_tokens": 1024, "api_key_env": "ADD YOUR API-KEY ENV VAR HERE (if the endpoint needs auth)", "subscription_header": "ADD YOUR GATEWAY KEY HEADER HERE (e.g. Ocp-Apim-Subscription-Key; omit if none)" },
+    "num_runs": 1,
+    "warmup_runs": 0,
+    "parallel": 1,
+    "cores_per_worker": 4
+}

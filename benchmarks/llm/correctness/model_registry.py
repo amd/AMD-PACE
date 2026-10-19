@@ -37,6 +37,12 @@ MODELS = {
     "Gemma4ForConditionalGeneration": ModelInfo(
         "Gemma4ForConditionalGeneration", "google/gemma-4-E2B"
     ),
+    "Qwen3_5ForConditionalGeneration": ModelInfo(
+        "Qwen3_5ForConditionalGeneration", "Qwen/Qwen3.5-0.8B"
+    ),
+    "Qwen3_5MoeForConditionalGeneration": ModelInfo(
+        "Qwen3_5MoeForConditionalGeneration", "Qwen/Qwen3.5-35B-A3B"
+    ),
     "GptOssForCausalLM": ModelInfo("GptOssForCausalLM", "openai/gpt-oss-20b"),
 }
 

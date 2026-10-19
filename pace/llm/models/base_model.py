@@ -14,16 +14,19 @@ from pace.ops.base import BackendBase
 from pace.utils.logging import PACE_LLM_ASSERT, PACE_LLM_DEBUG
 
 
-class BaseModelForCausalLM(ABC, nn.Module):
+class BaseModel(ABC, nn.Module):
     """
     Abstract base class for all models.
 
-    All models should subclass this class and should implement
-    the forward and load_weights methods.
+    Subclasses differ in what a forward pass means -- autoregressive against a
+    KV cache (:class:`BaseModelForCausalLM`) or a single bidirectional pass
+    over the whole sequence (:class:`BaseModelForEmbedding`) -- so `forward` is
+    declared by those subclasses. Everything around it is the same for both
+    families and lives here: config handling, checkpoint name mapping, and
+    backend preprocessing.
     """
 
     rename_layers: Dict[str, str] = None
-    target_map: Dict[str, List[str]] = None
 
     def __init__(self, config: PretrainedConfig):
 
@@ -44,25 +47,6 @@ class BaseModelForCausalLM(ABC, nn.Module):
             PretrainedConfig: The model configuration.
         """
         return self.config
-
-    @abstractmethod
-    def forward(self, input_ids, positions, kv_cache):
-        """
-        Forward pass for the model.
-
-        Args:
-            input_ids (torch.LongTensor): Only the new (unprocessed) token IDs.
-                The caller is responsible for sending only tokens not yet in the
-                KV cache. Shape: [batch_size, num_new_tokens].
-            positions (torch.LongTensor): Absolute position indices for each token
-                in input_ids. Computed by the caller from a num_computed_tokens
-                counter. Shape: [batch_size, num_new_tokens].
-            kv_cache: The key-value cache manager (KVCacheManager or list of them).
-
-        Returns:
-            ModelOutput: The model outputs containing logits.
-        """
-        pass
 
     @abstractmethod
     def load_weights(self, *args, **kwargs):
@@ -90,3 +74,34 @@ class BaseModelForCausalLM(ABC, nn.Module):
                     f"with backend: {backend.__class__.__name__}"
                 )
                 backend.preprocess(module)
+
+
+class BaseModelForCausalLM(BaseModel):
+    """
+    Abstract base class for autoregressive (decoder) models.
+
+    All such models should subclass this class and should implement
+    the forward and load_weights methods.
+    """
+
+    target_map: Dict[str, List[str]] = None
+    supports_eviction_rope: bool = False
+
+    @abstractmethod
+    def forward(self, input_ids, positions, kv_cache):
+        """
+        Forward pass for the model.
+
+        Args:
+            input_ids (torch.LongTensor): Only the new (unprocessed) token IDs.
+                The caller is responsible for sending only tokens not yet in the
+                KV cache. Shape: [batch_size, num_new_tokens].
+            positions (torch.LongTensor): Absolute position indices for each token
+                in input_ids. Computed by the caller from a num_computed_tokens
+                counter. Shape: [batch_size, num_new_tokens].
+            kv_cache: The key-value cache manager (KVCacheManager or list of them).
+
+        Returns:
+            ModelOutput: The model outputs containing logits.
+        """
+        pass

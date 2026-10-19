@@ -40,6 +40,8 @@ class PaceUnquantizedLinearMethod(UnquantizedLinearMethod):
     TPP-packed weights, falling back to stock CPU dispatch for shapes
     libXSMM cannot handle."""
 
+    supports_pre_processed_weights = False
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         packed = tpp_prepack(layer.weight.data)
         if packed is None:

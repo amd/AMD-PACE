@@ -6,6 +6,7 @@
 
 import random
 from collections.abc import Generator
+from itertools import islice
 from typing import Optional
 
 import tqdm
@@ -13,6 +14,10 @@ import torch
 from transformers import PreTrainedTokenizer, BatchEncoding
 
 from utils import PACE_LLM_ASSERT, PACE_LLM_INFO
+
+GSM8K_DATASET = "openai/gsm8k"
+GSM8K_CONFIG = "main"
+GSM8K_REVISION = "2c868b8af0ba15693ce607396871eb07802efab1"
 
 
 class BenchMarkDataGenerator(Generator):
@@ -22,9 +27,11 @@ class BenchMarkDataGenerator(Generator):
 
     Args:
         tokenizer (PreTrainedTokenizer): Tokenizer to use.
-        input_tokens (int): Number of tokens to generate.
+        input_tokens (int, optional): Fixed input length. Shorter inputs are
+            padded and longer inputs are truncated.
         batch_size (int): Number of input samples to generate.
         use_real_data (bool, optional): If True, real data from the dataset is used. Defaults to False.
+        deterministic (bool, optional): Return real-data batches in dataset order.
 
     Yields:
         Tuple[torch.Tensor, torch.Tensor]: Input tensor and attention mask.
@@ -33,17 +40,33 @@ class BenchMarkDataGenerator(Generator):
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
-        input_tokens: int,
+        input_tokens: Optional[int],
         batch_size: int,
         max_iter: Optional[int] = None,
         use_real_data: Optional[bool] = False,
+        deterministic: bool = False,
     ):
         self.tokenizer = tokenizer
         self.input_tokens = input_tokens
         self.batch_size = batch_size
+        self.deterministic = deterministic
+        self.use_fixed_input_length = input_tokens is not None
+        self.next_data_index = 0
 
         self.data_in_memory = []
+        PACE_LLM_ASSERT(
+            not deterministic or use_real_data,
+            "deterministic data selection requires use_real_data=True.",
+        )
+        PACE_LLM_ASSERT(
+            self.use_fixed_input_length or batch_size == 1,
+            "Unpadded benchmark inputs require batch_size=1.",
+        )
         if not use_real_data:
+            PACE_LLM_ASSERT(
+                input_tokens is not None,
+                "Random benchmark inputs require input_tokens.",
+            )
             self.generate_random_input(tokenizer, input_tokens, batch_size)
         else:
             self.generate_from_real_data(tokenizer, input_tokens, batch_size, max_iter)
@@ -70,8 +93,10 @@ class BenchMarkDataGenerator(Generator):
         PACE_LLM_INFO(
             f"Generating random input of {input_tokens} tokens for {batch_size} samples"
         )
-        input_ids = random.choices(list(tokenizer.get_vocab().values()), k=input_tokens)
-        input_ids = torch.tensor([input_ids] * batch_size)
+        vocab_ids = list(tokenizer.get_vocab().values())
+        input_ids = torch.tensor(
+            [random.choices(vocab_ids, k=input_tokens) for _ in range(batch_size)]
+        )
 
         PACE_LLM_ASSERT(
             input_ids.shape == (batch_size, input_tokens),
@@ -86,29 +111,41 @@ class BenchMarkDataGenerator(Generator):
     def generate_from_real_data(
         self,
         tokenizer: PreTrainedTokenizer,
-        input_tokens: int,
+        input_tokens: Optional[int],
         batch_size: int,
         max_iter: Optional[int] = None,
     ):
 
         from datasets import load_dataset
 
-        # @Question: Should we allow the user to specify the dataset name and version?
-        dataset_name = "openai/gsm8k"
-        dataset_version = "main"
-
         tokenizer.padding_side = "left"
 
+        input_description = (
+            f"{input_tokens} fixed tokens"
+            if self.use_fixed_input_length
+            else "unpadded token lengths"
+        )
         PACE_LLM_INFO(
-            f"Generating real data input of {input_tokens} tokens for {batch_size} batch size using {dataset_name}: v{dataset_version}."
+            f"Generating real data input with {input_description} for "
+            f"{batch_size} batch size using {GSM8K_DATASET}: {GSM8K_REVISION}."
         )
 
-        dataset = load_dataset(dataset_name, dataset_version)["test"]
+        dataset = load_dataset(
+            GSM8K_DATASET,
+            GSM8K_CONFIG,
+            split="test",
+            revision=GSM8K_REVISION,
+        )
         batched_data = dataset.batch(batch_size=batch_size, drop_last_batch=True)
+        if self.deterministic and max_iter is not None:
+            PACE_LLM_ASSERT(
+                max_iter <= len(batched_data),
+                "GSM8K does not contain enough distinct batches for all runs.",
+            )
         max_iter = min(max_iter, len(batched_data)) if max_iter else len(batched_data)
 
-        for idx, data in enumerate(
-            tqdm.tqdm(batched_data, desc="Tokenizing data", total=max_iter)
+        for data in tqdm.tqdm(
+            islice(batched_data, max_iter), desc="Tokenizing data", total=max_iter
         ):
             data_val = data["question"]
             if tokenizer.chat_template:
@@ -121,29 +158,42 @@ class BenchMarkDataGenerator(Generator):
                     for q in data_val
                 ]
 
-            input_encoded = tokenizer(
-                data_val,
-                padding="max_length",
-                truncation=True,
-                max_length=input_tokens,
-                return_tensors="pt",
-            )
-            PACE_LLM_ASSERT(
-                input_encoded["input_ids"].shape == (batch_size, input_tokens),
-                f"Input tensor shape is incorrect, expected: {(batch_size, input_tokens)}, got: {input_encoded['input_ids'].shape}",
-            )
+            if self.use_fixed_input_length:
+                input_encoded = tokenizer(
+                    data_val,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=input_tokens,
+                    return_tensors="pt",
+                )
+                PACE_LLM_ASSERT(
+                    input_encoded["input_ids"].shape == (batch_size, input_tokens),
+                    f"Input tensor shape is incorrect, expected: {(batch_size, input_tokens)}, got: {input_encoded['input_ids'].shape}",
+                )
+            else:
+                input_encoded = tokenizer(
+                    data_val,
+                    padding=False,
+                    truncation=False,
+                    return_tensors="pt",
+                )
             self.data_in_memory.append(input_encoded)
-            if idx == max_iter:
-                break
 
     def send(self, value) -> BatchEncoding:
         """
-        Always return a random sample from the data in memory.
-        This make sure that the benchmark is not dictated by the number of samples in the dataset.
+        Return the next deterministic batch or a random sample from memory.
 
         Returns:
             BatchEncoding: Input tensor and attention mask.
         """
+        if self.deterministic:
+            PACE_LLM_ASSERT(
+                self.next_data_index < len(self.data_in_memory),
+                "No deterministic data batches remain.",
+            )
+            data = self.data_in_memory[self.next_data_index]
+            self.next_data_index += 1
+            return data
         random_idx = random.choice(range(len(self.data_in_memory)))
         return self.data_in_memory[random_idx]
 

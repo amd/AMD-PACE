@@ -6,6 +6,7 @@
 #include <ATen/ATen.h>
 #include <immintrin.h>
 #include <omp.h>
+#include <ops/kernels/avx512_bf16_utils.h>
 #include "ops/kernels/fused_rope.h"
 
 namespace pace {
@@ -13,19 +14,6 @@ namespace pace {
 namespace kernels {
 
 namespace impl {
-
-// To Do: Move these functions to a common header file.
-
-static inline __m512 load_bf16_fp32(const at::BFloat16* p) {
-  __m256bh raw =
-      (__m256bh)_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-  return _mm512_cvtpbh_ps(raw);
-}
-
-static inline void store_fp32_bf16(at::BFloat16* p, __m512 v) {
-  __m256bh packed = _mm512_cvtneps_pbh(v);
-  _mm256_storeu_si256(reinterpret_cast<__m256i*>(p), (__m256i)packed);
-}
 
 static at::Tensor fused_rope_apply_impl(
     const at::Tensor& x,

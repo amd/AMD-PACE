@@ -1,6 +1,7 @@
 # *******************************************************************************
-# Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
+# Portions of this file consist of AI-generated content
 # *******************************************************************************
 
 import os
@@ -15,7 +16,8 @@ from transformers import (
 )
 
 from pace.llm.attention import KVCacheType
-from pace.llm.generator import Generator
+from pace.llm.attention.eviction import EvictionConfig
+from pace.llm.generation import GenerationBackendConfig, NativeGenerationBackendConfig
 from pace.llm.outputs import GeneratorOutput
 from pace.llm.configs import SamplingConfig, OperatorConfig, SpecDecodeConfig
 
@@ -39,6 +41,10 @@ class LLMModel(object):
         dtype (:obj:`torch.dtype`, `optional`, defaults to :obj:`torch.bfloat16`):
             The data type to use for the model. The model will be loaded in this dtype.
             If not provided, the model will be loaded in torch.bfloat16.
+        eviction_config (:obj:`EvictionConfig`, `optional`):
+            Enables StreamingLLM / EQUIP KV eviction on contiguous caches
+            (``KVCacheType.DYNAMIC`` / ``BMC``). Decode keeps at most
+            ``sink_size + recent_size`` slots.
 
     Examples:
         >>> model_name = "meta-llama/Llama-3.1-8B"
@@ -56,49 +62,30 @@ class LLMModel(object):
         model_name_or_path: Union[str, os.PathLike],
         tokenizer_name_or_path: Optional[Union[str, os.PathLike]] = None,
         dtype: Optional[torch.dtype] = torch.bfloat16,
-        kv_cache_type: Optional[KVCacheType] = KVCacheType.DYNAMIC,
+        kv_cache_type: Optional[KVCacheType] = None,
         spec_config: Optional[SpecDecodeConfig] = None,
         opconfig: Optional[OperatorConfig] = None,
+        generation_backend_config: Optional[GenerationBackendConfig] = None,
         disable_tqdm: bool = False,
+        cache_kwargs: Optional[dict] = None,
+        eviction_config: Optional[EvictionConfig] = None,
     ):
-
-        self.generator = Generator(
-            model_name_or_path=model_name_or_path,
-            tokenizer_name_or_path=tokenizer_name_or_path,
-            dtype=dtype,
-            kv_cache_type=kv_cache_type,
-            spec_config=spec_config,
-            opconfig=opconfig,
-            disable_tqdm=disable_tqdm,
-        )
-
-    @classmethod
-    def for_serving(
-        cls,
-        model_name_or_path: Union[str, os.PathLike],
-        dtype: Optional[torch.dtype] = torch.bfloat16,
-        kv_cache_type: Optional[KVCacheType] = KVCacheType.DYNAMIC,
-        opconfig: Optional[OperatorConfig] = None,
-    ):
-        """
-        A class method to create an LLMModel instance for serving.
-        This is a convenience method that sets some default parameters for serving.
-        """
-        return cls(
-            model_name_or_path=model_name_or_path,
-            dtype=dtype,
-            opconfig=opconfig,
-            disable_tqdm=True,
-            kv_cache_type=kv_cache_type,
-        )
-
-    @torch.inference_mode()
-    def step(self, *args, **kwargs):
-        """
-        Perform a single generation step. This is a wrapper around the generator's step method.
-        This is an advanced feature for users who want to control the generation process step-by-step.
-        """
-        return self.generator.step(*args, **kwargs)
+        config = generation_backend_config
+        if config is None:
+            config = NativeGenerationBackendConfig()
+        backend_kwargs = {
+            "serving": False,
+            "tokenizer_name_or_path": tokenizer_name_or_path,
+            "dtype": dtype,
+            "disable_tqdm": disable_tqdm,
+            "kv_cache_type": kv_cache_type
+            or (KVCacheType.PAGED if dtype == torch.float32 else KVCacheType.SLAB_POOL),
+            "spec_config": spec_config,
+            "opconfig": opconfig,
+            "cache_kwargs": cache_kwargs,
+            "eviction_config": eviction_config,
+        }
+        self._backend = config.initialize_backend(model_name_or_path, **backend_kwargs)
 
     @torch.inference_mode()
     def generate(
@@ -108,19 +95,24 @@ class LLMModel(object):
         text_streamer: Optional[TextStreamer] = None,
     ) -> GeneratorOutput:
         """
-        Generate text from a prompt. generate makes use of the generator to generate text from a prompt.
+        Generate text from a prompt through the configured backend.
         """
 
-        inputs = self.generator.prepare_for_generate(
-            prompt, sampling_config, text_streamer
+        return self._backend.generate(
+            prompt,
+            sampling_config,
+            text_streamer=text_streamer,
         )
-        outputs = self.generator.generate(inputs)
-        return outputs
 
     def __repr__(
         self,
     ):
-        return self.generator.model.__repr__()
+        """Return the underlying model's string representation."""
+        return self._backend.model.__repr__()
+
+    @property
+    def model(self):
+        return self._backend.model
 
     def get_tokenizer(
         self,
@@ -131,7 +123,7 @@ class LLMModel(object):
         Returns:
             PreTrainedTokenizer: The tokenizer
         """
-        return self.generator.get_tokenizer()
+        return self._backend.tokenizer
 
     def get_config(self) -> PretrainedConfig:
         """
@@ -140,4 +132,4 @@ class LLMModel(object):
         Returns:
             PretrainedConfig: The model config
         """
-        return self.generator.get_config()
+        return self._backend.model_config

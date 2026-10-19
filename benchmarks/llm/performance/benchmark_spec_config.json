@@ -21,7 +21,6 @@
     },
     "use_real_data": true,
     "generation_args": {
-        "input_tokens": 128,
         "output_tokens": 128,
         "batch_size": 1,
         "kv_cache_type": "BMC",

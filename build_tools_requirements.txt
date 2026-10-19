@@ -1,0 +1,8 @@
+# Build tooling, without PyTorch. Included by build_requirements.txt and gpu_requirements.txt.
+
+clang-format==22.1.5
+cmake==4.4.0
+setuptools>=77.0.3,<81.0.0
+setuptools-scm>=10.2.0
+ninja>=1.13.0
+wheel>=0.47.0

@@ -4,6 +4,7 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 
+import json
 import os
 
 from pace_agent.rundir import RunDir
@@ -71,6 +72,33 @@ def _render_multi(L, res, opt=None):
             f"- in-run observe A/B: {agg['observe_speedup_median']:.1f}x median "
             "(projection onto E2E comes from `pace-agent optimize`)"
         )
+    ch = agg.get("characterization")
+    if ch:
+        L += [
+            "",
+            "### Path characterization",
+            "",
+            f"- {ch['n_tasks']} task(s) characterized over {ch['live_runs_total']} "
+            f"live run(s) · median modal share {ch['modal_share_median']:.0%} · "
+            f"median normalized entropy {ch['normalized_entropy_median']:.2f}",
+        ]
+        # omitted rather than empty, so an older run dir renders short, not broken
+        for label, key in (
+            ("verdict", "verdict"),
+            ("path", "stability"),
+            ("work", "work_stability"),
+        ):
+            if ch.get(key):
+                L.append(
+                    f"- {label}: " + ", ".join(f"{k} {v}" for k, v in ch[key].items())
+                )
+        L.append(
+            f"- **{ch['n_recorded_outliers']} task(s) recorded a trajectory that is "
+            "still an outlier in its own sample** — their measurements describe an "
+            "atypical run"
+            if ch["n_recorded_outliers"]
+            else "- no task recorded an outlying trajectory"
+        )
     oa = (opt or {}).get("aggregate") or {}
     oe = oa.get("e2e") or {}
     if oe:
@@ -122,6 +150,104 @@ def _render_multi(L, res, opt=None):
         L += [
             f"- `{_text(q.get('query'), 60)}`: {_text(q['error'], 200)}" for q in failed
         ]
+
+
+# The headline; each line must survive being quoted on its own.
+_VERDICT_NOTE = {
+    "representative": "the live runs agreed on both what they did and what it cost, so "
+    "the recorded trajectory stands for the model-task pair",
+    "wide": "the recorded run is the most central one available, but the sample around it "
+    "is broad — treat its absolute numbers as one point in a wide range",
+    "no-majority": "the live runs never converged on a path, so no single recording is "
+    "typical; the measurements below describe one of several behaviours",
+    "unrepresentative": "**the recorded run is itself an outlier in its own sample** — "
+    "the measurements below describe an atypical run",
+    "unsampled": "characterization did not run (a single live run), so representativeness is "
+    "asserted rather than measured",
+}
+
+
+def _read_characterization(run_dir):
+    """The full record, or None: a legacy or single-run profile has only the summary."""
+    try:
+        with open(os.path.join(run_dir, "characterization.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _render_characterization(L, res, run_dir):
+    """What the replayed trajectory was chosen out of, above the measurements it qualifies."""
+    c = res.get("characterization")
+    if not c:
+        return
+    L += [
+        "",
+        "## Path characterization",
+        "",
+        f"- sampled {c.get('n_runs')} of {c.get('n_requested')} live run(s)"
+        + (f", {c['n_failed']} failed" if c.get("n_failed") else "")
+        + f" · {c.get('n_distinct_paths')} distinct path(s)",
+    ]
+    if c.get("verdict"):
+        L.append(f"- **{c['verdict']}** — {_VERDICT_NOTE.get(c['verdict'], '')}")
+    L += [
+        f"- path: **{c.get('stability', '?')}**",
+        f"- work: **{c.get('work_stability', '?')}**",
+    ]
+    if c.get("path_is_uninformative"):
+        # without this, a reader reads "deterministic" as the strongest possible result
+        L.append(
+            "- every run took the same path, so the path axis does not discriminate "
+            "between these runs (an agent with a fixed pipeline can do nothing else). "
+            "The case for representativeness rests on the work axis above."
+        )
+    L += [
+        f"- modal share: {c.get('modal_share', 0):.0%} · normalized entropy: "
+        f"{c.get('normalized_entropy', 0):.2f} (0 = every run agreed, 1 = all differed)",
+        f"- recorded run {c.get('selected_run')} by `{c.get('applied')}`: "
+        f"{c.get('reason', '-')}",
+        f"- typicality of the recorded run: {c.get('typicality_max_abs_z')} "
+        f"max |modified z| across features (a run is flagged as an outlier beyond 3.5)",
+    ]
+    if c.get("outlier_runs"):
+        recorded = (
+            "**the recorded run is one of them**"
+            if c.get("selected_is_outlier")
+            else "none of them was recorded"
+        )
+        L.append(f"- outlier run(s) in the sample: {c['outlier_runs']} — {recorded}")
+    L.append(
+        f"- paths derived from `{c.get('path_source')}` at `{c.get('granularity')}` "
+        f"granularity · {c.get('characterize_s', 0):.0f}s of live runs"
+    )
+
+    dist = (_read_characterization(run_dir) or {}).get("distribution") or {}
+    if dist.get("clusters"):
+        L += ["", "| path | runs | share | steps | recorded |", "|---|---|---|---|---|"]
+        for cl in dist["clusters"]:
+            mark = "yes" if cl.get("digest") == c.get("selected_path_digest") else ""
+            L.append(
+                f"| `{cl.get('digest')}` | {cl.get('count')} "
+                f"| {cl.get('share', 0):.0%} | {cl.get('n_steps')} | {mark} |"
+            )
+    spread = dist.get("work_dispersion") or {}
+    if spread:
+        # for a fixed pipeline the cluster table above is one row; this is the finding
+        L += ["", "| feature | median | min | max | spread / median |"]
+        L.append("|---|---|---|---|---|")
+        for name, f in sorted(spread.items()):
+            L.append(
+                f"| {name} | {f.get('median')} | {f.get('min')} | {f.get('max')} "
+                f"| {f.get('rel_range')} |"
+            )
+    live = (dist.get("numeric") or {}).get("e2e_s") or {}
+    if live.get("n"):
+        L.append(
+            f"\n- live E2E across the sample: median {live.get('median', 0):.1f}s "
+            f"(min {live.get('min', 0):.1f}, max {live.get('max', 0):.1f}) — the "
+            "variance characterization measured, before replay removed it"
+        )
 
 
 def _headline(L, res, opt):
@@ -198,6 +324,8 @@ def render(run_dir):
                 f"· total E2E: {cg.get('total_e2e_ms', 0):.0f} ms "
                 f"· observe median speedup: {_c(cg, 'observe_median_speedup', 0)}×",
             ]
+
+    _render_characterization(L, res, run_dir)
 
     e2e = res.get("e2e")
     if isinstance(e2e, dict):

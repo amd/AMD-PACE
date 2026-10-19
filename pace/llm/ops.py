@@ -47,6 +47,7 @@ class LLMOperatorType(StrEnum):
     QKVProjection = auto()
     RoPE = auto()
     Attention = auto()
+    GatedDeltaNet = auto()
     OutProjection = auto()
     MLP = auto()
     Norm = auto()

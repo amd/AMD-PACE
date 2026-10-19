@@ -6,14 +6,16 @@
 
 from __future__ import annotations
 
+import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch  # noqa: F401
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
 
 from pace_vllm.v1.connector import PaceSlabMetadata
+from pace_vllm.v1.kv_cache import PaceKVCache
 from pace_vllm.v1.worker.cpu_model_runner import PaceModelRunner
 
 
@@ -129,6 +131,41 @@ class TestPaceModelRunnerPrefixLifecycle(unittest.TestCase):
         self.assertEqual(
             events,
             ["retain", "remove:finished", "release", "assign"],
+        )
+
+
+class TestPaceModelRunnerKVInitialization(unittest.TestCase):
+    @unittest.skipUnless(
+        "kv_cache_allocation_context"
+        in inspect.signature(CPUModelRunner.initialize_kv_cache).parameters,
+        "allocation context unavailable",
+    )
+    def test_forwards_allocation_context(self) -> None:
+        runner = PaceModelRunner.__new__(PaceModelRunner)
+        runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+        runner.shared_kv_cache_layers = {}
+        config = MagicMock()
+        cache = MagicMock(layer_names=[])
+        allocation_context = MagicMock()
+
+        with (
+            patch.object(CPUModelRunner, "initialize_kv_cache") as mock_super,
+            patch.object(
+                PaceKVCache,
+                "from_kv_cache_config",
+                return_value=cache,
+            ),
+            patch("pace_vllm.v1.worker.cpu_model_runner.set_current_kv_cache"),
+        ):
+            runner.initialize_kv_cache(
+                config,
+                kv_cache_allocation_context=allocation_context,
+            )
+
+        mock_super.assert_called_once_with(
+            config,
+            False,
+            kv_cache_allocation_context=allocation_context,
         )
 
 

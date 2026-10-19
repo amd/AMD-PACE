@@ -41,6 +41,7 @@ class TestLinearOOTs(unittest.TestCase):
         self.assertTrue(
             issubclass(PaceUnquantizedLinearMethod, UnquantizedLinearMethod)
         )
+        self.assertFalse(PaceUnquantizedLinearMethod.supports_pre_processed_weights)
 
     def test_all_five_linear_subclasses_are_registered(self) -> None:
         from pace_vllm.model_executor.layers.linear import (
@@ -85,6 +86,7 @@ class TestParallelLMHeadOOT(unittest.TestCase):
         self.assertTrue(
             issubclass(PaceUnquantizedEmbeddingMethod, UnquantizedEmbeddingMethod)
         )
+        self.assertFalse(PaceUnquantizedEmbeddingMethod.supports_pre_processed_weights)
 
     def test_vocab_parallel_embedding_substitution(self) -> None:
         # Aliased lm_head = embed_tokens (Qwen2/3, OLMo, GLM4, OPT, ...).

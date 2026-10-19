@@ -152,7 +152,9 @@ class TestMoEExperts(TestCase):
         gate=True,
         bias=False,
         num_shared=0,
+        shared_inter=0,
         routed_scaling=1.0,
+        shared_gate=False,
     ):
         cfg = MoEConfig(
             hidden_size=H,
@@ -163,7 +165,9 @@ class TestMoEExperts(TestCase):
             gate=gate,
             bias=bias,
             num_shared_experts=num_shared,
+            shared_intermediate_size=shared_inter,
             routed_scaling_factor=routed_scaling,
+            shared_expert_gate=shared_gate,
         )
         moe = MoEExperts(cfg, backend_impl=BackendType.NATIVE)
         # Real models run bf16; cast the (fp32-by-default) module to match the
@@ -177,6 +181,10 @@ class TestMoEExperts(TestCase):
         moe.router.weight.data.copy_(torch.randn_like(moe.router.weight) * 0.1)
         if moe.router.bias is not None:
             moe.router.bias.data.zero_()
+        if moe.shared_gate is not None:
+            moe.shared_gate.weight.data.copy_(
+                torch.randn_like(moe.shared_gate.weight) * 0.1
+            )
         torch.manual_seed(0)
         gate_w = [torch.randn(I, H, dtype=torch.bfloat16) * 0.1 for _ in range(E)]
         up_w = [torch.randn(I, H, dtype=torch.bfloat16) * 0.1 for _ in range(E)]
@@ -237,6 +245,64 @@ class TestMoEExperts(TestCase):
         torch.manual_seed(1)
         for p in moe.shared_mlps.parameters():
             p.data.normal_(0, 0.1)
+        x = torch.randn(12, 64, dtype=torch.bfloat16) * 0.1
+        out = moe(x)
+        routed = _reference_moe(x, moe.router(x), gw, uw, dw, moe.topk, "silu", True)
+        shared = sum(m(x).float() for m in moe.shared_mlps)
+        self.assertEqual(out.float(), routed + shared, atol=2e-2, rtol=2e-2)
+
+    def test_shared_experts_can_be_sigmoid_gated(self):
+        moe, gw, uw, dw, *_ = self._build(E=4, num_shared=1, shared_gate=True)
+        torch.manual_seed(1)
+        for p in moe.shared_mlps.parameters():
+            p.data.normal_(0, 0.1)
+        x = torch.randn(12, 64, dtype=torch.bfloat16) * 0.1
+        out = moe(x)
+        routed = _reference_moe(x, moe.router(x), gw, uw, dw, moe.topk, "silu", True)
+        shared = sum(m(x).float() for m in moe.shared_mlps)
+        gate = torch.sigmoid(moe.shared_gate(x).float())
+        self.assertEqual(out.float(), routed + gate * shared, atol=2e-2, rtol=2e-2)
+
+    def test_gated_shared_experts_fold_with_the_gate_as_routing_weight(self):
+        moe = self._build(E=4, num_shared=1, shared_gate=True)[0]
+        self.assertTrue(moe.foldable_shared)
+
+        captured = {}
+
+        class _Recorder:
+            def execute(self, output, hidden, topk_ids, topk_weights, *args):
+                captured["ids"] = topk_ids
+                captured["weights"] = topk_weights
+                return output
+
+        moe.backend = _Recorder()
+        moe._folded_shared = True
+        x = torch.randn(12, 64, dtype=torch.bfloat16) * 0.1
+
+        moe(x)
+
+        shared_ids = captured["ids"][:, -1]
+        shared_w = captured["weights"][:, -1:]
+        expected = torch.sigmoid(moe.shared_gate(x)).to(shared_w.dtype)
+        self.assertEqual(shared_ids, torch.full_like(shared_ids, moe.num_experts))
+        self.assertEqual(shared_w, expected)
+
+    def test_shared_gate_is_built_only_when_shared_experts_are_gated(self):
+        self.assertIsNone(self._build(E=4)[0].shared_gate)
+        self.assertIsNone(self._build(E=4, num_shared=1)[0].shared_gate)
+
+        gated = self._build(E=4, num_shared=1, shared_gate=True)[0]
+        self.assertEqual(tuple(gated.shared_gate.weight.shape), (1, gated.hidden_size))
+
+    def test_shared_experts_can_size_independently_of_routed_experts(self):
+        moe, gw, uw, dw, *_ = self._build(E=4, num_shared=1, shared_inter=32)
+        torch.manual_seed(1)
+        for p in moe.shared_mlps.parameters():
+            p.data.normal_(0, 0.1)
+
+        self.assertEqual(moe.shared_mlps[0].down_proj.weight.shape[1], 32)
+        self.assertFalse(moe.foldable_shared)
+
         x = torch.randn(12, 64, dtype=torch.bfloat16) * 0.1
         out = moe(x)
         routed = _reference_moe(x, moe.router(x), gw, uw, dw, moe.topk, "silu", True)

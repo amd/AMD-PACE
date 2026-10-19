@@ -33,6 +33,11 @@ from pace.llm.attention.prefix_cache import (
     PrefixCacheContextMixin,
     PrefixCacheMixin,
 )
+from pace.llm.attention.recurrent_state import (
+    MergedRecurrentState,
+    RecurrentStateStore,
+    num_recurrent_layers,
+)
 from pace.utils.logging import (
     PACE_INFO,
     PACE_WARNING,
@@ -789,16 +794,17 @@ class _PagedCacheContext(PrefixCacheContextMixin):
 class PagedCache(PrefixCacheMixin, Cache):
     """Engine-level cache backend for paged attention. Implements Cache ABC.
 
-    Mirrors SlabCache: pool is created eagerly in __init__, contexts are
-    created per-request via create_context, batched decode metadata is
-    built in merge_contexts. Server code stays cache-type agnostic.
+    ``reserve_pool()`` allocates serving capacity before requests arrive.
+    Offline callers allocate lazily in ``create_context()``.
 
     Mixes in PrefixCacheMixin for automatic prefix caching (enabled by
-    default; disable via ``PACE_PREFIX_CACHE=0`` or ``enable_prefix_cache=False``).
+    default; disable via ``PACE_PREFIX_CACHE=0`` or ``enable_prefix_cache=False``;
+    always off for Gated DeltaNet models).
     """
 
     _query_start_loc_cache: Dict[Tuple[int, int], torch.Tensor] = {}
     _isa_cache: Optional[str] = None
+    supports_packing = True
 
     def __init__(self, config: PretrainedConfig, **kwargs):
         self._config = config
@@ -815,41 +821,26 @@ class PagedCache(PrefixCacheMixin, Cache):
         head_dim = getattr(
             text_config, "head_dim", text_config.hidden_size // num_heads
         )
-        num_layers = text_config.num_hidden_layers
         self._block_size = kwargs.get("block_size", 16)
         self._dtype = kwargs.get("dtype", torch.bfloat16)
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._num_heads = num_heads
-
-        max_total_tokens = kwargs.get(
-            "max_total_tokens",
-            int(os.getenv("PACE_MAX_CACHE_TOKENS", "262144")),
-        )
-        total_blocks = (max_total_tokens + self._block_size - 1) // self._block_size
-
         self._specs = compute_layer_kv_specs(config)
-
-        PagedKVCachePool.reset()
-        self._pool = PagedKVCachePool(
-            total_blocks=total_blocks,
-            block_size=self._block_size,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            num_layers=num_layers,
-            dtype=self._dtype,
-            specs=self._specs,
+        self._num_layers = len(self._specs)
+        element_size = torch.empty((), dtype=self._dtype).element_size()
+        self._bytes_per_token = sum(
+            2 * spec.num_kv_heads * spec.head_dim * element_size
+            for spec in self._specs
+            if spec.kv_sharing_target is None
         )
-        PACE_INFO(
-            f"PagedCache: pool initialized with {max_total_tokens} tokens, "
-            f"{total_blocks} blocks, {num_layers} layers"
-        )
+        self._pool = None
+        self._reserved_pool_tokens = None
 
         self._init_prefix_cache_from_config(config, "PagedCache", **kwargs)
-        if self.prefix_cache_enabled:
-            self._pool._eviction_callback = self.try_evict_for_allocation
 
         self._next_request_id = 0
+        self._active_context_ids = set()
 
         # Pre-allocated decode tensors
         max_batch = 64
@@ -868,9 +859,104 @@ class PagedCache(PrefixCacheMixin, Cache):
                 self._dtype, self._block_size, head_dim
             )
 
+    def reserve_pool(self) -> None:
+        """
+        Allocate the block pool at its configured size, taken from max_total_tokens, then kv_cache_memory_gb, then PACE_MAX_CACHE_TOKENS.
+
+        A reserved pool is never resized by prepare_batch.
+        """
+        if self._pool is not None:
+            return
+        configured = self._kwargs.get("max_total_tokens")
+        if configured is None:
+            memory_gb = self._kwargs.get("kv_cache_memory_gb")
+            if memory_gb is not None:
+                configured = int(memory_gb * 1024**3) // self._bytes_per_token
+            else:
+                configured = int(os.getenv("PACE_MAX_CACHE_TOKENS", "262144"))
+                PACE_WARNING(
+                    "PAGED serving cache capacity was not configured; reserving "
+                    f"{configured} tokens"
+                )
+        self._reserved_pool_tokens = configured
+        self._initialize_pool(self._reserved_pool_tokens)
+
+    def get_stats(self) -> dict:
+        """Block-pool and prefix-cache statistics."""
+        stats = {}
+        if self._pool is not None:
+            stats["pool"] = self._pool.get_stats()
+        stats["prefix_cache"] = self.get_prefix_cache_stats()
+        return stats
+
+    def prepare_batch(
+        self,
+        max_seq_length: int,
+        batch_size: int,
+        spec_headroom: int = 0,
+    ) -> None:
+        """
+        Size the pool for batch_size sequences of max_seq_length + spec_headroom tokens.
+
+        A configured or reserved pool keeps its size. Otherwise a pool that is too small is rebuilt, which is only allowed while no request is active.
+        """
+        self._ensure_pool(max_seq_length, batch_size, spec_headroom)
+
+    def _initialize_pool(self, max_total_tokens: int) -> None:
+        if self._pool is not None:
+            if self._active_context_ids:
+                raise RuntimeError(
+                    "cannot resize PAGED cache pool while requests are active"
+                )
+            self._on_pool_reset()
+            self._next_request_id = 0
+        total_blocks = (max_total_tokens + self._block_size - 1) // self._block_size
+        PagedKVCachePool.reset()
+        self._pool = PagedKVCachePool(
+            total_blocks=total_blocks,
+            block_size=self._block_size,
+            num_kv_heads=self._num_kv_heads,
+            head_dim=self._head_dim,
+            num_layers=self._num_layers,
+            dtype=self._dtype,
+            specs=self._specs,
+        )
+        PACE_INFO(
+            f"PagedCache: pool initialized with {max_total_tokens} tokens, "
+            f"{total_blocks} blocks, {self._num_layers} layers"
+        )
+
+        if self.prefix_cache_enabled:
+            self._pool._eviction_callback = self.try_evict_for_allocation
+
+    def _ensure_pool(
+        self,
+        max_seq_length: int,
+        batch_size: int,
+        spec_headroom: int,
+    ) -> None:
+        blocks_per_sequence = (
+            max_seq_length + spec_headroom + self._block_size - 1
+        ) // self._block_size
+        required_blocks = blocks_per_sequence * batch_size
+        if self._pool is None and (
+            "max_total_tokens" in self._kwargs or "kv_cache_memory_gb" in self._kwargs
+        ):
+            self.reserve_pool()
+        if self._pool is not None and self._pool.total_blocks >= required_blocks:
+            return
+        if self._pool is not None and self._reserved_pool_tokens is not None:
+            return
+        self._initialize_pool(required_blocks * self._block_size)
+
     def create_context(
         self, config: PretrainedConfig, max_seq_length: int, **kwargs
     ) -> _PagedCacheContext:
+        self._ensure_pool(
+            max_seq_length,
+            kwargs.get("batch_size", 1),
+            kwargs.get("spec_headroom", 0),
+        )
         pool_request_id = self._next_request_id
         self._next_request_id += 1
 
@@ -888,8 +974,13 @@ class PagedCache(PrefixCacheMixin, Cache):
             )
             for layer_idx in range(num_layers)
         ]
+        recurrent_state = RecurrentStateStore(num_recurrent_layers(config))
+        manager.recurrent_state = recurrent_state
 
-        return _PagedCacheContext(manager, pool_request_id=pool_request_id)
+        context = _PagedCacheContext(manager, pool_request_id=pool_request_id)
+        context.recurrent_state = recurrent_state
+        self._active_context_ids.add(pool_request_id)
+        return context
 
     @staticmethod
     def _fill_block_table(block_table, kv_managers, max_blocks_per_seq, pool):
@@ -1031,6 +1122,7 @@ class PagedCache(PrefixCacheMixin, Cache):
         merged = _PagedCacheContext(kv_managers[0])
         merged.paged_attn_metadata = meta
         merged._all_managers = kv_managers
+        self._attach_recurrent_state(merged, kv_managers)
         return merged
 
     def merge_contexts_mixed(
@@ -1152,7 +1244,15 @@ class PagedCache(PrefixCacheMixin, Cache):
         merged = _PagedCacheContext(kv_managers[0])
         merged.paged_attn_metadata = meta
         merged._all_managers = kv_managers
+        self._attach_recurrent_state(merged, kv_managers)
         return merged
+
+    @staticmethod
+    def _attach_recurrent_state(merged, kv_managers):
+        stores = [getattr(m, "recurrent_state", None) for m in kv_managers]
+        if any(s is None or s.num_layers == 0 for s in stores):
+            return
+        merged.recurrent_state = MergedRecurrentState(stores)
 
     def build_prefill_metadata(self, context, seq_len, past_len=0):
         """Build single-sequence metadata for prefill or draft decode."""
@@ -1180,9 +1280,8 @@ class PagedCache(PrefixCacheMixin, Cache):
 
     # ---- PrefixCacheMixin hooks ----
 
-    def _claim_prefix_blocks_impl(
-        self, context, token_ids, matched_blocks, num_matched_tokens
-    ):
+    def _claim_prefix_blocks_impl(self, context, matched_blocks, num_matched_tokens):
+        """Start the request's block list with the matched prefix blocks and mark that many tokens as cached in every layer."""
         if context.pool_request_id is None:
             return
         rid = context.pool_request_id
@@ -1203,11 +1302,11 @@ class PagedCache(PrefixCacheMixin, Cache):
         return []
 
     def _reserve_blocks_for_context(self, context, num_full_blocks):
-        rid = getattr(context, "pool_request_id", None)
-        if rid is None:
+        request_id = getattr(context, "pool_request_id", None)
+        if request_id is None:
             return []
-        self._pool.ensure_blocks_for_request(rid, num_full_blocks)
-        return self._pool.get_blocks_for_request(rid)
+        self._pool.ensure_blocks_for_request(request_id, num_full_blocks)
+        return self._pool.get_blocks_for_request(request_id)
 
     def _free_duplicate_block(self, block_idx: int) -> None:
         if block_idx not in self._pool.free_blocks:
@@ -1256,6 +1355,7 @@ class PagedCache(PrefixCacheMixin, Cache):
         rid = getattr(context, "pool_request_id", None)
         if rid is None:
             return
+        self._active_context_ids.discard(rid)
         # Resolve this request's cache-owned blocks before _release_prefix_refs
         # clears its held hashes; they survive completion (freed via LRU only).
         cached = set()

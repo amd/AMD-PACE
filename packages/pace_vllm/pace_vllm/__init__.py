@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 
 # Extend this hard-coded range only after end-to-end verification because
 # pace-vllm integrates with vLLM's internal APIs.
-_PACE_VLLM_SUPPORTED_VLLM_RANGE = ">=0.25.0,<=0.28.0"
+_PACE_VLLM_SUPPORTED_VLLM_RANGE = ">=0.28.0,<=0.30.0"
 
 
 # Module-level logger. Re-initialised by `_init_logging()` on first

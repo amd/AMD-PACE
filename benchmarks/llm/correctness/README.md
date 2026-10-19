@@ -85,4 +85,6 @@ When `model_name` is set to `"all"`, the following architectures are tested:
 | Phi3ForCausalLM | microsoft/Phi-4-mini-instruct |
 | Gemma3ForCausalLM | unsloth/gemma-3-270m |
 | Gemma4ForConditionalGeneration | google/gemma-4-E2B |
+| Qwen3_5ForConditionalGeneration | Qwen/Qwen3.5-0.8B |
+| Qwen3_5MoeForConditionalGeneration | Qwen/Qwen3.5-35B-A3B |
 | GptOssForCausalLM | openai/gpt-oss-20b |

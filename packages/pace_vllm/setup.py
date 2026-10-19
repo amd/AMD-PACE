@@ -51,16 +51,14 @@ def _find_pace_artifact() -> "Path | None":
     return libpace if libpace.exists() else None
 
 
-def _check_required_deps() -> None:
-    """Raise RuntimeError if vllm or torch isn't importable."""
-    for pkg in ("vllm", "torch"):
-        try:
-            __import__(pkg)
-        except ImportError as exc:
-            raise RuntimeError(
-                f"pace-vllm: {pkg} is not installed; "
-                f"see packages/pace_vllm/build_requirements.txt."
-            ) from exc
+def _check_torch_available() -> None:
+    """Require Torch for the build; vLLM is checked when the plugin registers."""
+    try:
+        import torch  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "pace-vllm: torch is not installed; see build_requirements.txt."
+        ) from exc
 
 
 def _build_pace_cpp_only() -> None:
@@ -103,7 +101,7 @@ class BuildPy(_build_py):
                 "pace-vllm: out-of-monorepo installs are not supported yet. "
                 "Install from `packages/pace_vllm` inside amd-pace."
             )
-        _check_required_deps()
+        _check_torch_available()
 
         super().run()
 

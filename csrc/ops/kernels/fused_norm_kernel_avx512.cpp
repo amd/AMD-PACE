@@ -11,6 +11,9 @@
 #include <ATen/ATen.h>
 #include <immintrin.h>
 #include <omp.h>
+#include <ops/exp_approx.h>
+#include <ops/kernels/avx512_bf16_utils.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -18,17 +21,6 @@
 namespace pace {
 namespace kernels {
 namespace impl {
-
-static inline __m512 load_bf16_fp32(const at::BFloat16* p) {
-  __m256bh raw =
-      (__m256bh)_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-  return _mm512_cvtpbh_ps(raw);
-}
-
-static inline void store_fp32_bf16(at::BFloat16* p, __m512 v) {
-  __m256bh packed = _mm512_cvtneps_pbh(v);
-  _mm256_storeu_si256(reinterpret_cast<__m256i*>(p), (__m256i)packed);
-}
 
 /**
  * Unified AVX-512 normalization kernel.
@@ -197,6 +189,95 @@ at::Tensor rmsnorm(const at::Tensor& x, const at::Tensor& weight, double eps) {
       num_rows,
       C);
   return out.reshape(orig_shape);
+}
+
+at::Tensor rmsnorm_gated(
+    const at::Tensor& input,
+    const at::Tensor& gate,
+    const at::Tensor& weight,
+    double eps) {
+  const auto orig_shape = input.sizes();
+  const int64_t D = orig_shape.back();
+  const int64_t N = input.numel() / D;
+
+  auto x = input.contiguous();
+  auto g = gate.contiguous();
+  auto output = at::empty({N, D}, input.options());
+
+  const at::BFloat16* __restrict__ x_ptr = x.data_ptr<at::BFloat16>();
+  const at::BFloat16* __restrict__ g_ptr = g.data_ptr<at::BFloat16>();
+  const at::BFloat16* __restrict__ w_ptr = weight.data_ptr<at::BFloat16>();
+  at::BFloat16* __restrict__ o_ptr = output.data_ptr<at::BFloat16>();
+
+  const int64_t vec_end = D & ~15LL;
+  const float eps_f = static_cast<float>(eps);
+
+  EXP_APPROX_AVX512_CONSTANTS();
+  const __m512 one_v = _mm512_set1_ps(1.0f);
+  const __m512 zero_v = _mm512_setzero_ps();
+  // The shared exp approximation only clamps its input from below, so
+  // exp(-gate) overflows for gate < -88. The gate itself is clamped, not just
+  // exp's argument, so SiLU stays ~0 even for huge negative gates (SiLU(-88)
+  // is already -5e-37).
+  constexpr float kMinSiluArg = -88.0f;
+  const __m512 min_silu_arg_v = _mm512_set1_ps(kMinSiluArg);
+
+#pragma omp parallel for schedule(static) if (N > 1)
+  for (int64_t i = 0; i < N; ++i) {
+    const at::BFloat16* xi = x_ptr + i * D;
+    const at::BFloat16* gi = g_ptr + i * D;
+    at::BFloat16* oi = o_ptr + i * D;
+
+    // Pass 1: variance
+    __m512 var_acc = _mm512_setzero_ps();
+    for (int64_t j = 0; j < vec_end; j += 16) {
+      __m512 v = impl::load_bf16_fp32(xi + j);
+      var_acc = _mm512_fmadd_ps(v, v, var_acc);
+    }
+    float variance = _mm512_reduce_add_ps(var_acc);
+    for (int64_t j = vec_end; j < D; ++j) {
+      float v = static_cast<float>(xi[j]);
+      variance += v * v;
+    }
+
+    float inv_rms = 1.0f / std::sqrt(variance / static_cast<float>(D) + eps_f);
+    __m512 inv_rms_v = _mm512_set1_ps(inv_rms);
+
+    // Pass 2: normalize, scale by weight, multiply by SiLU(gate)
+    for (int64_t j = 0; j < vec_end; j += 16) {
+      __m512 xv = impl::load_bf16_fp32(xi + j);
+      __m512 wv = impl::load_bf16_fp32(w_ptr + j);
+      __m512 gv = impl::load_bf16_fp32(gi + j);
+
+      // RMSNorm: weight * (x * inv_rms)
+      __m512 normed = _mm512_mul_ps(_mm512_mul_ps(xv, inv_rms_v), wv);
+
+      // SiLU(gate) = gate / (1 + exp(-gate)), fully vectorized through the
+      // shared exp approximation (same one the attention softmax uses).
+      // MAXPS returns its second operand when either is NaN, so the gate goes
+      // second to keep a NaN gate NaN.
+      const __m512 gc = _mm512_max_ps(min_silu_arg_v, gv);
+      __m512 exp_neg_g;
+      EXP_APPROX_AVX512(_mm512_sub_ps(zero_v, gc), exp_neg_g);
+      __m512 silu_v = _mm512_div_ps(gc, _mm512_add_ps(one_v, exp_neg_g));
+
+      impl::store_fp32_bf16(oi + j, _mm512_mul_ps(normed, silu_v));
+    }
+
+    // Scalar tail
+    for (int64_t j = vec_end; j < D; ++j) {
+      float xv = static_cast<float>(xi[j]);
+      float wv = static_cast<float>(w_ptr[j]);
+      float gv = static_cast<float>(gi[j]);
+      float normed = xv * inv_rms * wv;
+      const float gc = std::max(gv, kMinSiluArg);
+      float exp_neg_g;
+      EXP_APPROX_SCALAR(-gc, exp_neg_g);
+      oi[j] = at::BFloat16(normed * gc / (1.0f + exp_neg_g));
+    }
+  }
+
+  return output.reshape(orig_shape);
 }
 
 std::tuple<at::Tensor, at::Tensor> fused_add_rmsnorm(

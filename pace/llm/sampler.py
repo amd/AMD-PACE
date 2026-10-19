@@ -1,11 +1,11 @@
 # *******************************************************************************
-# Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
 # Portions of this file consist of AI-generated content
 # *******************************************************************************
 
 from functools import partial
-from typing import Optional
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import math
@@ -30,7 +30,8 @@ class Sampler(object):
         input_encodings: torch.Tensor,
     ) -> None:
         self.sampling_config = sampling_config
-        self._set_sampling_seed(sampling_config.sampling_seed)
+        self._sampling_seed = sampling_config.sampling_seed
+        self._generators: Dict[str, torch.Generator] = {}
         self.repetition_penalty = self.sampling_config.repetition_penalty
         self.frequency_penalty = self.sampling_config.frequency_penalty
         self.initial_input_length = input_encodings.shape[-1]
@@ -57,20 +58,24 @@ class Sampler(object):
             sampling_config.sampling_mode == SamplingMode.GREEDY_SEARCH
             and self.repetition_penalty == 1.0
             and self.frequency_penalty == 0.0
-            and getattr(sampling_config, "min_new_tokens", 0) == 0
             and not getattr(sampling_config, "return_probs", False)
             and not getattr(sampling_config, "return_logprobs", False)
         )
 
-    def _set_sampling_seed(self, sampling_seed: Optional[int] = None) -> None:
-        """
-        Set the seed for sampling operations. This is useful for reproducibility.
+    def _generator_for(self, device: torch.device) -> Optional[torch.Generator]:
+        if self._sampling_seed is None:
+            return None
+        key = str(device)
+        generator = self._generators.get(key)
+        if generator is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self._sampling_seed)
+            self._generators[key] = generator
+        return generator
 
-        Args:
-            sampling_seed: Seed for sampling operations
-        """
-        if sampling_seed is not None:
-            torch.manual_seed(sampling_seed)
+    def share_rng_with(self, other: "Sampler") -> None:
+        if self._sampling_seed == other._sampling_seed:
+            self._generators = other._generators
 
     # Top-k, Top-p, Min-p samplers adapted from Huggingface's transformers library
     # https://github.com/huggingface/transformers/blob/v4.44.0/src/transformers/generation/logits_process.py
@@ -182,6 +187,41 @@ class Sampler(object):
             scores_processed = torch.where(eos_token_mask, -math.inf, logits)
         return scores_processed
 
+    def min_new_tokens_pending(self, input_encodings: torch.Tensor) -> bool:
+        return input_encodings.shape[-1] < (
+            self.initial_input_length + self.sampling_config.min_new_tokens
+        )
+
+    @staticmethod
+    def sample_batch(
+        samplers: Sequence["Sampler"],
+        input_encodings: Sequence[torch.Tensor],
+        logits: Union[torch.Tensor, Sequence[torch.Tensor]],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Run the homogeneous greedy fast path for a request batch."""
+        if not all(sampler._greedy_fast_path for sampler in samplers):
+            return None
+
+        batched_logits = (
+            logits if isinstance(logits, torch.Tensor) else torch.cat(logits, dim=0)
+        )
+        rows_to_mask = [
+            index
+            for index, (sampler, inputs) in enumerate(zip(samplers, input_encodings))
+            if sampler.min_new_tokens_pending(inputs)
+        ]
+        if rows_to_mask:
+            batched_logits = batched_logits.clone()
+            for index in rows_to_mask:
+                eos_ids = samplers[index].sampling_config.eos_token_id.to(
+                    batched_logits.device
+                )
+                batched_logits[index, eos_ids] = -torch.inf
+
+        valid_rows = ~torch.isnan(batched_logits).any(dim=-1)
+        next_tokens = torch.argmax(batched_logits, dim=-1)
+        return next_tokens, valid_rows
+
     def sample(
         self,
         input_encodings: torch.Tensor,
@@ -206,14 +246,16 @@ class Sampler(object):
         # Greedy fast path: direct argmax, skip softmax/topk/temperature.
         # Eligibility pre-decided at __init__ (no per-call overhead).
         if self._greedy_fast_path:
+            if self.sampling_config.min_new_tokens > 0:
+                logits = self.set_min_new_tokens(logits, input_encodings)
             next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
             return SamplerOutput(next_tokens, None, None)
 
         if self.sampling_config.min_new_tokens > 0:
             logits = self.set_min_new_tokens(logits, input_encodings)
 
-        # Penalties expect 2D [batch, vocab]. For speculative decode logits are
-        # 3D [batch, num_candidates, vocab] — flatten, apply, then restore.
+        # Sampling preprocessors expect 2D [batch, vocab]. Speculative logits
+        # remain flattened until sampling is complete.
         needs_reshape = logits.dim() == 3
         if needs_reshape:
             batch, num_cand, vocab = logits.shape
@@ -224,9 +266,6 @@ class Sampler(object):
             logits = self.apply_repetition_penalty(logits, input_encodings)
         if self.frequency_penalty != 0.0:
             logits = self.apply_frequency_penalty(logits, input_encodings)
-
-        if needs_reshape:
-            logits = logits.reshape(batch, num_cand, vocab)
 
         # Apply temperature scaling.
         if self.sampling_config.temperature != 1.0:
@@ -247,12 +286,21 @@ class Sampler(object):
         if self.sampling_config.sampling_mode == SamplingMode.GREEDY_SEARCH:
             next_tokens = torch.argmax(probs, dim=-1, keepdim=True)
         else:  # By default, use random sampling
-            next_tokens = torch.multinomial(probs, num_samples=1)
+            next_tokens = torch.multinomial(
+                probs,
+                num_samples=1,
+                generator=self._generator_for(probs.device),
+            )
 
         # Make sure the next token is valid.
         PACE_LLM_ASSERT(
             next_tokens is not None or torch.isnan(next_tokens).any(),
             "Invalid next token sampled, something went wrong!",
         )
+
+        if needs_reshape:
+            probs = probs.reshape(batch, num_cand, vocab)
+            logprobs = logprobs.reshape(batch, num_cand, vocab)
+            next_tokens = next_tokens.reshape(batch, num_cand, 1)
 
         return SamplerOutput(next_tokens, probs, logprobs)

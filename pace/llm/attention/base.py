@@ -83,6 +83,23 @@ class CacheContext(ABC):
 class Cache(ABC):
     """Engine-level cache backend. Created once at startup."""
 
+    supports_packing = False
+
+    def reserve_pool(self) -> None:
+        """Allocate serving capacity before the first request. Caches that allocate per request do nothing."""
+
+    def prepare_batch(
+        self,
+        max_seq_length: int,
+        batch_size: int,
+        spec_headroom: int = 0,
+    ) -> None:
+        """Reserve capacity before request contexts are created."""
+
+    def get_stats(self) -> dict:
+        """Pool and prefix-cache statistics, empty for caches that keep none."""
+        return {}
+
     @abstractmethod
     def create_context(
         self, config: PretrainedConfig, max_seq_length: int, **kwargs
@@ -149,6 +166,10 @@ class KVCacheManager(CacheContext):
     ):
         from pace.llm.attention import get_kv_cache_class
         from pace.llm.attention.specs import compute_layer_kv_specs
+        from pace.llm.attention.recurrent_state import (
+            RecurrentStateStore,
+            num_recurrent_layers,
+        )
 
         self.token = token
         self.cache_type = cache_type
@@ -168,6 +189,11 @@ class KVCacheManager(CacheContext):
                     cache_objects[spec.kv_sharing_target], token=token
                 )
         self.cache_objects: List[KVCacheBase] = cache_objects
+
+        # Per-request Gated DeltaNet (linear-attention) recurrent/conv state.
+        # Empty for full-attention-only models. Owned by the request context so
+        # it batches and is released with the KV cache (online serving).
+        self.recurrent_state = RecurrentStateStore(num_recurrent_layers(config))
 
     def __len__(self) -> int:
         return int(self.cache_objects[0].seq_len)

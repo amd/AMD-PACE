@@ -29,7 +29,7 @@ from pace.server.engine.utils import (
     MixedStepRequest,
     PrefillRequest,
 )
-from pace.server.engine.server import model_executor, Sequence
+from pace.server.engine.server import model_executor
 
 from pace.server.model_list import SUPPORTED_MODEL_LIST
 
@@ -120,7 +120,26 @@ def step_auto_mixed(req: MixedStepRequest):
 
         prefill_sequences: List = []
         prefill_errors: Dict[str, Any] = {}
+        validated_prefills = []
         for pr in prefill_requests:
+            try:
+                req_uuid = uuid.UUID(pr.req_id)
+            except Exception as error:
+                prefill_errors[str(pr.req_id)] = {
+                    "status": "ERROR",
+                    "error": str(error),
+                }
+                continue
+            validated_prefills.append((pr, req_uuid))
+
+        request_ids = [req_uuid for _, req_uuid in validated_prefills]
+        if len(request_ids) != len(set(request_ids)):
+            raise HTTPException(
+                status_code=400,
+                detail="duplicate request IDs in prefill batch",
+            )
+
+        for pr, req_uuid in validated_prefills:
             rid = pr.req_id
             prompt_token_ids = pr.prompt
             generation_config = pr.generation_config or {}
@@ -130,29 +149,17 @@ def step_auto_mixed(req: MixedStepRequest):
                 else {}
             )
             try:
-                req_uuid = uuid.UUID(rid)
-
                 existing_seq = model_executor.prefill_queue.get(req_uuid)
                 if existing_seq is not None:
                     prefill_sequences.append(existing_seq)
                     continue
 
-                spec_headroom = 0
-                if model_executor._spec_decoder is not None:
-                    spec_headroom = (
-                        model_executor._spec_decoder.num_speculative_tokens + 1
-                    )
-                seq = Sequence(
-                    req_id=req_uuid,
-                    input_token_ids=prompt_token_ids,
-                    model_config=model_executor.model_config,
-                    cache_backend=model_executor._cache_backend,
-                    _prepare_sampling_config=model_executor._model.generator._prepare_sampling_config,
-                    genConfig=gen_config_dict if gen_config_dict else None,
-                    spec_headroom=spec_headroom,
-                    tokenizer=model_executor._tokenizer,
+                seq = model_executor.create_sequence(
+                    req_uuid,
+                    prompt_token_ids,
+                    gen_config_dict if gen_config_dict else None,
                 )
-                model_executor.prefill_queue[seq.id] = seq
+                model_executor.prefill_queue[req_uuid] = seq
                 prefill_sequences.append(seq)
             except Exception as e:
                 PACE_WARNING(f"Failed to create sequence for {rid}: {e}")
@@ -249,14 +256,9 @@ def get_cache_stats():
     gauges (``pace_prefix_cache_*``, ``pace_kv_cache_usage_perc``).
     """
     stats = {}
-    backend = getattr(model_executor, "_cache_backend", None)
+    backend = model_executor.cache_backend
     if backend is not None:
-        # Paged exposes the pool as ``_pool``; slab as ``_manager``.
-        pool = getattr(backend, "_pool", None) or getattr(backend, "_manager", None)
-        if pool is not None and hasattr(pool, "get_stats"):
-            stats["pool"] = pool.get_stats()
-        if hasattr(backend, "get_prefix_cache_stats"):
-            stats["prefix_cache"] = backend.get_prefix_cache_stats()
+        stats = backend.get_stats()
     return {"status": "success", "cache_stats": stats}
 
 
@@ -271,18 +273,14 @@ def get_sequences():
             prefill_sequences.append(
                 {
                     "id": str(seq_id),
-                    "state": sequence.state.name,
-                    "input_length": (
-                        sequence.input_encoded.input_ids.shape[-1]
-                        if hasattr(sequence, "input_encoded")
-                        else 0
-                    ),
+                    "state": "PREFILL",
+                    "input_length": sequence.prompt_length,
                     "max_new_tokens": (
                         sequence.sampling_config.max_new_tokens
                         if hasattr(sequence, "sampling_config")
                         else 0
                     ),
-                    "total_tokens": sequence._token_len,
+                    "total_tokens": sequence.token_count,
                 }
             )
 
@@ -290,18 +288,14 @@ def get_sequences():
             decode_sequences.append(
                 {
                     "id": str(seq_id),
-                    "state": sequence.state.name,
-                    "input_length": (
-                        sequence.input_encoded.input_ids.shape[-1]
-                        if hasattr(sequence, "input_encoded")
-                        else 0
-                    ),
+                    "state": "DECODING",
+                    "input_length": sequence.prompt_length,
                     "max_new_tokens": (
                         sequence.sampling_config.max_new_tokens
                         if hasattr(sequence, "sampling_config")
                         else 0
                     ),
-                    "total_tokens": sequence._token_len,
+                    "total_tokens": sequence.token_count,
                 }
             )
 
@@ -361,19 +355,15 @@ def get_sequence_by_id(sequence_id: str):
                 "status": "success",
                 "sequence": {
                     "id": str(seq_uuid),
-                    "state": sequence.state.name,
+                    "state": "PREFILL",
                     "queue": "prefill",
-                    "input_length": (
-                        sequence.input_encoded.input_ids.shape[-1]
-                        if hasattr(sequence, "input_encoded")
-                        else 0
-                    ),
+                    "input_length": sequence.prompt_length,
                     "max_new_tokens": (
                         sequence.sampling_config.max_new_tokens
                         if hasattr(sequence, "sampling_config")
                         else 0
                     ),
-                    "total_tokens": sequence._token_len,
+                    "total_tokens": sequence.token_count,
                     "sampling_config": (
                         {
                             "temperature": (
@@ -404,19 +394,15 @@ def get_sequence_by_id(sequence_id: str):
                 "status": "success",
                 "sequence": {
                     "id": str(seq_uuid),
-                    "state": sequence.state.name,
+                    "state": "DECODING",
                     "queue": "decode",
-                    "input_length": (
-                        sequence.input_encoded.input_ids.shape[-1]
-                        if hasattr(sequence, "input_encoded")
-                        else 0
-                    ),
+                    "input_length": sequence.prompt_length,
                     "max_new_tokens": (
                         sequence.sampling_config.max_new_tokens
                         if hasattr(sequence, "sampling_config")
                         else 0
                     ),
-                    "total_tokens": sequence._token_len,
+                    "total_tokens": sequence.token_count,
                     "sampling_config": (
                         {
                             "temperature": (

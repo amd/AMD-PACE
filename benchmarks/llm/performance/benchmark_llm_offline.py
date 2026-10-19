@@ -77,7 +77,7 @@ class HuggingFaceOfflineFramework(BenchmarkOfflineFramework):
             "max_new_tokens": generation_args.output_tokens,
             "min_new_tokens": generation_args.output_tokens,
             "streamer": self.streamer,
-            "do_sample": generation_args.do_sample,
+            "do_sample": (generation_args.do_sample and model_args.spec_config is None),
         }
 
     def generate(self, inputs: torch.Tensor) -> GeneratorOutput:
@@ -167,8 +167,12 @@ class PACEOfflineFramework(BenchmarkOfflineFramework):
             "max_new_tokens": generation_args.output_tokens,
             "min_new_tokens": generation_args.output_tokens,
             "streamer": self.streamer,
-            "do_sample": generation_args.do_sample,
-            "temperature": (torch.rand(1).item() if generation_args.do_sample else 0),
+            "do_sample": generation_args.do_sample and spec_config is None,
+            "temperature": (
+                torch.rand(1).item()
+                if generation_args.do_sample and spec_config is None
+                else 0
+            ),
             "seed": generation_args.manual_seed,
         }
 
@@ -237,20 +241,31 @@ class VLLMOfflineFramework(BenchmarkOfflineFramework):
             }
 
         # Init model
-        self.model = LLM(
-            model_args.model_name,
-            dtype=model_args.dtype,
-            seed=(
+        llm_kwargs = {
+            "dtype": model_args.dtype,
+            "seed": (
                 generation_args.manual_seed if generation_args.manual_seed else 1
             ),  # New vLLM (V1) sets default seed to 1 but cannot pass None
-            enable_prefix_caching=False,
-            speculative_config=speculative_config,
-        )
+            "enable_prefix_caching": False,
+            "disable_log_stats": not token_args.time_to_first_token,
+            "speculative_config": speculative_config,
+        }
+        try:
+            self.model = LLM(model_args.model_name, **llm_kwargs)
+        except TypeError as err:
+            if "disable_log_stats" not in str(err):
+                raise
+            llm_kwargs.pop("disable_log_stats")
+            self.model = LLM(model_args.model_name, **llm_kwargs)
 
         gen_kwargs = {
             "max_tokens": generation_args.output_tokens,
             "min_tokens": generation_args.output_tokens,
-            "temperature": torch.rand(1).item() if generation_args.do_sample else 1.0,
+            "temperature": (
+                0.0
+                if speculative_config is not None
+                else (torch.rand(1).item() if generation_args.do_sample else 1.0)
+            ),
         }
 
         self.sampling_params = SamplingParams(**gen_kwargs)
@@ -277,14 +292,17 @@ class VLLMOfflineFramework(BenchmarkOfflineFramework):
         out = self.model.generate(prompts, self.sampling_params, use_tqdm=False)
         end_time = time.perf_counter()
 
-        # There is no direct way to get the time to first token
-        # w.r.to the start_time. So we calculate it using
-        # the metrics returned by the model
+        # Use vLLM's native TTFT metric, with a legacy timestamp fallback.
         ttft = None
         if self.token_args.time_to_first_token:
-            ttft = fmean(
-                [response.metrics.first_token_time for response in out]
-            ) - fmean([response.metrics.arrival_time for response in out])
+            ttfts = []
+            for response in out:
+                metrics = response.metrics
+                latency = getattr(metrics, "first_token_latency", None)
+                if latency is None:
+                    latency = metrics.first_token_time - metrics.arrival_time
+                ttfts.append(latency)
+            ttft = fmean(ttfts)
         output_tokens = torch.tensor(
             [response.outputs[0].token_ids for response in out]
         ).shape[-1]
@@ -340,7 +358,7 @@ class ZenTorchOfflineFramework(BenchmarkOfflineFramework):
             "max_new_tokens": generation_args.output_tokens,
             "min_new_tokens": generation_args.output_tokens,
             "streamer": self.streamer,
-            "do_sample": generation_args.do_sample,
+            "do_sample": (generation_args.do_sample and model_args.spec_config is None),
         }
         self.model = zentorch.llm.optimize(self.model, self.model.dtype)
         self.model.forward = torch.compile(self.model.forward, backend="zentorch")
@@ -395,6 +413,16 @@ def benchmark(
     PACE_LLM_INFO(
         f"Running benchmark for model: {model_args.model_name} using {framework} framework"
     )
+    if model_args.spec_config is not None:
+        PACE_LLM_ASSERT(
+            generation_args.input_tokens is None,
+            "input_tokens must not be set for speculative decoding benchmarks.",
+        )
+        PACE_LLM_ASSERT(
+            generation_args.batch_size == 1,
+            "Speculative decoding benchmarks require batch_size=1 "
+            "to avoid input padding.",
+        )
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name)
@@ -407,7 +435,8 @@ def benchmark(
         generation_args.input_tokens,
         generation_args.batch_size,
         max_iter=warmup_runs + num_runs,
-        use_real_data=use_real_data,
+        use_real_data=use_real_data or model_args.spec_config is not None,
+        deterministic=model_args.spec_config is not None,
     )
 
     # Start system monitor as soon as possible
@@ -521,7 +550,8 @@ def main():
             args.output_dir,
             f"{frameworks_tag}_{args.model_args.model_name.replace('/', '--')}"
             f"_{args.model_args.dtype}_bs{args.generation_args.batch_size}"
-            f"_it{args.generation_args.input_tokens}_nt{args.generation_args.output_tokens}"
+            f"_it{'real' if args.generation_args.input_tokens is None else args.generation_args.input_tokens}"
+            f"_nt{args.generation_args.output_tokens}"
             f"_{timestamp}",
         )
         output_file = f"{output_file_prefix}_results.json"

@@ -1,0 +1,6 @@
+# Developer convenience for a GPU build: requirements.txt without the CPU torch pin.
+
+-r build_tools_requirements.txt
+-r runtime_requirements.txt
+-r dev_requirements.txt
+accelerate>=1.13.0

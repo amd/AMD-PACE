@@ -4,7 +4,7 @@
 # Portions of this file consist of AI-generated content
 # ******************************************************************************
 
-"""PACE FusedMoE OOT for vLLM's monolithic CPU path."""
+"""PACE FusedMoE OOT for vLLM's CPU path."""
 
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 
 try:
-    from vllm.model_executor.layers.fused_moe.cpu_fused_moe import select_experts
-except ImportError:
+    from vllm.model_executor.layers.fused_moe.router.cpu_router import select_experts
+except ImportError:  # vLLM 0.28
     from vllm.model_executor.layers.fused_moe.experts.cpu_moe import select_experts
 
 from pace_vllm.model_executor.layers.utils import tpp_prepack_moe
@@ -51,8 +51,9 @@ def _resolve_activation_str(layer) -> str:
 
 @CustomOp.register_oot(name="UnquantizedFusedMoEMethod")
 class PaceUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
-    """Route vLLM's monolithic CPU MoE through PACE."""
+    """Route vLLM's CPU MoE through PACE."""
 
+    supports_pre_processed_weights = False
     _SUPPORTED_ACTIVATIONS = frozenset({"silu", "gelu", "relu", "gptoss_glu"})
 
     # SwigluOAI checkpoints alternate gate/up rows; other supported activations
@@ -136,7 +137,9 @@ class PaceUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Resolve eagerly because enum inspection causes a Dynamo graph break.
         layer._pace_activation_str = act
         # Keep router selection outside the compiled forward.
-        layer._pace_cpp_router = self._decide_router(layer)
+        layer._pace_cpp_router = (
+            self._decide_router(layer) if self.is_monolithic else None
+        )
         # vLLM may still read the original weights after this hook.
         logger.info(
             "pace-vllm: FusedMoE %s packed into TPP layout "
@@ -185,22 +188,7 @@ class PaceUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if not getattr(layer, "_pace_use_fused_moe", False):
             return super().apply_monolithic(layer, x, router_logits, input_ids)
 
-        act = getattr(layer, "_pace_activation_str", None)
-        if act is None:
-            act = _resolve_activation_str(layer)
-        if act not in self._SUPPORTED_ACTIVATIONS:
-            raise NotImplementedError(
-                f"PaceFusedMoE supports activations "
-                f"{sorted(self._SUPPORTED_ACTIVATIONS)}; got {act!r}."
-            )
-        if act == "gptoss_glu":
-            self._check_gptoss_glu_params(layer)
-
-        orig_shape = x.shape
         x2d = x.reshape(-1, x.shape[-1]).contiguous()
-        num_experts = int(
-            getattr(layer, "global_num_experts", None) or layer.num_experts
-        )
 
         cpp_router = getattr(layer, "_pace_cpp_router", None)
         if cpp_router == _PACE_SOFTMAX_ROUTER:
@@ -221,9 +209,47 @@ class PaceUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
                 e_score_correction_bias=getattr(layer, "e_score_correction_bias", None),
             )
-            topk_ids = topk_ids.to(torch.int64).contiguous()
-            topk_weights = topk_weights.to(torch.float32).contiguous()
+        return self._apply_pace_experts(layer, x, topk_weights, topk_ids)
 
+    def apply(
+        self,
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        shared_experts,
+        shared_experts_input,
+    ):
+        if not getattr(layer, "_pace_use_fused_moe", False):
+            return super().apply(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+            )
+        return self._apply_pace_experts(layer, x, topk_weights, topk_ids)
+
+    def _apply_pace_experts(self, layer, x, topk_weights, topk_ids):
+        act = getattr(layer, "_pace_activation_str", None)
+        if act is None:
+            act = _resolve_activation_str(layer)
+        if act not in self._SUPPORTED_ACTIVATIONS:
+            raise NotImplementedError(
+                f"PaceFusedMoE supports activations "
+                f"{sorted(self._SUPPORTED_ACTIVATIONS)}; got {act!r}."
+            )
+        if act == "gptoss_glu":
+            self._check_gptoss_glu_params(layer)
+
+        orig_shape = x.shape
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+        topk_ids = topk_ids.to(torch.int64).contiguous()
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+        num_experts = int(
+            getattr(layer, "global_num_experts", None) or layer.num_experts
+        )
         output = torch.zeros_like(x2d)
         torch.ops.pace.libxsmm_moe_engine(
             output,
@@ -243,8 +269,12 @@ class PaceUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def _check_gptoss_glu_params(self, layer) -> None:
         """Reject parameters that differ from the hardcoded kernel values."""
-        alpha = getattr(layer, "gemm1_alpha", None)
-        limit = getattr(layer, "gemm1_clamp_limit", None)
+        alpha = getattr(layer, "gemm1_alpha", getattr(layer, "swiglu_alpha", None))
+        limit = getattr(
+            layer,
+            "gemm1_clamp_limit",
+            getattr(layer, "swiglu_limit", None),
+        )
         if alpha is not None and float(alpha) != _GPTOSS_ALPHA:
             raise NotImplementedError(
                 f"PaceFusedMoE gptoss_glu hardcodes alpha={_GPTOSS_ALPHA}; "

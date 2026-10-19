@@ -43,7 +43,7 @@ When the plugin loads cleanly you'll see, in order:
 
 ```
 Loading plugin pace
-pace-vllm: vllm 0.28.0 satisfies supported range '>=0.25.0,<=0.28.0'.
+pace-vllm: vllm 0.30.0 satisfies supported range '>=0.28.0,<=0.30.0'.
 pace-vllm: loaded bundled libpace_cpp.so via torch.ops.load_library.
 pace-vllm: native surfaces live (torch.ops.pace.rmsnorm, torch.classes.pace.SlabPool).
 pace-vllm: plugin active, PacePlatform registered.
@@ -92,11 +92,9 @@ remains correct.
 
 ## vLLM version compatibility
 
-`pace_vllm.register()` checks the installed `vllm.__version__` against a hard-coded supported range before loading any native libraries or registering the platform. The range lives in `_PACE_VLLM_SUPPORTED_VLLM_RANGE` at the top of [`pace_vllm/__init__.py`](../pace_vllm/__init__.py); the current value is `>=0.25.0,<=0.28.0`.
+`pace_vllm.register()` checks the installed `vllm.__version__` against a hard-coded supported range before loading any native libraries or registering the platform. The range lives in `_PACE_VLLM_SUPPORTED_VLLM_RANGE` at the top of [`pace_vllm/__init__.py`](../pace_vllm/__init__.py); the current value is `>=0.28.0,<=0.30.0`.
 
-This range is verified end-to-end (unit suite + offline `LLM.generate` + `vllm serve`) on 0.28.0. 0.25.0, 0.25.1, and 0.26.0 remain in-range; they were not re-run this cycle. Plugin changes this cycle are shims (`select_experts` import, ModelConfig attention geometry, hybrid-Mamba prefix-cache disable) that keep those versions on the previous code paths. 0.23.x and 0.24.x are no longer supported.
-
-> **vLLM 0.25.0 + FFmpeg caveat:** on hosts without system FFmpeg libraries, vLLM 0.25.0 aborts at import time — `torchcodec` raises `OSError` loading its shared libs, which vLLM only catches as `ImportError`, so the failure propagates through `vllm.multimodal.video`. This is a vLLM-side bug fixed in 0.25.1 ([vllm-project/vllm#47888](https://github.com/vllm-project/vllm/pull/47888)), unrelated to pace-vllm. Installing FFmpeg (e.g. `conda install -c conda-forge ffmpeg`) or upgrading to 0.25.1 resolves it.
+pace-vllm supports vLLM versions 0.28.0 through 0.30.0. vLLM 0.30.0 is validated across the full pace-vllm compatibility matrix. Versions before 0.28.0 are not supported.
 
 There is no env-var override — changing the supported range requires a source edit and end-to-end re-verification.
 

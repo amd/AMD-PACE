@@ -96,7 +96,7 @@ class TestSampler(TestCase):
             top_p=1.0,
             min_p=0,
             eos_token_id=[0],
-            sampling_seed=42,
+            seed=42,
         )
         config.verify_max_new_tokens()
         config.finalize()
@@ -109,6 +109,46 @@ class TestSampler(TestCase):
         output2 = sampler2.sample(input_tensor, logits)
 
         self.assertTrue(torch.equal(output1.next_tokens, output2.next_tokens))
+
+    def test_seed_does_not_mutate_global_rng(self):
+        config = SamplingConfig(
+            do_sample=True,
+            temperature=1.0,
+            eos_token_id=[0],
+            seed=42,
+        )
+        config.verify_max_new_tokens()
+        config.finalize()
+        torch.manual_seed(7)
+        expected = torch.rand(4)
+        torch.manual_seed(7)
+
+        sampler = Sampler(config, input_tensor)
+        sampler.sample(input_tensor, torch.ones(2, 5))
+
+        self.assertEqual(torch.rand(4), expected)
+
+    def test_samplers_can_share_one_seeded_stream(self):
+        config = SamplingConfig(
+            do_sample=True,
+            temperature=1.0,
+            eos_token_id=[0],
+            seed=42,
+        )
+        config.verify_max_new_tokens()
+        config.finalize()
+        first = Sampler(config, input_tensor)
+        second = Sampler(config, input_tensor)
+        second.share_rng_with(first)
+        logits = torch.ones(2, 100)
+
+        first.sample(input_tensor, logits)
+        generator = first._generators["cpu"]
+        state_after_first = generator.get_state().clone()
+        second.sample(input_tensor, logits)
+
+        self.assertIs(second._generators["cpu"], generator)
+        self.assertFalse(torch.equal(generator.get_state(), state_after_first))
 
     def test_large_top_k_sampling(self):
         config = SamplingConfig(
@@ -124,6 +164,37 @@ class TestSampler(TestCase):
         logits = torch.randn(3, 4)
         output = sampler.sample(input_tensor, logits)
         self.assertEqual(output.next_tokens.shape, (3, 1))
+
+    def test_speculative_top_p_preserves_batch_and_candidate_axes(self):
+        config = SamplingConfig(
+            do_sample=False,
+            top_p=0.9,
+            eos_token_id=[0],
+            return_logprobs=True,
+        )
+        config.verify_max_new_tokens()
+        config.finalize()
+        for batch_size, vocab_size in ((1, 10), (2, 8)):
+            with self.subTest(batch_size=batch_size):
+                inputs = input_tensor[:batch_size]
+                sampler = Sampler(config, inputs)
+                output = sampler.sample(
+                    inputs,
+                    torch.randn(batch_size, 3, vocab_size),
+                )
+
+                self.assertEqual(
+                    output.next_tokens.shape,
+                    (batch_size, 3, 1),
+                )
+                self.assertEqual(
+                    output.probs.shape,
+                    (batch_size, 3, vocab_size),
+                )
+                self.assertEqual(
+                    output.logprobs.shape,
+                    (batch_size, 3, vocab_size),
+                )
 
     def test_zero_temperature(self):
         config = SamplingConfig(
@@ -229,14 +300,53 @@ class TestSampler(TestCase):
         s3 = Sampler(sample_config, input_tensor)
         self.assertFalse(s3._greedy_fast_path)
 
-        # Greedy with min_new_tokens: NOT eligible (needs EOS masking)
+        # Greedy with min_new_tokens remains eligible; fast path masks EOS.
         min_tokens_config = SamplingConfig(
             do_sample=False, min_new_tokens=4, eos_token_id=[0]
         )
         min_tokens_config.verify_max_new_tokens()
         min_tokens_config.finalize()
         s4 = Sampler(min_tokens_config, input_tensor)
-        self.assertFalse(s4._greedy_fast_path)
+        self.assertTrue(s4._greedy_fast_path)
+
+    def test_greedy_fast_path_masks_eos_until_min_tokens(self):
+        prompt = torch.tensor([[4, 5]])
+        config = SamplingConfig(
+            do_sample=False,
+            min_new_tokens=2,
+            eos_token_id=[0],
+        )
+        config.verify_max_new_tokens()
+        config.finalize()
+        sampler = Sampler(config, prompt)
+        logits = torch.tensor([[10.0, 9.0, 1.0]])
+
+        before_min = sampler.sample(prompt, logits)
+        at_min = sampler.sample(torch.tensor([[4, 5, 1, 1]]), logits)
+
+        self.assertEqual(before_min.next_tokens.item(), 1)
+        self.assertEqual(at_min.next_tokens.item(), 0)
+
+    def test_greedy_batch_masks_only_rows_below_min_tokens(self):
+        prompt = torch.tensor([[4]])
+        config = SamplingConfig(
+            do_sample=False,
+            min_new_tokens=2,
+            eos_token_id=[0],
+        )
+        config.verify_max_new_tokens()
+        config.finalize()
+        samplers = [Sampler(config, prompt), Sampler(config, prompt)]
+        logits = torch.tensor([[10.0, 9.0], [10.0, 9.0]])
+
+        tokens, valid = Sampler.sample_batch(
+            samplers,
+            [prompt, torch.tensor([[4, 1, 1]])],
+            logits,
+        )
+
+        self.assertEqual(tokens, torch.tensor([1, 0]))
+        self.assertTrue(valid.all())
 
     def test_greedy_fast_path_matches_slow_path(self):
         """Greedy fast path produces same tokens as full pipeline."""

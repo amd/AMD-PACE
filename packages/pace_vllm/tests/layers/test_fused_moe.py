@@ -22,9 +22,13 @@ from pace_vllm.model_executor.layers.fused_moe import (
 from pace_vllm.model_executor.layers.utils import tpp_prepack_moe
 
 
-def _make_method() -> PaceUnquantizedFusedMoEMethod:
+def _make_method(monolithic: bool = True) -> PaceUnquantizedFusedMoEMethod:
     """Create an instance without vLLM's backend-dependent initialization."""
-    return object.__new__(PaceUnquantizedFusedMoEMethod)
+    method = object.__new__(PaceUnquantizedFusedMoEMethod)
+    method.moe_kernel = None
+    method.experts_cls = SimpleNamespace(is_monolithic=lambda: monolithic)
+    method.moe_quant_config = None
+    return method
 
 
 def _make_layer(**overrides) -> SimpleNamespace:
@@ -61,6 +65,7 @@ class TestPaceFusedMoeRegistration(unittest.TestCase):
         self.assertTrue(
             issubclass(PaceUnquantizedFusedMoEMethod, UnquantizedFusedMoEMethod)
         )
+        self.assertFalse(PaceUnquantizedFusedMoEMethod.supports_pre_processed_weights)
 
 
 class TestApplyMonolithicGuards(unittest.TestCase):
@@ -95,6 +100,26 @@ class TestApplyMonolithicGuards(unittest.TestCase):
         ) as mock_super:
             out = method.apply_monolithic(layer, x, rl)
         mock_super.assert_called_once_with(layer, x, rl, None)
+        self.assertIs(out, sentinel)
+
+
+class TestApplyModular(unittest.TestCase):
+    def test_uses_precomputed_routing(self) -> None:
+        method = _make_method(monolithic=False)
+        layer = _make_layer()
+        x = torch.zeros(4, 16, dtype=torch.bfloat16)
+        topk_weights = torch.ones(4, 2, dtype=torch.float32)
+        topk_ids = torch.zeros(4, 2, dtype=torch.int32)
+        sentinel = torch.empty(4, 16)
+
+        with patch.object(
+            PaceUnquantizedFusedMoEMethod,
+            "_apply_pace_experts",
+            return_value=sentinel,
+        ) as mock_apply:
+            out = method.apply(layer, x, topk_weights, topk_ids, None, None)
+
+        mock_apply.assert_called_once_with(layer, x, topk_weights, topk_ids)
         self.assertIs(out, sentinel)
 
 

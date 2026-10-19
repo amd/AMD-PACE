@@ -1,0 +1,43 @@
+{
+  "model_args": {
+    "model_name": "unsloth/llama-2-7b",
+    "dtype": "bf16",
+    "llm_operators": {
+      "Norm": "JIT",
+      "QKVProjection": "TPP",
+      "Attention": "JIT",
+      "OutProjection": "TPP",
+      "MLP": "TPP",
+      "LMHead": "TPP"
+    }
+  },
+  "generation_args": {
+    "prompt_len": 128,
+    "seqs": [1024, 1536, 2048, 4096],
+    "batch_sizes": [1, 4, 8]
+  },
+  "equip": {
+    "name": "equip",
+    "sink_size": 4,
+    "recent_size": 752,
+    "rope_mode": "sink_only",
+    "update": "inplace",
+    "kv_cache_type": "DYNAMIC"
+  },
+  "baselines": ["streaming", "ar"],
+  "streaming": {
+    "name": "streaming",
+    "rope_mode": "reindex",
+    "update": "shift",
+    "kv_cache_type": "DYNAMIC"
+  },
+  "ar": {
+    "name": "ar",
+    "kv_cache_type": "DYNAMIC",
+    "attention": "native"
+  },
+  "warmup_runs": 1,
+  "num_runs": 2,
+  "verbose": true,
+  "output_dir": "./benchmark_results"
+}

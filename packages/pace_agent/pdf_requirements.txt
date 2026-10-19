@@ -1,3 +1,3 @@
 # PDF text-extraction backend for the pdf_text_extract op.
 # Installed via the `pdf` extra: `pip install pace-agent[pdf]`.
-pypdf==6.15.0
+pypdf==6.19.0
